@@ -1,0 +1,174 @@
+From bb52de80475a8c0a0572b484a05736a2de7a0eb9 Mon Sep 17 00:00:00 2001
+From: beyond2lte port <noreply@example.invalid>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] cad-pulse: don't crash when no suitable card is found yet
+
+At session start PipeWire may not have the card (or its ports) yet, so
+init_card_info() finds no suitable card and card_id stays -1. Card-less
+(virtual) sinks and sources such as echo-cancel or loopback nodes report
+card == PA_INVALID_INDEX, which compares equal to card_id == -1, so the
+next SINK NEW event makes process_new_sink() adopt such a sink. It has no
+ports, and init_sink_info() then dereferences the NULL active_port
+(g_strcmp0(info->active_port->name, ...)), SIGSEGV.
+
+- only adopt sinks/sources once a card was found, never card-less ones
+- guard every active_port dereference
+- retry the card lookup on card CHANGE events too (PipeWire can complete a
+  card after announcing it), coalescing bursts into one query
+- free the port tables on re-init instead of leaking them
+- log the no-card case as a message: callaudiod keeps waiting for a card
+---
+ src/cad-pulse.c | 56 ++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 46 insertions(+), 10 deletions(-)
+
+diff --git a/src/cad-pulse.c b/src/cad-pulse.c
+index ba6f624..43e123b 100644
+--- a/src/cad-pulse.c
++++ b/src/cad-pulse.c
+@@ -53,8 +53,16 @@ struct _CadPulse
+     CallAudioMode audio_mode;
+     CallAudioSpeakerState speaker_state;
+     CallAudioMicState mic_state;
++
++    guint card_retry_id;
+ };
+ 
++/*
++ * A sink without ports (virtual sinks such as echo-cancel or loopback nodes
++ * under PipeWire) has no active port.
++ */
++#define ACTIVE_PORT_NAME(info) ((info)->active_port ? (info)->active_port->name : NULL)
++
+ G_DEFINE_TYPE(CadPulse, cad_pulse, G_TYPE_OBJECT);
+ 
+ typedef struct _CadPulseOperation {
+@@ -64,6 +72,7 @@ typedef struct _CadPulseOperation {
+ } CadPulseOperation;
+ 
+ static void pulseaudio_cleanup(CadPulse *self);
++static void schedule_card_retry(CadPulse *self);
+ static gboolean pulseaudio_connect(CadPulse *self);
+ static gboolean init_pulseaudio_objects(gpointer data);
+ 
+@@ -157,6 +166,12 @@ static void process_new_source(CadPulse *self, const pa_source_info *info)
+         return;
+     if (info->monitor_of_sink != PA_INVALID_INDEX)
+         return;
++    /*
++     * card_id is -1 until a suitable card is found, and a card-less (virtual)
++     * source has card == PA_INVALID_INDEX, which compares equal to -1.
++     */
++    if (self->card_id < 0 || info->card == PA_INVALID_INDEX)
++        return;
+     if (info->card != self->card_id || self->source_id != -1)
+         return;
+ 
+@@ -305,6 +320,9 @@ static void process_new_sink(CadPulse *self, const pa_sink_info *info)
+     prop = pa_proplist_gets(info->proplist, PA_PROP_DEVICE_CLASS);
+     if (prop && g_strcmp0(prop, SINK_CLASS) != 0)
+         return;
++    /* See process_new_source(): no card yet, or a card-less virtual sink */
++    if (self->card_id < 0 || info->card == PA_INVALID_INDEX)
++        return;
+     if (info->card != self->card_id || self->sink_id != -1)
+         return;
+ 
+@@ -383,7 +401,7 @@ static void init_sink_info(pa_context *ctx, const pa_sink_info *info, int eol, v
+ 
+         switch (self->audio_mode) {
+         case CALL_AUDIO_MODE_CALL:
+-            if (g_strcmp0(info->active_port->name, self->speaker_port) == 0) {
++            if (g_strcmp0(ACTIVE_PORT_NAME(info), self->speaker_port) == 0) {
+                 self->speaker_state = CALL_AUDIO_SPEAKER_ON;
+                 g_object_set(self->manager, "speaker-state", self->speaker_state, NULL);
+                 /*
+@@ -406,7 +424,8 @@ static void init_sink_info(pa_context *ctx, const pa_sink_info *info, int eol, v
+              * Note: this code path is only used when the card doesn't have a
+              * voice profile, otherwise things are easier to deal with.
+              */
+-            if (g_strcmp0(info->active_port->name, self->earpiece_port) == 0) {
++            if (info->active_port &&
++                g_strcmp0(info->active_port->name, self->earpiece_port) == 0) {
+                 self->audio_mode = CALL_AUDIO_MODE_CALL;
+                 g_object_set(self->manager, "audio-mode", self->audio_mode, NULL);
+                 /*
+@@ -455,7 +474,7 @@ static void init_card_info(pa_context *ctx, const pa_card_info *info, int eol, v
+ 
+     if (eol != 0) {
+         if (self->card_id < 0) {
+-            g_critical("No suitable card found, stopping here...");
++            g_message("No suitable card found yet, waiting for one...");
+         }
+         return;
+     }
+@@ -588,8 +607,13 @@ static gboolean init_pulseaudio_objects(gpointer data)
+     CadPulse *self = data;
+     pa_operation *op;
+ 
++    self->card_retry_id = 0;
++    if (!self->ctx)
++        return G_SOURCE_REMOVE;
++
+     self->card_id = self->sink_id = self->source_id = -1;
+-    self->sink_ports = self->source_ports = NULL;
++    g_clear_pointer(&self->sink_ports, g_hash_table_destroy);
++    g_clear_pointer(&self->source_ports, g_hash_table_destroy);
+ 
+     op = pa_context_get_card_info_list(self->ctx, init_card_info, self);
+     if (op)
+@@ -604,6 +628,13 @@ static gboolean init_pulseaudio_objects(gpointer data)
+     return G_SOURCE_REMOVE;
+ }
+ 
++static void schedule_card_retry(CadPulse *self)
++{
++    /* Coalesce bursts of card events into one card list query */
++    if (self->card_retry_id == 0)
++        self->card_retry_id = g_idle_add(init_pulseaudio_objects, self);
++}
++
+ static void changed_cb(pa_context *ctx, pa_subscription_event_type_t type, uint32_t idx, void *data)
+ {
+     CadPulse *self = data;
+@@ -638,9 +669,14 @@ static void changed_cb(pa_context *ctx, pa_subscription_event_type_t type, uint3
+         }
+         break;
+     case PA_SUBSCRIPTION_EVENT_CARD:
+-        if (self->card_id < 0 && kind == PA_SUBSCRIPTION_EVENT_NEW) {
+-            g_debug("card %u added, but no valid card detected yet, retrying...", idx);
+-            g_idle_add(init_pulseaudio_objects, self);
++        if (self->card_id < 0 && (kind == PA_SUBSCRIPTION_EVENT_NEW ||
++                                  kind == PA_SUBSCRIPTION_EVENT_CHANGE)) {
++            /*
++             * PipeWire may announce a card before its ports/profiles are
++             * known and complete it with CHANGE events, so retry on both.
++             */
++            g_debug("card %u added/changed, but no valid card detected yet, retrying...", idx);
++            schedule_card_retry(self);
+         } else if (idx == self->card_id && kind == PA_SUBSCRIPTION_EVENT_CHANGE) {
+             g_debug("card %u changed", idx);
+             if (self->sink_id != -1) {
+@@ -687,7 +723,7 @@ static void pulse_state_cb(pa_context *ctx, void *data)
+                              PA_SUBSCRIPTION_MASK_SINK  | PA_SUBSCRIPTION_MASK_SOURCE | PA_SUBSCRIPTION_MASK_CARD,
+                              NULL, self);
+         g_debug("PA is ready, initializing cards list");
+-        g_idle_add(init_pulseaudio_objects, self);
++        schedule_card_retry(self);
+         break;
+     default:
+         g_return_if_reached();
+@@ -954,9 +990,9 @@ static void set_output_port(pa_context *ctx, const pa_sink_info *info, int eol,
+             target_port = get_available_sink_port(info, operation->pulse->speaker_port);
+     }
+ 
+-    g_debug("active port is '%s', target port is '%s'", info->active_port->name, target_port);
++    g_debug("active port is '%s', target port is '%s'", ACTIVE_PORT_NAME(info), target_port);
+ 
+-    if (target_port && g_strcmp0(info->active_port->name, target_port) != 0) {
++    if (target_port && g_strcmp0(ACTIVE_PORT_NAME(info), target_port) != 0) {
+         g_debug("switching to target port '%s'", target_port);
+         op = pa_context_set_sink_port_by_index(ctx, operation->pulse->sink_id,
+                                                target_port,
+-- 
+2.56.1
+
