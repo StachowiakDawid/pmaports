@@ -1,0 +1,18 @@
+pkg_resources was removed from setuptools; use importlib.resources (python >= 3.9).
+
+--- a/js8py/jsc.py
++++ b/js8py/jsc.py
+@@ -1,11 +1,11 @@
+ import pickle
+-import pkg_resources
++from importlib.resources import files
+ 
+ 
+ class Jsc(object):
+     size = 262144
+ 
+-    with pkg_resources.resource_stream("js8py", "jsc_map.pickle") as f:
++    with files("js8py").joinpath("jsc_map.pickle").open("rb") as f:
+         map = pickle.load(f)
+ 
+     def decompress(self, bitvec):

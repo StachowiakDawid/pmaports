@@ -1,0 +1,42 @@
+From 7258123acbf4e8814032062de21da6ff30e0b21b Mon Sep 17 00:00:00 2001
+From: limesdr8 <beyond2lte@example.org>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH 1/4] TRXLooper: honour extraConfig.rx.packetsInBatch
+
+RxSetup applied the requested Rx packetsInBatch first and then
+overwrote it with the automatic ~100 us value whenever a sample rate is
+known (always), so limeTRX --rxPacketsInBatch and any API user could
+never change the Rx USB transfer size. Apply the request after the
+automatic value, like TxSetup already does.
+---
+ src/streaming/TRXLooper.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/streaming/TRXLooper.cpp b/src/streaming/TRXLooper.cpp
+index 5122eb4..f66a617 100644
+--- a/src/streaming/TRXLooper.cpp
++++ b/src/streaming/TRXLooper.cpp
+@@ -348,9 +348,6 @@ OpStatus TRXLooper::RxSetup()
+         mRx.samplesInPkt = (packetSize - headerSize) / (sampleSize * chCount);
+     }
+ 
+-    if (mConfig.extraConfig.rx.packetsInBatch != 0)
+-        mRx.packetsToBatch = mConfig.extraConfig.rx.packetsInBatch;
+-
+     // const auto dmaBufferSize{ mRxArgs.port->GetBufferSize() };
+ 
+     const auto dmaChunks{ mRxArgs.dma->GetBuffers() };
+@@ -371,6 +368,10 @@ OpStatus TRXLooper::RxSetup()
+     if (mConfig.hintSampleRate > 0)
+         mRx.packetsToBatch = std::floor((0.0001 * mConfig.hintSampleRate) / mRx.samplesInPkt);
+ 
++    // an explicit request wins over the automatic value (same as for Tx)
++    if (mConfig.extraConfig.rx.packetsInBatch != 0)
++        mRx.packetsToBatch = std::min<uint32_t>(mConfig.extraConfig.rx.packetsInBatch, 255);
++
+     mRx.packetsToBatch = std::clamp<uint8_t>(mRx.packetsToBatch, 1, dmaBufferSize / packetSize);
+ 
+     float bufferTimeDuration;
+-- 
+2.56.1
+

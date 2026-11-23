@@ -1,0 +1,30 @@
+# Contributor: StachowiakDawid
+pkgname=csdr
+pkgver=0.18.43_git20261114
+_commit=d5dbd4f7db78d521ad97ca7ae968ceb6a0c8c255
+pkgrel=0
+pkgdesc="DSP library and command line tools for SDR (OpenWebRX+ fork, with nmux)"
+url="https://github.com/luarvique/csdr"
+arch="all"
+license="GPL-3.0-or-later"
+depends_dev="fftw-dev libsamplerate-dev"
+makedepends="cmake $depends_dev samurai"
+subpackages="$pkgname-dev"
+source="$pkgname-$_commit.tar.gz::https://github.com/luarvique/csdr/archive/$_commit.tar.gz"
+builddir="$srcdir/csdr-$_commit"
+options="!check" # no test suite
+
+build() {
+	cmake -B build -G Ninja \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_INSTALL_LIBDIR=lib \
+		-DCMAKE_BUILD_TYPE=Release
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+}
+sha512sums="
+12014d46f58328c0a5fdb3472c231efc51de5e98527c832bf24188555e8cf95d8e84cb0a97f61df28e8e1244616b0f073ae129543b75c1725f3d7b4d5e505b75  csdr-d5dbd4f7db78d521ad97ca7ae968ceb6a0c8c255.tar.gz
+"

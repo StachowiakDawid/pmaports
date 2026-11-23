@@ -1,0 +1,43 @@
+# Contributor: StachowiakDawid
+pkgname=openwebrx
+pkgver=1.2.130_git20261113
+_commit=58fc249d9828300e48ad2bbdd91a20c21c57b02e
+pkgrel=0
+pkgdesc="OpenWebRX+ multi-user SDR receiver with a web interface (luarvique fork)"
+url="https://github.com/luarvique/openwebrx"
+arch="noarch"
+license="AGPL-3.0-or-later"
+# py3-setuptools: owrx.version / owrx.feature import distutils (see py3-js8py)
+# csdr: nmux (IQ distribution for direct sources)
+depends="
+	csdr
+	owrx-connector
+	py3-csdr
+	py3-js8py
+	py3-setuptools
+	python3
+	"
+makedepends="py3-gpep517 py3-setuptools py3-wheel"
+subpackages="$pkgname-pyc"
+source="$pkgname-$_commit.tar.gz::https://github.com/luarvique/openwebrx/archive/$_commit.tar.gz
+	limesuiteng-driver.patch
+	"
+builddir="$srcdir/openwebrx-$_commit"
+options="!check" # tests need the full optional decoder set
+
+build() {
+	gpep517 build-wheel --wheel-dir .dist --output-fd 3 3>&1 >&2
+}
+
+package() {
+	python3 -m installer -d "$pkgdir" .dist/*.whl
+	install -Dm644 openwebrx.conf bands.json bands-r1.json bands-r2.json bands-r3.json \
+		-t "$pkgdir"/etc/openwebrx/
+	cp -r bookmarks.d "$pkgdir"/etc/openwebrx/
+	# No service file, user or data directory here: the hardened unit, the
+	# openwebrx user and /var/lib/openwebrx come from beyond2lte-sdr-services-openwebrx.
+}
+sha512sums="
+22c4802809cd2cb3f4f25a6c6f93f00d9b11f2e5c34aed6003be8dad4f24b29916c3d20d0d6fe6e442ca9b9a3f673cbb9510b10fcc2a260f2da7498cc4dc10c0  openwebrx-58fc249d9828300e48ad2bbdd91a20c21c57b02e.tar.gz
+ac9ff1bc768a78193903351c0e2aafeacf49d757108c3f7f4f761f42617d8e577015a7ddeafb04d3be7b460bf52b47283475fb17294800dfde5d31fd49da8258  limesuiteng-driver.patch
+"

@@ -1,0 +1,32 @@
+From 5e1e3602e81cd89e756d1319ade8cae008ce576f Mon Sep 17 00:00:00 2001
+From: limesdr8 <beyond2lte@example.org>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH 3/4] limeTRX: add each channel once
+
+The channel loop pushed channel j unconditionally and again for
+rx_require/tx_require, so a single-channel run streamed channels {0,0}:
+the Rx looper then assumed 2 channels per packet (510 instead of 1020
+samples in a 4 KiB I16 packet), reported every packet as lost and
+returned half the samples.
+---
+ cli/limeTRX.cpp | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/cli/limeTRX.cpp b/cli/limeTRX.cpp
+index 209da7b..3102df1 100644
+--- a/cli/limeTRX.cpp
++++ b/cli/limeTRX.cpp
+@@ -337,10 +337,6 @@ int main(int argc, char** argv)
+         const int deviceChannelCount = device->GetDescriptor().rfSOC[index].channelCount;
+         for (int j = 0; j < deviceChannelCount; ++j)
+         {
+-            if (rx)
+-                streamCfg.channels.at(TRXDir::Rx).push_back(j);
+-            if (tx)
+-                streamCfg.channels.at(TRXDir::Tx).push_back(j);
+             if (rx_require > 0)
+             {
+                 streamCfg.channels.at(TRXDir::Rx).push_back(j);
+-- 
+2.56.1
+

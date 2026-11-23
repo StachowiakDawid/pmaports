@@ -1,0 +1,57 @@
+--- a/source_modules/soapy_source/src/main.cpp
++++ b/source_modules/soapy_source/src/main.cpp
+@@ -1,4 +1,5 @@
+ #include <SoapySDR/Constants.h>
++#include <algorithm>
+ #include <imgui.h>
+ #include <utils/flog.h>
+ #include <module.h>
+@@ -134,7 +135,7 @@
+         }
+         if (!found) {
+             // Select default sample rate
+-            selectSampleRate(sampleRates[0]);
++            selectSampleRate(sampleRates.empty() ? 0.0 : sampleRates[0]);
+         }
+     }
+ 
+@@ -208,6 +209,21 @@
+         }
+ 
+         sampleRates = dev->listSampleRates(SOAPY_SDR_RX, channelId);
++        if (sampleRates.empty()) {
++            // Some drivers (e.g. LimeSuiteNG) only report a sample rate range:
++            // offer the common rates that fall inside it instead of an empty list.
++            static const double commonRates[] = { 0.25e6, 0.5e6, 1e6, 2e6, 2.4e6, 2.5e6, 3.2e6, 4e6, 5e6, 6e6,
++                                                  8e6, 10e6, 12.5e6, 15.36e6, 20e6, 25e6, 30.72e6, 40e6, 61.44e6 };
++            for (const auto& range : dev->getSampleRateRange(SOAPY_SDR_RX, channelId)) {
++                for (double sr : commonRates) {
++                    if (sr >= range.minimum() && sr <= range.maximum() &&
++                        std::find(sampleRates.begin(), sampleRates.end(), sr) == sampleRates.end()) {
++                        sampleRates.push_back(sr);
++                    }
++                }
++            }
++            std::sort(sampleRates.begin(), sampleRates.end());
++        }
+         txtSrList = "";
+         for (double sr : sampleRates) {
+             if (sr > 1.0e3 && sr <= 1.0e6) {
+@@ -260,7 +276,7 @@
+                 selectSampleRate(config.conf["devices"][name]["sampleRate"]);
+             }
+             else {
+-                selectSampleRate(sampleRates[0]);
++                selectSampleRate(sampleRates.empty() ? 0.0 : sampleRates[0]);
+             }
+         }
+         else {
+@@ -275,7 +291,7 @@
+             if (hasAgc) {
+                 agc = false;
+             }
+-            selectSampleRate(sampleRates[0]); // Select default
++            selectSampleRate(sampleRates.empty() ? 0.0 : sampleRates[0]); // Select default
+         }
+         config.release();
+     }

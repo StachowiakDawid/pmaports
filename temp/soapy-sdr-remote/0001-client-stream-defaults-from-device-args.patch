@@ -1,0 +1,55 @@
+From: beyond2lte port <beyond2lte@example.org>
+Subject: [PATCH] client: use remote:format/scale/mtu/window/priority from the
+ device args as stream defaults
+
+Only remote:prot was honoured as a device-level default. Applications that
+cannot pass stream args (SoapySDRUtil --rate tests, SDR++, gr-osmosdr users
+with a single device string) were therefore stuck with the built-in window,
+which is 16 KiB on macOS and limits a stream to ~0.5 MS/s CS16 over Wi-Fi.
+Stream args still take precedence.
+
+diff -ruN a/client/Settings.cpp b/client/Settings.cpp
+--- a/client/Settings.cpp	2026-11-15 00:19:38
++++ b/client/Settings.cpp	2026-11-15 00:19:50
+@@ -43,6 +43,16 @@
+     //default stream protocol specified in device args
+     const auto protIt = args.find("prot");
+     if (protIt != args.end()) _defaultStreamProt = protIt->second;
++
++    //default stream buffer/format settings specified in device args
++    //(remote:window=..., remote:mtu=..., remote:format=... arrive here with
++    //the prefix stripped); used when the stream args do not set them, so
++    //applications that cannot pass stream args (SoapySDRUtil, SDR++) can tune
++    for (const char *key : {"format", "scale", "mtu", "window", "priority"})
++    {
++        const auto it = args.find(key);
++        if (it != args.end()) _defaultStreamArgs[std::string(SOAPY_REMOTE_KWARG_PREFIX) + key] = it->second;
++    }
+ }
+ 
+ SoapyRemoteDevice::~SoapyRemoteDevice(void)
+diff -ruN a/client/SoapyClient.hpp b/client/SoapyClient.hpp
+--- a/client/SoapyClient.hpp	2026-11-15 00:19:38
++++ b/client/SoapyClient.hpp	2026-11-15 00:19:50
+@@ -382,4 +382,5 @@
+     SoapyLogAcceptor *_logAcceptor;
+     mutable std::mutex _mutex;
+     std::string _defaultStreamProt;
++    SoapySDR::Kwargs _defaultStreamArgs;
+ };
+diff -ruN a/client/Streaming.cpp b/client/Streaming.cpp
+--- a/client/Streaming.cpp	2026-11-15 00:19:38
++++ b/client/Streaming.cpp	2026-11-15 00:19:50
+@@ -142,6 +142,12 @@
+ {
+     SoapySDR::Kwargs args(args_); //read/write copy
+ 
++    //apply stream defaults from the device args (stream args win)
++    for (const auto &pair : _defaultStreamArgs)
++    {
++        if (args.count(pair.first) == 0) args[pair.first] = pair.second;
++    }
++
+     //extract the specified stream protocol
+     std::string prot = _defaultStreamProt;
+     const auto protIt = args.find(SOAPY_REMOTE_KWARG_PROT);

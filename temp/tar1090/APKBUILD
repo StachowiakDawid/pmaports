@@ -1,0 +1,53 @@
+# Contributor: StachowiakDawid
+# tar1090 has no release tags (rolling master); pinned to commits. pkgver = upstream "version" file.
+pkgname=tar1090
+pkgver=3.14.1825
+pkgrel=0
+_commit=5d59b1ba2c5e30eb23f1161940367b7767f10ad5
+_dbcommit=6e14dcfd6b300475c239b1fe668ec71a79c949a3
+_dbver=3.14.1725
+pkgdesc="Improved web map for ADS-B decoders (dump1090-fa / readsb), with aircraft database"
+url="https://github.com/wiedehopf/tar1090"
+arch="noarch"
+license="GPL-2.0-or-later"
+depends="bash jq coreutils sed gzip lighttpd"
+makedepends="bash"
+install="$pkgname.pre-install"
+source="$pkgname-$_commit.tar.gz::https://github.com/wiedehopf/tar1090/archive/$_commit.tar.gz
+	$pkgname-db-$_dbcommit.tar.gz::https://github.com/wiedehopf/tar1090-db/archive/$_dbcommit.tar.gz
+	tar1090.service
+	tar1090-web.service
+	tar1090.default
+	tar1090-lighttpd.conf
+	"
+builddir="$srcdir/tar1090-$_commit"
+options="!check" # static web app + shell script
+
+package() {
+	local html="$pkgdir"/usr/share/tar1090/html
+	mkdir -p "$html" "$pkgdir"/etc/tar1090
+	cp -r html/. "$html"/
+	# what upstream install.sh does: aircraft db next to the html, cache busting
+	cp -r "$srcdir"/tar1090-db-$_dbcommit/db "$html"/db-$_dbver
+	sed -i -e "s/let databaseFolder = .*;/let databaseFolder = \"db-$_dbver\";/" "$html"/index.html
+	echo "{ \"tar1090Version\": \"$pkgver\", \"databaseVersion\": \"$_dbver\" }" > "$html"/version.json
+	( cd "$html" && bash "$builddir"/cachebust.sh "$builddir"/cachebust.list "$html" )
+	# site configuration is a conffile
+	mv "$html"/config.js "$pkgdir"/etc/tar1090/config.js
+	ln -s /etc/tar1090/config.js "$html"/config.js
+
+	install -Dm755 tar1090.sh "$pkgdir"/usr/libexec/tar1090/tar1090.sh
+	install -Dm644 default "$pkgdir"/usr/share/tar1090/default
+	install -Dm644 "$srcdir"/tar1090.default "$pkgdir"/etc/default/tar1090
+	install -Dm644 "$srcdir"/tar1090-lighttpd.conf "$pkgdir"/etc/tar1090/lighttpd.conf
+	install -Dm644 "$srcdir"/tar1090.service "$pkgdir"/usr/lib/systemd/system/tar1090.service
+	install -Dm644 "$srcdir"/tar1090-web.service "$pkgdir"/usr/lib/systemd/system/tar1090-web.service
+}
+sha512sums="
+23d75a52f89387d174d26ba990999d5bec6b8ae06dd1ac277fb8191e06ec1fcdb1297193706a9289d370615099b6f349d07f21b65e6337bf5f5b85ca3902fd28  tar1090-5d59b1ba2c5e30eb23f1161940367b7767f10ad5.tar.gz
+a258115ff14934d0f7f1247a02befffa2afa220fae0c74e793ddee21b57835f1147edec0e3d82e1ee2412cd034c92269ffbbe7a81c1baa368b622c61fb16e81a  tar1090-db-6e14dcfd6b300475c239b1fe668ec71a79c949a3.tar.gz
+e183815247f1ccae3a07299fb06d794d5506c00986b9e6f2dcb71599b9aaaf3adc73e51298430825a40fef3b5df6dd010821437e17500ab5d44dc600060aed6f  tar1090.service
+c1d885bce45ccfb20420618c550171cd8a683d4709e17a9c2735e8758620dbdf67a26ed366a551b4f3f0fb3b678c99d06e143a2d693f761b96027af7bdae1a55  tar1090-web.service
+7e8d719e33e9b1e679e32f6f3d878a6649958578d2cf80b7d3c2c70f57e0cbab713f5eafb24ccb42e212923c932db6110842aa325948189fa7c8e245b58e128d  tar1090.default
+b1e8d1a0844ad31e5d73acec1435874a573b670d511765a268d0c914c864a21ec46084fc531f8707284a41b03d422066b52b23ee5df734d9d9abaf6b2d7266fe  tar1090-lighttpd.conf
+"

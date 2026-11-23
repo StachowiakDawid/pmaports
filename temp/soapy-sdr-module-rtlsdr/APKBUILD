@@ -1,0 +1,27 @@
+# Contributor: StachowiakDawid
+pkgname=soapy-sdr-module-rtlsdr
+pkgver=0.3.4
+pkgrel=0
+pkgdesc="SoapySDR module for RTL-SDR dongles (SoapyRTLSDR)"
+url="https://github.com/pothosware/SoapyRTLSDR"
+arch="all"
+license="MIT"
+depends="soapy-sdr-libs"
+makedepends="cmake samurai soapy-sdr-dev librtlsdr-dev"
+source="$pkgname-$pkgver.tar.gz::https://github.com/pothosware/SoapyRTLSDR/archive/refs/tags/soapy-rtlsdr-$pkgver.tar.gz"
+builddir="$srcdir/SoapyRTLSDR-soapy-rtlsdr-$pkgver"
+options="!check" # no test suite
+
+build() {
+	cmake -B build -G Ninja \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_BUILD_TYPE=MinSizeRel
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+}
+sha512sums="
+a5c5ec262eacf3f7f4d8d2efaa8aaf2421e291e2716b0ea9b375cde45bf99057b73b87eb3ca01fd2f0d7530c13c396981068fbb05d6d6a8f8e2388e7350c86cf  soapy-sdr-module-rtlsdr-0.3.4.tar.gz
+"

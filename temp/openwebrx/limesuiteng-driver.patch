@@ -1,0 +1,36 @@
+Support the LimeSuiteNG SoapySDR driver (driver=limesuiteng) for the "lime_sdr"
+device type: Alpine/postmarketOS only have LimeSuiteNG, the legacy LimeSuite
+module (driver=lime) is not packaged.
+
+--- a/owrx/feature.py
++++ b/owrx/feature.py
+@@ -431,9 +431,11 @@
+         """
+         The [Lime Suite](https://github.com/myriadrf/LimeSuite)
+         installs, among other things, a SoapySDR driver for the
+-        LimeSDR device series.
++        LimeSDR device series. The SoapySDR driver of its successor,
++        [LimeSuiteNG](https://github.com/myriadrf/LimeSuiteNG) (`limesuiteng`),
++        is accepted as well.
+         """
+-        return self._has_soapy_driver("lime")
++        return self._has_soapy_driver("lime") or self._has_soapy_driver("limesuiteng")
+ 
+     def has_soapy_pluto_sdr(self):
+         """
+--- a/owrx/source/lime_sdr.py
++++ b/owrx/source/lime_sdr.py
+@@ -5,6 +5,13 @@
+ 
+ class LimeSdrSource(SoapyConnectorSource):
+     def getDriver(self):
++        # LimeSuiteNG registers its SoapySDR module as "limesuiteng"; use it
++        # when the legacy LimeSuite module ("lime") is not installed.
++        from owrx.feature import FeatureDetector
++
++        fd = FeatureDetector()
++        if not fd._has_soapy_driver("lime") and fd._has_soapy_driver("limesuiteng"):
++            return "limesuiteng"
+         return "lime"
+ 
+ 

@@ -1,0 +1,30 @@
+# Contributor: StachowiakDawid
+pkgname=multimon-ng
+pkgver=1.6.2
+pkgrel=0
+pkgdesc="Digital radio transmission decoder (POCSAG, FLEX, AFSK1200/APRS, EAS, DTMF, ...)"
+url="https://github.com/EliasOenal/multimon-ng"
+arch="all"
+license="GPL-2.0-or-later"
+makedepends="cmake samurai"
+subpackages="$pkgname-doc"
+source="$pkgname-$pkgver.tar.gz::https://github.com/EliasOenal/multimon-ng/archive/refs/tags/$pkgver.tar.gz"
+options="!check" # tests need sox + sample generation
+
+build() {
+	# headless decoder: no X11 scope, no PulseAudio, no SDL3 (none are in makedepends)
+	cmake -B build -G Ninja \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_BUILD_TYPE=MinSizeRel \
+		-DCMAKE_DISABLE_FIND_PACKAGE_X11=ON \
+		-DCMAKE_DISABLE_FIND_PACKAGE_PulseAudio=ON \
+		-DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+}
+sha512sums="
+2ded07069dcdce4675181f65dc2faf9f4be42a9bec1b1c058ab746ba0ab2c754c9e26930ebca04930c3d5e273c1a23eeb74f0be07b49df021aa823fddef59ca9  multimon-ng-1.6.2.tar.gz
+"

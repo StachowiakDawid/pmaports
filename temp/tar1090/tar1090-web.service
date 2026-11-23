@@ -1,0 +1,46 @@
+[Unit]
+Description=tar1090 web map (dedicated lighttpd instance)
+Documentation=https://github.com/wiedehopf/tar1090
+After=network.target tar1090.service
+PartOf=sdr-adsb.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tar1090
+Group=tar1090
+Environment=TAR1090_SRC_DIR=/run/dump1090-fa
+Environment=TAR1090_PORT=8504
+EnvironmentFile=-/etc/default/tar1090
+ExecStartPre=/usr/sbin/lighttpd -tt -f /etc/tar1090/lighttpd.conf
+ExecStart=/usr/sbin/lighttpd -D -f /etc/tar1090/lighttpd.conf
+Restart=always
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=5min
+CPUAffinity=0-3
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

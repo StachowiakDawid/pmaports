@@ -1,0 +1,52 @@
+# Maintainer: beyond2lte port <beyond2lte@example.org>
+# SoapyRemote: network transport for SoapySDR (SoapySDRServer + "remote" client module).
+# Not packaged in Alpine edge (checked 2026-11-14).
+pkgname=soapy-sdr-remote
+pkgver=0.5.4
+pkgrel=1
+pkgdesc="SoapySDR remote support - use any Soapy SDR remotely over the network"
+url="https://github.com/pothosware/SoapyRemote"
+arch="all"
+license="BSL-1.0"
+makedepends="cmake samurai soapy-sdr-dev"
+subpackages="$pkgname-doc $pkgname-server:server"
+source="$pkgname-$pkgver.tar.gz::https://github.com/pothosware/SoapyRemote/archive/refs/tags/soapy-remote-$pkgver.tar.gz
+	0001-client-stream-defaults-from-device-args.patch
+	"
+builddir="$srcdir/SoapyRemote-soapy-remote-$pkgver"
+options="!check" # no test suite
+
+# ENABLE_AVAHI=OFF: with avahi compiled in, SoapySDRServer exits ("DNS-SD daemon
+# disconnected... Exiting prematurely") whenever avahi-daemon is not running or
+# restarts (verified in an aarch64 container). Discovery still works via SSDP
+# (UDP 1900), and clients can always use remote=<ip> directly.
+build() {
+	cmake -B build -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_INSTALL_LIBDIR=lib \
+		-DSOAPY_REMOTE_EXTVER="r$pkgrel" \
+		-DENABLE_AVAHI=OFF \
+		-DENABLE_SYSTEMD=ON \
+		-DENABLE_SYSCTL=ON \
+		-DSYSCTL_CONFIG_DIR=lib/sysctl.d
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+	# Upstream SoapySDRServer.service runs as root; beyond2lte-sdr-server ships a
+	# hardened unit instead, so do not install a second unit on port 55132.
+	rm -r "$pkgdir"/usr/lib/systemd
+}
+
+server() {
+	pkgdesc="$pkgdesc (SoapySDRServer daemon + socket buffer sysctl)"
+	depends="$pkgname=$pkgver-r$pkgrel"
+	amove usr/bin/SoapySDRServer
+	amove usr/lib/sysctl.d
+}
+sha512sums="
+bf5bc042486ab215aea071c392ece0c36efd9c000d62940c82fd6591f7d8604c526f2c09176f2bbc7cc8a3b53c832565282decf04f2856700eba95e7864bb655  soapy-sdr-remote-0.5.4.tar.gz
+737f381a9b514c01b24a6196116eb04f1463ca2a89b7749055993a3719b75a62dd408d7d0c6b1ce0e7e445992d83d9d18e4e04302896628f11b36c9cff95a2cc  0001-client-stream-defaults-from-device-args.patch
+"

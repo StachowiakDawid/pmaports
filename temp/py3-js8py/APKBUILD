@@ -1,0 +1,31 @@
+# Contributor: StachowiakDawid
+pkgname=py3-js8py
+pkgver=0.2.0_git20221130
+_commit=f7e394b7892d26cbdcce5d43c0b4081a2a6a48f6
+pkgrel=0
+pkgdesc="Python module for parsing messages from the JS8 digital mode"
+url="https://github.com/jketterl/js8py"
+arch="noarch"
+license="GPL-3.0-or-later"
+# py3-setuptools: js8py.version imports distutils (gone from python >= 3.12,
+# setuptools ships the compatibility shim)
+depends="python3 py3-setuptools"
+makedepends="py3-gpep517 py3-setuptools py3-wheel"
+subpackages="$pkgname-pyc"
+source="js8py-$_commit.tar.gz::https://github.com/jketterl/js8py/archive/$_commit.tar.gz
+	importlib-resources.patch
+	"
+builddir="$srcdir/js8py-$_commit"
+options="!check" # no test suite
+
+build() {
+	gpep517 build-wheel --wheel-dir .dist --output-fd 3 3>&1 >&2
+}
+
+package() {
+	python3 -m installer -d "$pkgdir" .dist/*.whl
+}
+sha512sums="
+4f7a8655e7091134b7a6c055269c62b2a9bcbef3e18c5b860d89f798666f5b8ddbf62c9da3dd82c9a8569caaf8983d94064eb700f433dc6abc0b6ee8fedf5b62  js8py-f7e394b7892d26cbdcce5d43c0b4081a2a6a48f6.tar.gz
+4b5bde692f6a91a6dd64e0cf0f8f093d9b2206752bd9b53df5def2aad05bc58074e697a599a6436c6a58c67cfb8dbc89d909bed1e18325f333b45a8f981ceb72  importlib-resources.patch
+"

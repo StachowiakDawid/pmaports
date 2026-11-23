@@ -1,0 +1,76 @@
+# Contributor: StachowiakDawid
+pkgname=sdrpp
+pkgver=1.3.2_git20261107
+_commit=ea6f755ac9f746cb05e34238ec5d69e5c5d17da8
+pkgrel=1
+pkgdesc="SDR++ receiver software (server-oriented build: SoapySDR, RTL-SDR and network sources)"
+url="https://www.sdrpp.org/"
+arch="all"
+license="GPL-3.0-only"
+makedepends="
+	cmake
+	fftw-dev
+	glfw-dev
+	librtlsdr-dev
+	libvolk-dev
+	mesa-dev
+	samurai
+	soapy-sdr-dev
+	zstd-dev
+	"
+source="$pkgname-$_commit.tar.gz::https://github.com/AlexandreRouma/SDRPlusPlus/archive/$_commit.tar.gz
+	flush-log.patch
+	soapy-samplerate-range.patch
+	"
+builddir="$srcdir/SDRPlusPlus-$_commit"
+options="!check" # no test suite
+
+# `sdrpp --server` only loads *_source plugins, so sinks, decoders and misc
+# modules are not built. The core library still links GLFW/OpenGL (there is no
+# headless backend upstream); in server mode the GUI backend is never
+# initialised, so no display is needed at run time.
+build() {
+	cmake -B build -G Ninja \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DOPT_BUILD_SOAPY_SOURCE=ON \
+		-DOPT_BUILD_RTL_SDR_SOURCE=ON \
+		-DOPT_BUILD_RTL_TCP_SOURCE=ON \
+		-DOPT_BUILD_FILE_SOURCE=ON \
+		-DOPT_BUILD_NETWORK_SOURCE=ON \
+		-DOPT_BUILD_SDRPP_SERVER_SOURCE=ON \
+		-DOPT_BUILD_SPYSERVER_SOURCE=ON \
+		-DOPT_BUILD_AIRSPY_SOURCE=OFF \
+		-DOPT_BUILD_AIRSPYHF_SOURCE=OFF \
+		-DOPT_BUILD_AUDIO_SOURCE=OFF \
+		-DOPT_BUILD_HACKRF_SOURCE=OFF \
+		-DOPT_BUILD_HERMES_SOURCE=OFF \
+		-DOPT_BUILD_PLUTOSDR_SOURCE=OFF \
+		-DOPT_BUILD_RFSPACE_SOURCE=OFF \
+		-DOPT_BUILD_SPECTRAN_HTTP_SOURCE=OFF \
+		-DOPT_BUILD_AUDIO_SINK=OFF \
+		-DOPT_BUILD_NETWORK_SINK=OFF \
+		-DOPT_BUILD_ATV_DECODER=OFF \
+		-DOPT_BUILD_METEOR_DEMODULATOR=OFF \
+		-DOPT_BUILD_PAGER_DECODER=OFF \
+		-DOPT_BUILD_RADIO=OFF \
+		-DOPT_BUILD_DISCORD_PRESENCE=OFF \
+		-DOPT_BUILD_FREQUENCY_MANAGER=OFF \
+		-DOPT_BUILD_IQ_EXPORTER=OFF \
+		-DOPT_BUILD_RECORDER=OFF \
+		-DOPT_BUILD_RIGCTL_CLIENT=OFF \
+		-DOPT_BUILD_RIGCTL_SERVER=OFF \
+		-DOPT_BUILD_SCANNER=OFF
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+	# server-only build: no desktop entry
+	rm -rf "$pkgdir"/usr/share/applications
+}
+sha512sums="
+fe53b325ab784d4171a43c824c5b322ba07b862943f9d65a1d0dd91da163412a4d8fcedcfec38ec01ec039a0145ccd5d05cd2ac777969688a5c47b2e656c02e1  sdrpp-ea6f755ac9f746cb05e34238ec5d69e5c5d17da8.tar.gz
+84b4104241d06f4c99880d7b2fcb331d3f5e394654ee9bbcf09c07bccf02c1032c2b03a8a541b7afadad567454bc3ef638a3ad3bd7baefa81882e921cf5870ea  flush-log.patch
+e48dc31727cf369ec0be541528c1e639ac5b1d564481b9a6a7cc059d22e084b6938d8a46e454c45673d74a4dabdb21db1c44c2c1820b0f8a12ad853ef71a1560  soapy-samplerate-range.patch
+"

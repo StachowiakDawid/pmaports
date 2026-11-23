@@ -1,0 +1,189 @@
+From 9b05f76ed937177d1d0770ff4f5de35e913a221a Mon Sep 17 00:00:00 2001
+From: limesdr8 <beyond2lte@example.org>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH 2/4] soapysdr: report stream status events once,
+ packetsInBatch arg, reject CS12
+
+readStreamStatus() compared the cumulative StreamStats counters (loss,
+overrun, underrun) with zero, so after the first lost packet every call
+returned SOAPY_SDR_OVERFLOW at once. SoapySDRUtil's rate test drains the
+status queue in a while(true) loop every second and never got out of it:
+the spinner stopped after 1-2 s, no rate line was printed, SIGINT did
+nothing. SoapyRemote's status thread spins the same way. Remember what was
+reported and return each new event once.
+
+Add a packetsInBatch stream arg (also as device arg or the
+LIMESUITENG_PACKETS_IN_BATCH environment variable) that sets the
+packets per USB transfer (Rx 4 KiB packets, up to 16 = 64 KiB).
+
+CS12 as host format made StreamRx() write complex16_t (4 bytes) per
+sample into the caller's 3-byte-per-sample buffer: heap overflow,
+segfault. Stop advertising it and reject it in setupStream(); CS16 with
+linkFormat=CS12 gives the 12-bit wire format.
+---
+ plugins/soapysdr/Settings.cpp        |  1 +
+ plugins/soapysdr/Soapy_limesuiteng.h |  1 +
+ plugins/soapysdr/Streaming.cpp       | 64 +++++++++++++++++++++++++---
+ 3 files changed, 61 insertions(+), 5 deletions(-)
+
+diff --git a/plugins/soapysdr/Settings.cpp b/plugins/soapysdr/Settings.cpp
+index 99552e9..01e9642 100644
+--- a/plugins/soapysdr/Settings.cpp
++++ b/plugins/soapysdr/Settings.cpp
+@@ -33,6 +33,7 @@ Soapy_limesuiteng::Soapy_limesuiteng(const DeviceHandle& handle, const SoapySDR:
+     : isStreamRunning(false)
+     , sampleRate{ 0.0, 0.0 }
+     , oversampling(0) // Auto
++    , _deviceArgs(args)
+ {
+     SoapySDR::log(SOAPY_SDR_INFO, "Make connection: '" + handle.ToString() + "'");
+     //NOLINTNEXTLINE(cppcoreguidelines-prefer-member-initializer)
+diff --git a/plugins/soapysdr/Soapy_limesuiteng.h b/plugins/soapysdr/Soapy_limesuiteng.h
+index 541309a..41ada1d 100644
+--- a/plugins/soapysdr/Soapy_limesuiteng.h
++++ b/plugins/soapysdr/Soapy_limesuiteng.h
+@@ -277,6 +277,7 @@ class Soapy_limesuiteng : public SoapySDR::Device
+ 
+     std::array<double, 2> sampleRate; // sampleRate[direction]
+     int oversampling;
++    SoapySDR::Kwargs _deviceArgs; // device args, for stream defaults (packetsInBatch)
+ 
+     std::array<std::vector<SettingsCache>, 2> settingsCache; // settingsCache[direction]
+ };
+diff --git a/plugins/soapysdr/Streaming.cpp b/plugins/soapysdr/Streaming.cpp
+index 6bcd77a..153d7d4 100644
+--- a/plugins/soapysdr/Streaming.cpp
++++ b/plugins/soapysdr/Streaming.cpp
+@@ -10,6 +10,7 @@
+ #include <SoapySDR/Time.hpp>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <iostream>
+ #include <ratio>
+ #include <thread>
+@@ -34,6 +35,11 @@ struct IConnectionStream {
+     long long rxBurstStart_timeNs{};
+     size_t rxBurstSamples{};
+ 
++    // stream statistics already reported by readStreamStatus()
++    uint32_t reportedLoss{};
++    uint32_t reportedOverrun{};
++    uint32_t reportedUnderrun{};
++
+     StreamConfig streamConfig;
+ };
+ 
+@@ -43,7 +49,7 @@ struct IConnectionStream {
+ std::vector<std::string> Soapy_limesuiteng::getStreamFormats(
+     [[maybe_unused]] const int direction, [[maybe_unused]] const size_t channel) const
+ {
+-    return { SOAPY_SDR_CF32, SOAPY_SDR_CS12, SOAPY_SDR_CS16 };
++    return { SOAPY_SDR_CF32, SOAPY_SDR_CS16 };
+ }
+ 
+ std::string Soapy_limesuiteng::getNativeStreamFormat(
+@@ -75,6 +81,17 @@ SoapySDR::ArgInfoList Soapy_limesuiteng::getStreamArgsInfo(
+         argInfos.push_back(info);
+     }
+ 
++    // USB/DMA transfer size
++    {
++        SoapySDR::ArgInfo info;
++        info.value = "0";
++        info.key = "packetsInBatch";
++        info.name = "Packets in batch";
++        info.description = "Packets per data transfer (Rx: 4 KiB each on USB, max 16). 0 = auto (~100 us of samples).";
++        info.type = SoapySDR::ArgInfo::INT;
++        argInfos.push_back(info);
++    }
++
+     // // Skip calibrations
+     // {
+     //     SoapySDR::ArgInfo info;
+@@ -132,7 +149,11 @@ SoapySDR::Stream* Soapy_limesuiteng::setupStream(
+     }
+     else if (format == SOAPY_SDR_CS12)
+     {
+-        config.format = DataFormat::I12;
++        // readStream() hands the samples to StreamRx() as complex16_t, i.e. it
++        // writes 4 bytes per sample into a buffer sized for 3 (heap overflow,
++        // segfault). Packed CS12 output is not implemented: use CS16 with
++        // linkFormat=CS12 for the 12-bit wire format.
++        throw std::runtime_error("Soapy_limesuiteng::setupStream(format=CS12) not supported, use CS16 + linkFormat=CS12");
+     }
+     else
+     {
+@@ -159,6 +180,28 @@ SoapySDR::Stream* Soapy_limesuiteng::setupStream(
+         }
+     }
+ 
++    // Optional packets per transfer: stream args, else device args, else
++    // the LIMESUITENG_PACKETS_IN_BATCH environment variable, else auto.
++    {
++        std::string value;
++        const char* key = "packetsInBatch";
++        if (args.count(key))
++            value = args.at(key);
++        else if (_deviceArgs.count(key))
++            value = _deviceArgs.at(key);
++        else if (const char* env = std::getenv("LIMESUITENG_PACKETS_IN_BATCH"))
++            value = env;
++        if (!value.empty())
++        {
++            const uint32_t n = std::stoul(value);
++            if (dir == TRXDir::Rx)
++                config.extraConfig.rx.packetsInBatch = n;
++            else
++                config.extraConfig.tx.packetsInBatch = n;
++            SoapySDR::logf(SOAPY_SDR_INFO, "%s packetsInBatch=%u", dir == TRXDir::Rx ? "Rx" : "Tx", n);
++        }
++    }
++
+     // TODO: reimplement if relevant
+     // Optional buffer length if specified (from device args)
+ 
+@@ -244,6 +287,9 @@ int Soapy_limesuiteng::activateStream(SoapySDR::Stream* stream, const int flags,
+     icstream->rxBurstStart_timeNs = timeNs;
+     icstream->rxBurstRequest = (flags & SOAPY_SDR_HAS_TIME) | (flags & SOAPY_SDR_END_BURST);
+     icstream->rxBurstSamples = numElems;
++    icstream->reportedLoss = 0;
++    icstream->reportedOverrun = 0;
++    icstream->reportedUnderrun = 0;
+ 
+     rfstream->Start();
+     isStreamRunning = true;
+@@ -423,19 +469,27 @@ int Soapy_limesuiteng::readStreamStatus(
+             rfstream->StreamStatus(&metadata, nullptr);
+         }
+ 
+-        if (metadata.loss)
++        // StreamStats counters are cumulative: report each new event once.
++        // Comparing the totals against zero made every call after the first
++        // loss return OVERFLOW immediately, so callers that drain the status
++        // queue (SoapySDRUtil rate test, SoapyRemote's status thread) spun
++        // forever and the stream looked stalled.
++        if (metadata.loss != icstream->reportedLoss)
+         {
++            icstream->reportedLoss = metadata.loss;
+             if (icstream->direction == SOAPY_SDR_TX)
+                 ret = SOAPY_SDR_UNDERFLOW;
+             else
+                 ret = SOAPY_SDR_OVERFLOW;
+         }
+-        else if (metadata.overrun)
++        else if (metadata.overrun != icstream->reportedOverrun)
+         {
++            icstream->reportedOverrun = metadata.overrun;
+             ret = SOAPY_SDR_OVERFLOW;
+         }
+-        else if (metadata.underrun)
++        else if (metadata.underrun != icstream->reportedUnderrun)
+         {
++            icstream->reportedUnderrun = metadata.underrun;
+             ret = SOAPY_SDR_UNDERFLOW;
+         }
+ 
+-- 
+2.56.1
+

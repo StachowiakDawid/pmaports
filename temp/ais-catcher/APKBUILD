@@ -1,0 +1,32 @@
+# Contributor: StachowiakDawid
+pkgname=ais-catcher
+pkgver=0.71
+pkgrel=0
+pkgdesc="AIS receiver for RTL-SDR/SoapySDR with built-in web UI (AIS-catcher)"
+url="https://github.com/jvde-github/AIS-catcher"
+arch="all"
+license="GPL-3.0-or-later"
+makedepends="cmake samurai librtlsdr-dev soapy-sdr-dev zlib-dev openssl-dev"
+source="$pkgname-$pkgver.tar.gz::https://github.com/jvde-github/AIS-catcher/archive/refs/tags/v$pkgver.tar.gz"
+builddir="$srcdir/AIS-catcher-$pkgver"
+options="!check" # no test suite
+
+build() {
+	# RTL-SDR + SoapySDR (LimeSDR) inputs only; web UI, tracker/API, zlib and
+	# TLS (HTTPS/MQTT feeds) on; no databases, resamplers, ZMQ, NMEA2000.
+	cmake -B build -G Ninja \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DRTLSDR=ON -DSOAPYSDR=ON \
+		-DAIRSPY=OFF -DAIRSPYHF=OFF -DHACKRF=OFF -DSDRPLAY=OFF -DHYDRASDR=OFF \
+		-DSOXR=OFF -DSAMPLERATE=OFF -DZMQ=OFF -DPSQL=OFF -DSQLITE=OFF \
+		-DNMEA2000=OFF -DZLIB=ON -DOPENSSL=ON
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+}
+sha512sums="
+1f3da3d4ae463631a64c5a9e82b727cd7b2f05a8e5e038b3eb380e4b34a9225f3a03faf37a13049a9c8fa6372aedf9eb4b0cd69a9d3194deec09da9278206564  ais-catcher-0.71.tar.gz
+"

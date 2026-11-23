@@ -1,0 +1,91 @@
+# Maintainer: beyond2lte port <beyond2lte@example.org>
+# LimeSuiteNG: driver library + CLI for LimeSDR boards incl. LimeSDR Mini 2.0
+# (FT601, USB 0403:601f, driven from userspace through libusb - no kernel driver).
+# Not packaged in Alpine edge (checked 2026-11-14), neither is legacy LimeSuite.
+pkgname=limesuiteng
+pkgver=25.1.0
+pkgrel=2
+pkgdesc="Driver and tools for LimeSDR devices (next generation LimeSuite)"
+url="https://github.com/myriadrf/LimeSuiteNG"
+arch="all"
+license="Apache-2.0"
+depends_dev="libusb-dev"
+# python3: plugins/gr-limesuiteng includes GrPython (FindPythonInterp) even when
+# BUILD_PLUGINS_GNURADIO=OFF
+makedepends="cmake samurai python3 libusb-dev soapy-sdr-dev $depends_dev"
+subpackages="
+	$pkgname-dev
+	$pkgname-tools
+	$pkgname-udev
+	soapy-sdr-module-limesuiteng:soapy
+	"
+# r1: Soapy readStreamStatus fix (SoapySDRUtil/SoapyRemote "stall"),
+# packetsInBatch stream/device arg + Rx override fix, CS12 host format rejected,
+# limeTRX single-channel fix; r2: drop stale Rx data left by a killed session
+source="$pkgname-$pkgver.tar.gz::https://github.com/myriadrf/LimeSuiteNG/archive/refs/tags/v$pkgver.tar.gz
+	0001-TRXLooper-honour-extraConfig.rx.packetsInBatch.patch
+	0002-soapysdr-report-stream-status-events-once-packetsInB.patch
+	0003-limeTRX-add-each-channel-once.patch
+	0004-TRXLooper-drop-stale-Rx-data-at-stream-start.patch
+	"
+builddir="$srcdir/LimeSuiteNG-$pkgver"
+options="!check" # unit tests need googletest download
+
+prepare() {
+	default_prepare
+	# Debian-style SOVERSION "0.3-1" is rejected by abuild's so: provider scan
+	# ("library version 0.3-1 is invalid") -> soname liblimesuiteng.so.0.3
+	sed -i 's/set(LIMESUITENG_SOVER "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}-1")/set(LIMESUITENG_SOVER "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")/' \
+		src/CMakeLists.txt
+	grep -q 'LIMESUITENG_SOVER "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")' src/CMakeLists.txt
+}
+
+build() {
+	# GUI needs wxWidgets/OpenGL, drivers = PCIe kernel module sources (not
+	# needed for USB boards), amarisoft/gnuradio plugins not wanted here.
+	cmake -B build -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_INSTALL_LIBDIR=lib \
+		-DBUILD_SHARED_LIBS=ON \
+		-DBUILD_GUI=OFF \
+		-DBUILD_DRIVERS=OFF \
+		-DBUILD_DOCS=OFF \
+		-DENABLE_UNIT_TESTS=OFF \
+		-DBUILD_PLUGINS_AMARISOFT=OFF \
+		-DBUILD_PLUGINS_GNURADIO=OFF \
+		-DBUILD_PLUGINS_SOAPYSDR=ON \
+		-DINSTALL_UDEV_RULES=ON \
+		-DUDEV_RULES_INSTALL_PATH=/usr/lib/udev/rules.d \
+		-DUDEV_RULES_RELOAD_ON_INSTALL=OFF \
+		-DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 # vendored rang/args need it with CMake 4
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+}
+
+tools() {
+	pkgdesc="$pkgdesc (command line tools: limeDevice, limeTRX, limeConfig, ...)"
+	amove usr/bin
+}
+
+udev() {
+	pkgdesc="$pkgdesc (upstream udev rules, world-writable - see beyond2lte-sdr-server for a group-based rule)"
+	amove usr/lib/udev
+}
+
+soapy() {
+	pkgdesc="SoapySDR module for LimeSuiteNG (driver=limesuiteng)"
+	depends="$pkgname=$pkgver-r$pkgrel"
+	amove usr/lib/SoapySDR
+}
+sha512sums="
+bbcb202e32c1ab693305144a3e1efdc77a146354606ec83e9ae8a22eed1e12c285a7d8921d539f5df4a1f700a002b2ba2923e688756b188ea97e1f95fd0b9cd8  limesuiteng-25.1.0.tar.gz
+5f85441f1bc31227cbb70633948796521b73f1ef2b20e187d02d69e11b8ef63ec8aac7f49b014361c1e56c039c254c98622210cb964af86b1dfe5f14e220cda9  0001-TRXLooper-honour-extraConfig.rx.packetsInBatch.patch
+d69a8c8ff5be28a03645e480f878353d0b57a1269e0af62af5a043499e8724dc32d28e3cf1fa4d769e5045c5871281bb301fe68ee9f1543786e519dbdf319e46  0002-soapysdr-report-stream-status-events-once-packetsInB.patch
+3921c9c586278cae0d03eddc36767658fad8cf02ffe246a7d35d494499b528f7d85027e8ef8ad3fdab4384b03c575b1b2e3e6cb8f8c7692ea3aadae3a2a38636  0003-limeTRX-add-each-channel-once.patch
+7a99ea015e6de5f4796e618bc407218bbbfe5e62c0c28ed7f51121139978c0b79c23994e2ed669d37d874c8901ba769574f6a3986442e94f916e749752b69456  0004-TRXLooper-drop-stale-Rx-data-at-stream-start.patch
+"

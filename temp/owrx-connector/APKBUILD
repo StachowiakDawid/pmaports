@@ -1,0 +1,29 @@
+# Contributor: StachowiakDawid
+pkgname=owrx-connector
+pkgver=0.6.5_git20260823
+_commit=5b014234cf0f1f49b01ec85f8b29d04c471d28ac
+pkgrel=0
+pkgdesc="SDR connectors for OpenWebRX+ (rtl_connector, soapy_connector, rtl_tcp_connector)"
+url="https://github.com/luarvique/owrx_connector"
+arch="all"
+license="GPL-3.0-or-later"
+makedepends="cmake csdr-dev fftw-dev librtlsdr-dev libsamplerate-dev samurai soapy-sdr-dev"
+subpackages="$pkgname-dev"
+source="$pkgname-$_commit.tar.gz::https://github.com/luarvique/owrx_connector/archive/$_commit.tar.gz"
+builddir="$srcdir/owrx_connector-$_commit"
+options="!check" # no test suite
+
+build() {
+	cmake -B build -G Ninja \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_INSTALL_LIBDIR=lib \
+		-DCMAKE_BUILD_TYPE=Release
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+}
+sha512sums="
+35e882ba5a1c3897af8363d65e45eb3c440f38dede31472640a215f9c16b4e44250c0711d47ab969983d19afd6d7c85c61597345605560dd800c07a98034f86a  owrx-connector-5b014234cf0f1f49b01ec85f8b29d04c471d28ac.tar.gz
+"

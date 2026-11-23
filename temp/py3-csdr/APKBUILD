@@ -1,0 +1,27 @@
+# Contributor: StachowiakDawid
+pkgname=py3-csdr
+pkgver=0.18.43
+_commit=e0029bdfb135ff09557dc296ef9772b17ff4fe1a
+pkgrel=0
+pkgdesc="Python bindings for the csdr library (OpenWebRX+ fork)"
+url="https://github.com/luarvique/pycsdr"
+arch="all"
+license="GPL-3.0-or-later"
+depends="python3"
+makedepends="csdr-dev fftw-dev py3-gpep517 py3-setuptools py3-wheel python3-dev"
+source="pycsdr-$_commit.tar.gz::https://github.com/luarvique/pycsdr/archive/$_commit.tar.gz"
+builddir="$srcdir/pycsdr-$_commit"
+options="!check" # no test suite
+
+build() {
+	gpep517 build-wheel --wheel-dir .dist --output-fd 3 3>&1 >&2
+}
+
+package() {
+	python3 -m installer -d "$pkgdir" .dist/*.whl
+	# C++ headers for other bindings (pydigiham etc.), not needed at run time
+	rm -rf "$pkgdir"/usr/include
+}
+sha512sums="
+65332ed9aa5fc2d66d205ea1b022d94f96f8505ed0ab4cb5d3c4399276b00fb6e3a23d5e936b2e9ec162981a67135ada3424d456c5d8078430f4fd168d4cae5f  pycsdr-e0029bdfb135ff09557dc296ef9772b17ff4fe1a.tar.gz
+"

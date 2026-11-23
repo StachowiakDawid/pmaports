@@ -1,0 +1,63 @@
+From cafaefaa0bce83e5672ee61844ecb93bbf006813 Mon Sep 17 00:00:00 2001
+From: limesdr8 <beyond2lte@example.org>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH 4/4] TRXLooper: drop stale Rx data at stream start
+
+When the previous session ended without stopping the stream (process
+killed), the FPGA keeps streaming into the FT601 FIFO and the next
+session's first transfer carries the old session's samples and
+timestamps (~38M ticks after a 4 s session at 10 MS/s), followed by a
+jump back to ~0: one bogus loss event and a backwards timestamp for the
+application. Setup() resets the FPGA timestamp before every start, so
+drop leading transfers whose first packet counter is beyond 64 batches
+(at most 256 transfers).
+---
+ src/streaming/TRXLooper.cpp | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/streaming/TRXLooper.cpp b/src/streaming/TRXLooper.cpp
+index f66a617..d8f3069 100644
+--- a/src/streaming/TRXLooper.cpp
++++ b/src/streaming/TRXLooper.cpp
+@@ -529,6 +529,9 @@ void TRXLooper::ReceivePacketsLoop()
+     uint32_t lastHwIndex{ 0 };
+     DMATransactionCounter counters;
+ 
++    bool staleCheck{ true };
++    int staleDropped{ 0 };
++
+     assert(mRx.stagingPacket == nullptr); // should be clean start
+     assert(fifo->empty());
+ 
+@@ -594,6 +597,28 @@ void TRXLooper::ReceivePacketsLoop()
+             continue;
+         }
+ 
++        // Data left in the FPGA/FT601 FIFOs by a previous session that ended
++        // without stopping the stream (process killed) arrives first, with that
++        // session's timestamps. The timestamp was reset in Setup(), so fresh data
++        // starts near 0: drop leading transfers that start far beyond the queued
++        // request depth (bounded, in case a gateware does not reset the counter).
++        if (staleCheck)
++        {
++            const uint64_t idx{ counters.requests % bufferCount };
++            const auto* first = reinterpret_cast<const FPGA_RxDataPacket*>(dmaBuffers.at(idx));
++            const int64_t limit = int64_t(64) * mRxArgs.packetsToBatch * samplesInPkt;
++            if (first->counter > limit && staleDropped < 256)
++            {
++                ++staleDropped;
++                ++counters.requests;
++                mRxArgs.dma->SubmitRequest(idx, readSize, DataTransferDirection::DeviceToHost, false);
++                continue;
++            }
++            if (staleDropped)
++                lime::info("Rx%i: dropped %i stale transfer(s) at stream start", chipId, staleDropped);
++            staleCheck = false;
++        }
++
+         if (outputPkt == nullptr)
+         {
+             outputPkt = SamplesPacketType::ConstructSamplesPacket(
+-- 
+2.56.1
+

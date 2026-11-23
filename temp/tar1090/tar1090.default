@@ -1,0 +1,15 @@
+# /etc/default/tar1090 - read by tar1090.service and tar1090-web.service.
+# Upstream defaults are in /usr/share/tar1090/default; override here.
+
+# Directory where the ADS-B decoder writes aircraft.json
+# (sdr-adsb.service = dump1090-fa: /run/dump1090-fa; readsb: /run/readsb).
+TAR1090_SRC_DIR=/run/dump1090-fa
+
+# Web map port (lighttpd instance of tar1090-web.service, all interfaces).
+TAR1090_PORT=8504
+
+# Track history: one snapshot every INTERVAL s, HISTORY_SIZE snapshots
+# (8 s x 450 = 1 h). /?pTracks shows PTRACKS hours.
+#INTERVAL=8
+#HISTORY_SIZE=450
+#PTRACKS=8
