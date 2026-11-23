@@ -1,0 +1,12 @@
+[Unit]
+Description=No suspend in the first 2 minutes after boot (Wi-Fi does not survive a suspend during its bring-up)
+DefaultDependencies=no
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=sleep --mode=block --who=beyond2lte-boot "--why=Wi-Fi/PCIe bring-up after boot" /bin/sleep 120
+
+[Install]
+WantedBy=multi-user.target

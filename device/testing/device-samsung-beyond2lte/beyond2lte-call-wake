@@ -1,0 +1,50 @@
+#!/bin/sh
+# Light the screen for a ringing call. shannon-modemd writes
+# /run/shannon/call-active ("<pid> incoming|call") while a voice call exists
+# (and holds a logind sleep inhibitor); this runs from beyond2lte-call-wake.path
+# whenever the flag changes, and from beyond2lte-resuspend after a modem wake.
+#
+#   beyond2lte-call-wake          screen on if a call is ringing (incoming/waiting)
+#   beyond2lte-call-wake state    print "incoming", "call" or nothing
+#
+# Screen on = end the panel's hold_dark (set by the sleep hook for dark wakes)
+# and Phosh's DisplayConfig.PowerSaveMode 0 (what a power key press does), so
+# Phosh shows the incoming call on the lock screen at once.
+FLAG=/run/shannon/call-active
+H=/sys/module/panel_samsung_s6e3ha9/parameters/hold_dark
+
+call_state() {
+	local pid kind
+	[ -r "$FLAG" ] || return 1
+	read -r pid kind < "$FLAG" 2>/dev/null || return 1
+	# the daemon removes the flag; a crashed one cannot, so check it is alive
+	kill -0 "$pid" 2>/dev/null || return 1
+	echo "$kind"
+}
+
+in_sessions() {
+	local b uid u
+	for b in /run/user/*/bus; do
+		[ -S "$b" ] || continue
+		uid=${b#/run/user/}; uid=${uid%/bus}
+		[ "$uid" = 0 ] && continue
+		u=$(id -nu "$uid" 2>/dev/null) || continue
+		runuser -u "$u" -- env DBUS_SESSION_BUS_ADDRESS=unix:path="$b" "$@"
+	done
+}
+
+screen_on_now() {
+	local h=0
+	[ -r "$H" ] && read -r h < "$H"
+	[ "$h" = 1 ] && echo 0 > "$H"
+	in_sessions gdbus call --session --timeout 2 -d org.gnome.Mutter.DisplayConfig \
+		-o /org/gnome/Mutter/DisplayConfig -m org.freedesktop.DBus.Properties.Set \
+		org.gnome.Mutter.DisplayConfig PowerSaveMode "<0>" >/dev/null 2>&1
+}
+
+case $1 in
+state) call_state; exit 0 ;;
+esac
+[ "$(call_state)" = incoming ] || exit 0
+screen_on_now
+echo "beyond2lte-call-wake: incoming call: screen on"

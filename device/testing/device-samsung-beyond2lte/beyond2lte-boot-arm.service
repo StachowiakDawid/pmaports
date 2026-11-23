@@ -1,0 +1,7 @@
+[Unit]
+Description=Arm systemd-boot boot counting for the new kernel/initramfs
+RequiresMountsFor=/boot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/beyond2lte-boot arm

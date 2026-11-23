@@ -1,0 +1,364 @@
+#!/bin/sh
+# beyond2lte-dvfs: lower the memory (MIF) and bus (INT) DVFS levels of the
+# Galaxy S10+ (Exynos 9820) while the screen is off and during s2idle, and
+# restore them when the screen comes on.
+#
+# The U-Boot DT asks ACPM for MIF 2093000 / INT 534000 / DISP 534000 kHz at
+# boot and nothing in the kernel lowers them (no MIF/INT devfreq). This script
+# sends requests through the acpm_protocol.dvfs_cmd debug knob (pmaports 0030):
+# "<domain> <kHz>", domains 0 = MIF, 1 = INT, 6 = DISP. Without the knob it
+# does nothing.
+#
+# Screen state: /sys/class/drm/card*-DSI-*/dpms (the atomic helper sets it to
+# Off when the CRTC goes inactive, which is how phoc blanks). The kernel sends
+# no uevent for DPMS and the attribute cannot be poll()ed, so the daemon reads
+# it every POLL s (a builtin read, no fork), and is woken at once through
+# a FIFO by the power key (evdev) and by beyond2lte-blank (Phosh
+# PowerSaveMode). A wake-up nudge always raises the levels first; nothing that
+# writes to the FIFO can make it go low.
+#
+# Usage: beyond2lte-dvfs status | low | high | auto
+#        (daemon | restore | sleep-pre | sleep-post: used by the unit and the
+#        systemd-sleep hook)
+# Config: /etc/default/beyond2lte-dvfs
+# Shell: BusyBox ash (POSIX sh, no "local").
+
+KNOB=/sys/module/acpm_protocol/parameters/dvfs_cmd
+SOFT_OFF=/sys/module/exynos9820_decon/parameters/soft_off
+RUN=/run/beyond2lte-dvfs
+FIFO=$RUN/nudge
+CONF=/etc/default/beyond2lte-dvfs
+DEVMEM=b2l-devmem
+
+# boot values (U-Boot DT assigned-clock-rates), restored when the service stops
+BOOT_MIF=2093000
+BOOT_INT=534000
+BOOT_DISP=534000
+
+# defaults, overridden by $CONF
+ENABLE=1
+SCREEN_OFF_LOW=1
+SLEEP_LOW=1
+# 3-r37: the S5000AP CP works in AP DRAM and asks the AP for MIF levels (mailbox
+# DVFS requests, not served yet). Lowering MIF under a running CP froze the phone
+# (2026-11-20), so keep the boot levels while the CP link is up.
+CP_KEEP_HIGH=1		# 0: lower while the CP runs too, but not below its MIF/INT floor
+CP_DEV=/sys/devices/platform/soc@0/15920000.modem
+HIGH_MIF=$BOOT_MIF
+HIGH_INT=$BOOT_INT
+HIGH_DISP=$BOOT_DISP
+LOW_MIF=421000
+LOW_INT=200000
+LOW_DISP=134000
+SLEEP_MIF=421000
+SLEEP_INT=200000
+SLEEP_DISP=134000
+DECON_SOFT_OFF=
+POLL=2
+OFF_SAMPLES=2
+HOLD=5
+CONNECTOR=
+KEY_DEVICES=auto
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+MIF_LEVELS="2093000 1794000 1352000 1014000 845000 676000 421000"
+
+cp_running() {
+	[ "$CP_KEEP_HIGH" = 1 ] || return 1
+	[ "$(cat /sys/kernel/debug/s5000ap/link_up 2>/dev/null)" = Y ]
+}
+
+log() {
+	if command -v logger >/dev/null 2>&1; then
+		logger -t beyond2lte-dvfs -- "$*"
+		[ -t 2 ] && echo "beyond2lte-dvfs: $*" >&2
+	else
+		echo "beyond2lte-dvfs: $*" >&2
+	fi
+	return 0
+}
+
+dname() {
+	case $1 in 0) echo MIF ;; 1) echo INT ;; 6) echo DISP ;; *) echo "dom$1" ;; esac
+}
+
+# valid <dom> <kHz>: refuse typos (Hz instead of kHz, MHz, out of range)
+valid() {
+	case $2 in '' | *[!0-9]*) return 1 ;; esac
+	case $1 in
+	0) for l in $MIF_LEVELS; do [ "$l" = "$2" ] && return 0; done; return 1 ;;
+	1) [ "$2" -ge 100000 ] && [ "$2" -le 534000 ] ;;
+	6) [ "$2" -ge 134000 ] && [ "$2" -le 534000 ] ;;
+	*) return 1 ;;
+	esac
+}
+
+# req <dom> <kHz>: send one request unless it is the last one this tool sent.
+# Empty kHz = leave the domain alone. Sets CHANGED for the log line.
+req() {
+	[ -n "$2" ] || return 0
+	if ! valid "$1" "$2"; then
+		log "ignoring invalid $(dname "$1") level '$2' (see $CONF)"
+		return 1
+	fi
+	r_cur=
+	[ -r "$RUN/cur.$1" ] && read -r r_cur < "$RUN/cur.$1"
+	[ "$r_cur" = "$2" ] && return 0
+	if echo "$1 $2" 2>/dev/null > "$KNOB"; then
+		echo "$2" > "$RUN/cur.$1"
+		CHANGED="$CHANGED $(dname "$1") ${r_cur:-?}->$2"
+		return 0
+	fi
+	rm -f "$RUN/cur.$1"
+	log "request $(dname "$1") $2 kHz failed (dmesg: acpm-dvfs)"
+	return 1
+}
+
+soft_off_n() {
+	so=
+	[ -r "$SOFT_OFF" ] && read -r so < "$SOFT_OFF"
+	[ "$so" = N ] || [ "$so" = 0 ]
+}
+
+# screen: sets SCREEN to on | off | unknown (no DSI connector: treat as on)
+find_connector() {
+	CONN_DPMS=
+	if [ -n "$CONNECTOR" ]; then
+		[ -r "/sys/class/drm/$CONNECTOR/dpms" ] && CONN_DPMS=/sys/class/drm/$CONNECTOR/dpms
+		return 0
+	fi
+	for c in /sys/class/drm/card*-DSI-*/dpms; do
+		[ -r "$c" ] && { CONN_DPMS=$c; return 0; }
+	done
+}
+screen() {
+	[ -n "$CONN_DPMS" ] && [ -r "$CONN_DPMS" ] || find_connector
+	SCREEN=unknown
+	[ -n "$CONN_DPMS" ] || return 0
+	d=
+	read -r d < "$CONN_DPMS" 2>/dev/null
+	case $d in
+	On) SCREEN=on ;;
+	Off | Standby | Suspend) SCREEN=off ;;
+	esac
+}
+
+# apply <high|low|sleep|boot> <reason>
+apply() {
+	CHANGED=
+	mkdir -p "$RUN"
+	case $1 in
+	high)
+		req 6 "$HIGH_DISP"; req 1 "$HIGH_INT"; req 0 "$HIGH_MIF" ;;
+	boot)
+		req 6 "$BOOT_DISP"; req 1 "$BOOT_INT"; req 0 "$BOOT_MIF" ;;
+	low | sleep)
+		if [ "$1" = low ]; then a_m=$LOW_MIF a_i=$LOW_INT a_d=$LOW_DISP
+		else a_m=$SLEEP_MIF a_i=$SLEEP_INT a_d=$SLEEP_DISP; fi
+		# 3-r40: never below the CP's own MIF/INT request (kernel 0267)
+		c=$(cat "$CP_DEV/cp_mif_khz" 2>/dev/null || echo 0)
+		[ -n "$a_m" ] && [ "${c:-0}" -gt "$a_m" ] && a_m=$c
+		c=$(cat "$CP_DEV/cp_int_khz" 2>/dev/null || echo 0)
+		[ -n "$a_i" ] && [ "${c:-0}" -gt "$a_i" ] && a_i=$c
+		req 0 "$a_m"; req 1 "$a_i"
+		# DISP only while DECON is really stopped: screen off and soft_off=N
+		screen
+		if [ "$SCREEN" = off ] && soft_off_n; then req 6 "$a_d"
+		else req 6 "$HIGH_DISP"; fi ;;
+	esac
+	a_p=
+	[ -r "$RUN/profile" ] && read -r a_p < "$RUN/profile"
+	[ "$a_p" = "$1" ] || echo "$1" > "$RUN/profile"
+	[ -n "$CHANGED" ] && log "$1 ($2):$CHANGED kHz"
+	return 0
+}
+
+nudge() {
+	[ -p "$FIFO" ] && echo "$1" 2>/dev/null 1<>"$FIFO"
+	return 0
+}
+
+# now: NOW = seconds since boot (builtin read, no fork)
+now() {
+	read -r NOW _ < /proc/uptime
+	NOW=${NOW%.*}
+}
+
+# key_devices: event devices with KEY_POWER (116 = bit 52 of the second
+# lowest 64-bit word of capabilities/key)
+key_devices() {
+	if [ "$KEY_DEVICES" != auto ]; then
+		echo "$KEY_DEVICES"
+		return 0
+	fi
+	for k in /sys/class/input/event*/device/capabilities/key; do
+		[ -r "$k" ] || continue
+		caps=
+		read -r caps < "$k"
+		prev=0 last=0
+		for w in $caps; do prev=$last last=$w; done
+		[ $(( (0x$prev >> 52) & 1 )) = 1 ] || continue
+		k=${k%/device/capabilities/key}
+		echo "/dev/input/${k##*/}"
+	done
+}
+
+have_knob() {
+	[ -w "$KNOB" ] && return 0
+	log "no $KNOB (kernel without pmaports 0030?): doing nothing"
+	return 1
+}
+
+daemon() {
+	[ "$ENABLE" = 1 ] || { log "disabled (ENABLE=$ENABLE in $CONF)"; exit 0; }
+	have_knob || exit 0
+	mkdir -p "$RUN"
+	rm -f "$RUN"/cur.* "$RUN/manual" "$RUN/sleeping" "$FIFO"
+	mkfifo -m 0622 "$FIFO" || exit 1
+	exec 3<>"$FIFO"
+
+	case $DECON_SOFT_OFF in
+	Y | N)
+		if [ -w "$SOFT_OFF" ]; then
+			echo "$DECON_SOFT_OFF" > "$SOFT_OFF" && log "exynos9820_decon.soft_off=$DECON_SOFT_OFF"
+		else
+			log "DECON_SOFT_OFF=$DECON_SOFT_OFF: no $SOFT_OFF"
+		fi ;;
+	esac
+
+	kd=$(key_devices)
+	pids=
+	for dev in $kd; do
+		[ -r "$dev" ] || continue
+		(
+			while dd if="$dev" of=/dev/null bs=4096 count=1 2>/dev/null; do
+				echo key >&3
+			done
+		) &
+		pids="$pids $!"
+	done
+	trap 'exit 0' TERM INT HUP
+	# shellcheck disable=SC2086
+	trap '[ -n "$pids" ] && kill $pids 2>/dev/null' EXIT
+
+	find_connector
+	log "started: connector ${CONN_DPMS:-none}, keys ${kd:-none}, poll ${POLL}s," \
+		"screen on MIF ${HIGH_MIF:--} INT ${HIGH_INT:--}, off MIF ${LOW_MIF:--} INT ${LOW_INT:--}" \
+		"(screen-off lowering $SCREEN_OFF_LOW)"
+
+	offs=0
+	seen_on=0
+	NOW=0
+	hold_until=0
+	msg=
+	while :; do
+		if [ -e "$RUN/manual" ] || [ -e "$RUN/sleeping" ]; then
+			offs=0
+		else
+			screen
+			case $msg in
+			key | on | resume) now; hold_until=$((NOW + HOLD)); offs=0 ;;
+			esac
+			# 3-r16: DPMS only reflects the compositor's atomic state. During boot the
+			# splash (plymouth via fbdev) and the console draw while DPMS reads Off, so
+			# only lower once phoc runs and the screen has been seen On at least once.
+			[ "$SCREEN" = on ] && seen_on=1
+			if [ "$SCREEN" = off ] && [ "$seen_on" = 1 ] && pgrep -x phoc >/dev/null 2>&1; then
+				offs=$((offs + 1))
+			else
+				offs=0
+			fi
+			[ "$offs" -ge "$OFF_SAMPLES" ] && now
+			if [ "$SCREEN_OFF_LOW" = 1 ] && [ "$offs" -ge "$OFF_SAMPLES" ] &&
+				[ "$NOW" -ge "$hold_until" ] && cp_running; then
+				apply high "screen off, CP running"
+			elif [ "$SCREEN_OFF_LOW" = 1 ] && [ "$offs" -ge "$OFF_SAMPLES" ] &&
+				[ "$NOW" -ge "$hold_until" ]; then
+				apply low "screen off"
+			else
+				apply high "screen $SCREEN${msg:+, $msg}"
+			fi
+		fi
+		msg=
+		# BusyBox ash has read -t (timeout, also on a FIFO)
+		# shellcheck disable=SC3045
+		read -r -t "$POLL" msg <&3
+	done
+}
+
+decode_pll() {
+	command -v "$DEVMEM" >/dev/null 2>&1 || { echo "PLL_MIF: $DEVMEM missing"; return 0; }
+	p=$($DEVMEM 0x1bc00140 2>/dev/null) m=$($DEVMEM 0x1bc01000 2>/dev/null)
+	[ -n "$p" ] && [ -n "$m" ] || { echo "PLL_MIF: read failed (root?)"; return 0; }
+	pm=$(( (p >> 16) & 0x3ff )) pp=$(( (p >> 8) & 0x3f )) ps=$(( p & 7 ))
+	f=0
+	[ "$pp" -gt 0 ] && f=$(( 26 * pm / (pp << ps) ))
+	echo "PLL_MIF $p (M=$pm P=$pp S=$ps -> $f MHz, DDR ~ half) CLKMUX_MIF_DDRPHY2X $m (bit0 $(( m & 1 )): 0 = PLL_MIF, 1 = switch clock, low levels)"
+}
+
+status() {
+	if [ -w "$KNOB" ]; then echo "knob: $KNOB"; else echo "knob: missing ($KNOB)"; fi
+	echo "config: ENABLE=$ENABLE SCREEN_OFF_LOW=$SCREEN_OFF_LOW SLEEP_LOW=$SLEEP_LOW DECON_SOFT_OFF=${DECON_SOFT_OFF:-keep}"
+	echo "levels kHz: high MIF ${HIGH_MIF:--} INT ${HIGH_INT:--} DISP ${HIGH_DISP:--} |" \
+		"low MIF ${LOW_MIF:--} INT ${LOW_INT:--} DISP ${LOW_DISP:--} |" \
+		"sleep MIF ${SLEEP_MIF:--} INT ${SLEEP_INT:--} DISP ${SLEEP_DISP:--}"
+	st=$(systemctl is-active beyond2lte-dvfs.service 2>/dev/null)
+	mode=auto
+	[ -r "$RUN/manual" ] && mode="manual $(cat "$RUN/manual")"
+	[ -e "$RUN/sleeping" ] && mode="$mode (sleeping marker set)"
+	echo "service: ${st:-unknown}, mode: $mode, profile: $(cat "$RUN/profile" 2>/dev/null || echo none)"
+	screen
+	echo "screen: $SCREEN (${CONN_DPMS:-no DSI connector}), soft_off: $(cat "$SOFT_OFF" 2>/dev/null || echo n/a)"
+	echo "last requests kHz (FREQ_GET is broken, these are what this tool sent):" \
+		"MIF $(cat "$RUN/cur.0" 2>/dev/null || echo ?)" \
+		"INT $(cat "$RUN/cur.1" 2>/dev/null || echo ?)" \
+		"DISP $(cat "$RUN/cur.6" 2>/dev/null || echo ?)"
+	echo "power keys: $(key_devices | tr '\n' ' ')"
+	decode_pll
+}
+
+case $1 in
+daemon) daemon ;;
+status) status ;;
+low | high)
+	have_knob || exit 1
+	mkdir -p "$RUN"
+	echo "$1" > "$RUN/manual"
+	screen
+	[ "$1" = low ] && [ "$SCREEN" = on ] && echo "warning: screen is on, scanout at low MIF is untested" >&2
+	apply "$1" "manual"
+	echo "manual $1; 'beyond2lte-dvfs auto' gives control back to the service"
+	;;
+auto)
+	rm -f "$RUN/manual"
+	nudge on
+	echo "auto (service: $(systemctl is-active beyond2lte-dvfs.service 2>/dev/null))"
+	;;
+restore)
+	[ -w "$KNOB" ] || exit 0
+	apply boot "service stopped"
+	rm -rf "$RUN"
+	;;
+sleep-pre)
+	[ "$ENABLE" = 1 ] && [ "$SLEEP_LOW" = 1 ] && [ -w "$KNOB" ] || exit 0
+	cp_running && exit 0
+	mkdir -p "$RUN"
+	: > "$RUN/sleeping"
+	apply sleep "system sleep"
+	;;
+sleep-post)
+	[ -e "$RUN/sleeping" ] || exit 0
+	rm -f "$RUN/sleeping"
+	p=high
+	[ -r "$RUN/manual" ] && read -r p < "$RUN/manual"
+	# up first (a power-key wake turns the screen on right away); the daemon
+	# lowers again after HOLD s if the screen stays off
+	apply "$p" "resume"
+	nudge resume
+	;;
+*)
+	echo "usage: ${0##*/} status | low | high | auto" >&2
+	exit 2
+	;;
+esac

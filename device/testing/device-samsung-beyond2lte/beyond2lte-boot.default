@@ -1,0 +1,16 @@
+# Kernel fallback / boot menu settings (device-samsung-beyond2lte).
+# See /usr/libexec/beyond2lte-boot.
+
+# systemd-boot menu timeout in seconds (written to /boot/loader/loader.conf by
+# the boot-deploy hook on the next `sudo mkinitfs` / kernel install).
+# 0 hides the menu; it then only shows while a key is held.
+MENU_TIMEOUT=3
+
+# 1: arm systemd-boot boot counting for every newly deployed kernel/initramfs.
+# After BOOT_TRIES failed boots (forced restart = Power+Vol-Down ~7 s), the
+# last known-good kernel boots automatically.
+BOOTCOUNT=1
+BOOT_TRIES=3
+
+# Seconds after boot before the running kernel counts as good and is saved.
+GOOD_DELAY=60

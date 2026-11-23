@@ -1,0 +1,19 @@
+# device-samsung-beyond2lte: enabled on install (systemd-apk-trigger runs
+# `systemctl preset` for newly installed units)
+enable usb-gadget-reconnect.service
+enable touch-rebind.service
+# touch-wake.service: shipped but not enabled since 3-r7 (r9: touch works at boot
+# without it; the panel->touch DT link handles it). Enable by hand if needed.
+enable beyond2lte-charge.service
+enable beyond2lte-rtc.service
+enable beyond2lte-rtc-save.path
+enable beyond2lte-boot-arm.path
+enable beyond2lte-boot-good.service
+enable beyond2lte-fallback-modules.service
+enable systemd-timesyncd.service
+# Display takeover wait: a no-op unless exynos9820_decon enable=1 is set (opt-in, see modprobe.conf)
+enable beyond2lte-display-takeover.service
+# Memory/bus DVFS (MIF/INT low with the screen off); exits at once without the dvfs_cmd knob
+enable beyond2lte-dvfs.service
+# Screen on for a ringing voice call (shannon-modem call flag)
+enable beyond2lte-call-wake.path

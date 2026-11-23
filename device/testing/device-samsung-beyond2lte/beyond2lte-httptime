@@ -1,0 +1,13 @@
+#!/bin/sh
+# Set the clock from the HTTP "Date:" header of a well-known site, through
+# $https_proxy if set (e.g. a proxy on the host when on USB networking).
+# Accuracy ~1 s. Run as root:  sudo -E beyond2lte-httptime [URL]
+URL=${1:-https://www.google.com/}
+d=$(wget -S --spider -q -T 10 "$URL" 2>&1 | sed -n 's/^ *[Dd]ate: *//p' | head -1 | tr -d '\r')
+[ -n "$d" ] || d=$(curl -sI -m 10 "$URL" 2>/dev/null | sed -n 's/^[Dd]ate: *//p' | head -1 | tr -d '\r')
+[ -n "$d" ] || { echo "no Date header from $URL" >&2; exit 1; }
+# "Sat, 14 Nov 2026 12:34:56 GMT" -> busybox/coreutils date
+s=$(date -u -D '%a, %d %b %Y %H:%M:%S GMT' -d "$d" +%s 2>/dev/null || date -u -d "$d" +%s) || exit 1
+date -u -s "@$s" >/dev/null 2>&1 || date -u -s "$(date -u -d "@$s" '+%Y-%m-%d %H:%M:%S')"
+echo "clock set to $(date -u) from $URL"
+[ -e /dev/rtc0 ] && hwclock -u -w -f /dev/rtc0 && echo "rtc0 written"

@@ -1,0 +1,10 @@
+[Unit]
+Description=Soft-reconnect USB gadget if the host did not enumerate it
+After=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/usb-gadget-reconnect.sh
+
+[Install]
+WantedBy=multi-user.target

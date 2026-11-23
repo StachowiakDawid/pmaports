@@ -1,0 +1,11 @@
+[Unit]
+Description=Wake the s6sy761 touch controller with one panel display off/on (it stays dead until the panel cycles)
+After=systemd-modules-load.service
+Before=greetd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for i in $(seq 1 60); do b=$(ls -d /sys/class/backlight/* 2>/dev/null | head -1); [ -n "$b" ] && break; sleep 1; done; [ -n "$b" ] || exit 0; sleep 1; echo 1 > $b/bl_power; sleep 1; echo 0 > $b/bl_power'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Light the screen for a ringing voice call
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/beyond2lte-call-wake

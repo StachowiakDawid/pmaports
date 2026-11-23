@@ -1,0 +1,11 @@
+# device-samsung-beyond2lte-autosuspend: deep sleep after 5 min idle, on battery
+# and on the charger (the screen blanks at 2 min). A plugged-in SDR radio keeps
+# the phone awake (beyond2lte-sdr-inhibit@.service).
+[org.gnome.settings-daemon.plugins.power]
+sleep-inactive-ac-type='suspend'
+sleep-inactive-battery-type='suspend'
+sleep-inactive-ac-timeout=300
+sleep-inactive-battery-timeout=300
+
+[org.gnome.desktop.session]
+idle-delay=uint32 120

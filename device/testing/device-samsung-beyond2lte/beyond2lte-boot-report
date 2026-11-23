@@ -1,0 +1,32 @@
+#!/bin/sh
+# Capture boot-time analysis.
+#   beyond2lte-boot-report [OUTDIR]     (default ~/boot-report-<date>)
+# Then copy the boot-report-* directory to the host (scp).
+# Works as user; run with sudo for the full journal and dmesg.
+O=${1:-$HOME/boot-report-$(date +%Y%m%d-%H%M%S)}
+mkdir -p "$O" || exit 1
+run() { f=$1; shift; { echo "\$ $*"; "$@"; } > "$O/$f" 2>&1; }
+run 00-summary.txt     systemd-analyze time
+run 01-blame.txt       systemd-analyze blame --no-pager
+run 02-critical.txt    systemd-analyze critical-chain --no-pager
+run 03-critical-greetd.txt systemd-analyze critical-chain greetd.service --no-pager
+run 04-failed.txt      systemctl --failed --no-pager
+run 05-jobs.txt        systemctl list-jobs --no-pager
+run 06-cmdline.txt     cat /proc/cmdline
+run 07-uname.txt       uname -a
+run 08-dmesg.txt       dmesg
+run 09-journal-warn.txt journalctl -b -p warning --no-pager
+run 10-journal.txt     journalctl -b -o short-monotonic --no-pager
+run 11-boot-fallback.txt /usr/libexec/beyond2lte-boot status
+run 12-rtc.txt         /usr/libexec/beyond2lte-rtc status
+run 13-security.txt    systemd-analyze security --no-pager
+systemd-analyze plot > "$O/boot.svg" 2>/dev/null
+# slowest kernel initcalls / probes (needs initcall_debug on the cmdline for
+# full detail: echo initcall_debug | sudo tee /etc/kernel-cmdline.d/90-debug.conf && sudo mkinitfs)
+dmesg 2>/dev/null | awk '/initcall .* returned/ {for(i=1;i<=NF;i++) if($i=="after"){t=$(i+1); print t, $0}}' \
+	| sort -rn | head -40 > "$O/14-slow-initcalls.txt"
+dmesg 2>/dev/null | awk -F'[][]' '{print $2}' | awk 'NR>1 && $1-p > 0.5 {printf "gap %.2fs before %s\n", $1-p, $1} {p=$1}' \
+	> "$O/15-dmesg-gaps.txt"
+tar -C "$(dirname "$O")" -czf "$O.tar.gz" "$(basename "$O")" 2>/dev/null
+echo "report: $O ($O.tar.gz)"
+head -3 "$O/00-summary.txt"

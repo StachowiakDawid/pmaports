@@ -1,0 +1,74 @@
+#!/usr/bin/python3 -I
+"""Fix the systemd-boot menu separator on Alpine/postmarketOS builds.
+
+systemd-boot is compiled with -fshort-wchar -fwide-exec-charset=UCS2.  musl's
+iconv treats "UCS2" as big-endian, so every L'x' wide character constant comes
+out byte-swapped.  The only one in the boot menu is the separator in boot.c:
+
+    separator[i] = unicode_supported() ? L'─' : L'-';
+
+which becomes 0x0025 ('%') / 0x2D00, so the menu shows a row of '%'.  This
+patches exactly those two MOVZ immediates (0x25 -> 0x2500, 0x2d00 -> 0x2d) in
+an aarch64 systemd-boot EFI binary.  It changes nothing unless it finds exactly
+one such pair within 8 instructions; an already fixed binary is left alone.
+
+usage: beyond2lte-sdboot-wchar-fix FILE...    (exit 0 = fixed / already fine)
+"""
+import os
+import struct
+import sys
+
+MOVZ_W = 0x52800000          # MOVZ Wd, #imm16 (hw = 0)
+MOVZ_MASK = 0xFFE00000
+
+
+def movz_imm(w):
+    return (w >> 5) & 0xFFFF if (w & MOVZ_MASK) == MOVZ_W else None
+
+
+def find_pairs(d, a, b):
+    words = [struct.unpack_from("<I", d, o)[0] for o in range(0, len(d) - 3, 4)]
+    out = []
+    for i, w in enumerate(words):
+        if movz_imm(w) != a:
+            continue
+        for j in range(max(0, i - 8), min(len(words), i + 9)):
+            if j != i and movz_imm(words[j]) == b:
+                out.append((i * 4, j * 4))
+    return out
+
+
+def fix(path):
+    with open(path, "rb") as f:
+        d = bytearray(f.read())
+    if b"systemd-boot" not in d:
+        print(f"{path}: not systemd-boot, skipped")
+        return 0
+    bad = find_pairs(d, 0x0025, 0x2D00)
+    if not bad:
+        good = find_pairs(d, 0x2500, 0x002D)
+        print(f"{path}: {'already fixed' if good else 'pattern not found, left alone'}")
+        return 0
+    if len(bad) != 1:
+        print(f"{path}: {len(bad)} candidate pairs, left alone")
+        return 1
+    for off, new in zip(bad[0], (0x2500, 0x002D)):
+        w = struct.unpack_from("<I", d, off)[0]
+        struct.pack_into("<I", d, off, (w & ~(0xFFFF << 5)) | (new << 5))
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(d)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+    os.replace(tmp, path)
+    print(f"{path}: separator fixed (offsets {bad[0][0]:#x}, {bad[0][1]:#x})")
+    return 0
+
+
+if __name__ == "__main__":
+    rc = 0
+    for p in sys.argv[1:]:
+        if os.path.isfile(p):
+            rc |= fix(p)
+    sys.exit(rc)

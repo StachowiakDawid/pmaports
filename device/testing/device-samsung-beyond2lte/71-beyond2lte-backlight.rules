@@ -1,0 +1,5 @@
+# Let the logged-in session (beyond2lte-blank user service) switch the panel
+# off/on via bl_power; brightness is already handled by the systemd-backlight
+# / logind SetBrightness path.
+SUBSYSTEM=="backlight", ACTION=="add", \
+	RUN+="/bin/chgrp video /sys%p/bl_power", RUN+="/bin/chmod g+w /sys%p/bl_power"

@@ -1,0 +1,25 @@
+# Charging policy for the Galaxy S10+ (beyond2lte), read by
+# /usr/local/bin/beyond2lte-charge (beyond2lte-charge.service).
+# All values are optional. Unset = leave what the hardware/firmware picked.
+
+# Stop charging at END %, resume below START % (inhibit-charge, the system
+# still runs from the charger). 100 = no limit.
+CHARGE_START_THRESHOLD=60
+CHARGE_END_THRESHOLD=80
+
+# Hardware cap on the battery float voltage in uV (max 4350000).
+# 4100000 keeps the battery at roughly 85 %. Unset = 4350000 (DT default).
+#FLOAT_VOLTAGE_UV=4100000
+
+# Fast-charge current into the battery in uA (charger max 3150000,
+# battery spec 2850000). Reduced automatically when the battery is cold or hot.
+CHARGE_CURRENT_UA=2100000
+
+# Input current limit in uA. Only set this when you know the charger can
+# deliver it: there is no USB charger-type detection yet, and a USB host port
+# only guarantees 500 mA (the MAX77705 AICL backs off if VBUS sags).
+# 5 V wall chargers (DCP/AFC/QC/PD at 5 V): 1650000..2000000 is fine.
+#INPUT_CURRENT_UA=1650000
+
+# Poll interval in seconds
+INTERVAL=30

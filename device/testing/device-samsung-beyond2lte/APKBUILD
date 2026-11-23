@@ -1,0 +1,353 @@
+# Reference: <https://postmarketos.org/devicepkg>
+# Samsung Galaxy S10+ (SM-G975F). Uses the generic Exynos 9820 kernel
+# (linux-postmarketos-exynos9820) and U-Boot (EFI -> systemd-boot, DT from
+# U-Boot); this package adds the beyond2lte-specific userspace glue.
+maintainer="StachowiakDawid <dawidos234@gmail.com>"
+pkgname=device-samsung-beyond2lte
+pkgdesc="Samsung Galaxy S10+"
+pkgver=3
+pkgrel=52
+url="https://postmarketos.org"
+arch="aarch64"
+license="MIT"
+# firmware-samsung-beyond2lte-stock: local-only package, files from this
+# phone's vendor partition (not redistributable), see its APKBUILD.
+depends="
+	alsa-ucm-conf
+	beyond2lte-tools
+	bluez-btmgmt
+	e2fsprogs-extra
+	firmware-samsung-beyond2lte-stock
+	linux-postmarketos-exynos9820
+	postmarketos-base
+	python3
+	reboot-mode
+	systemd-boot
+"
+makedepends="devicepkg-dev"
+# was provided (virtually) by the generic device-samsung-exynos9820
+replaces="device-samsung-exynos9820"
+subpackages="
+	$pkgname-autosuspend:autosuspend:noarch
+	$pkgname-nosuspend:nosuspend:noarch
+	$pkgname-phosh:phosh:noarch
+	$pkgname-pipewire:pipewire_audio:noarch
+"
+_pmb_recommends="$pkgname-autosuspend"
+# systemd-boot app changes: re-apply the menu separator fix
+triggers="$pkgname.trigger=/usr/lib/systemd/boot/efi"
+source="
+	deviceinfo
+	kernel-cmdline.conf
+	51-wifi-powersave.conf
+	modprobe.conf
+	beyond2lte-usbc.conf
+	usb-gadget-reconnect.sh
+	usb-gadget-reconnect.service
+	touch-rebind.service
+	touch-wake.service
+	70-beyond2lte-feedback.rules
+	72-beyond2lte-ufs-rpm.rules
+	62-beyond2lte-usbc-sleep.rules
+	beyond2lte-usbc-sleep
+	50-wifi-permanent-mac.conf
+	beyond2lte-charge
+	beyond2lte-charge.default
+	beyond2lte-charge.service
+	beyond2lte-boot
+	beyond2lte-boot.default
+	boot-deploy-hook.sh
+	sleep-mem-only.conf
+	osk-no-respawn.conf
+	beyond2lte-sdboot-wchar-fix
+	beyond2lte-boot-arm.path
+	beyond2lte-boot-arm.service
+	beyond2lte-boot-good.service
+	beyond2lte-fallback-modules.service
+	beyond2lte-rtc
+	beyond2lte-rtc.service
+	beyond2lte-rtc-save.path
+	beyond2lte-rtc-save.service
+	beyond2lte-httptime
+	timesyncd.conf
+	watchdog.conf
+	beyond2lte-boot-report
+	80-device-samsung-beyond2lte.preset
+	50_beyond2lte-autosuspend.gschema.override
+	beyond2lte-feedbackd.conf
+	62-beyond2lte-sdr-inhibit.rules
+	beyond2lte-boot-nosleep.service
+	beyond2lte-sdr-inhibit@.service
+	beyond2lte-resuspend
+	beyond2lte-resuspend.service
+	beyond2lte-resuspend.sleep
+	beyond2lte-call-wake
+	beyond2lte-call-wake.path
+	beyond2lte-call-wake.service
+	logind-nosuspend.conf
+	sleep-nosuspend.conf
+	50_beyond2lte-nosuspend.gschema.override
+	phoc.ini
+	beyond2lte-blank
+	beyond2lte-blank.service
+	71-beyond2lte-backlight.rules
+	80-device-samsung-beyond2lte.user-preset
+	beyond2lte-bt-addr
+	beyond2lte-bt-addr.default
+	beyond2lte-bt-addr.service
+	81-beyond2lte-bt-addr.rules
+	beyond2lte-display-takeover
+	beyond2lte-display-takeover.service
+	beyond2lte-dvfs
+	beyond2lte-dvfs.default
+	beyond2lte-dvfs.service
+	beyond2lte-dvfs.sleep
+	ucm/beyond-madera.conf
+	ucm/HiFi.conf
+	60-beyond2lte-voice-mic.conf
+	61-beyond2lte-call-mic.conf
+	61-beyond2lte-call-mic.wireplumber.conf
+	beyond2lte-call-mic-reference.lua
+"
+options="!archcheck !check"
+
+build() {
+	devicepkg_build $startdir $pkgname
+}
+
+package() {
+	# deviceinfo, machine-info, kernel-cmdline.d, modprobe.d
+	devicepkg_package $startdir $pkgname
+
+	cd "$srcdir"
+	local sys="$pkgdir"/usr/lib/systemd/system
+	install -Dm644 beyond2lte-usbc.conf "$pkgdir"/etc/modprobe.d/beyond2lte-usbc.conf
+
+	# USB gadget reconnect (+ MUIC CTRL1 fix via i2crw unless max77705-usbc is bound)
+	install -Dm755 usb-gadget-reconnect.sh "$pkgdir"/usr/libexec/usb-gadget-reconnect.sh
+	install -Dm644 usb-gadget-reconnect.service -t "$sys"
+	install -Dm644 touch-rebind.service -t "$sys"
+	install -Dm644 touch-wake.service -t "$sys"
+
+	install -Dm644 70-beyond2lte-feedback.rules -t "$pkgdir"/usr/lib/udev/rules.d
+	install -Dm644 72-beyond2lte-ufs-rpm.rules -t "$pkgdir"/usr/lib/udev/rules.d
+	install -Dm644 62-beyond2lte-usbc-sleep.rules -t "$pkgdir"/usr/lib/udev/rules.d
+	install -Dm755 beyond2lte-usbc-sleep -t "$pkgdir"/usr/libexec
+	install -Dm644 50-wifi-permanent-mac.conf -t "$pkgdir"/usr/lib/NetworkManager/conf.d
+	install -Dm644 51-wifi-powersave.conf -t "$pkgdir"/usr/lib/NetworkManager/conf.d
+
+	# charging policy (enabled, 60-80 % window for 24/7 plugged use)
+	install -Dm755 beyond2lte-charge "$pkgdir"/usr/libexec/beyond2lte-charge
+	install -Dm644 beyond2lte-charge.default "$pkgdir"/etc/default/beyond2lte-charge
+	install -Dm644 beyond2lte-charge.service -t "$sys"
+
+	# kernel fallback: loader.conf hook, boot counting, known-good slots
+	install -Dm755 beyond2lte-boot "$pkgdir"/usr/libexec/beyond2lte-boot
+	install -Dm644 beyond2lte-boot.default "$pkgdir"/etc/default/beyond2lte-boot
+	install -Dm755 boot-deploy-hook.sh \
+		"$pkgdir"/usr/share/boot-deploy/hooks/50-beyond2lte-loader-conf
+	install -Dm755 beyond2lte-sdboot-wchar-fix -t "$pkgdir"/usr/libexec/
+	# never fall back to s2idle (hangs with the modem running)
+	install -Dm644 sleep-mem-only.conf \
+		"$pkgdir"/usr/lib/systemd/sleep.conf.d/40-beyond2lte-mem-only.conf
+	# greeter OSK: no respawn loop into a dead compositor at login
+	install -Dm644 osk-no-respawn.conf \
+		"$pkgdir"/usr/lib/systemd/user/mobi.phosh.OSK.service.d/50-beyond2lte.conf
+	install -Dm644 beyond2lte-boot-arm.path beyond2lte-boot-arm.service \
+		beyond2lte-boot-good.service beyond2lte-fallback-modules.service -t "$sys"
+	install -dm755 "$pkgdir"/var/lib/beyond2lte-boot
+
+	# time: RTC load/save, timesyncd, HTTP fallback
+	install -Dm755 beyond2lte-rtc "$pkgdir"/usr/libexec/beyond2lte-rtc
+	install -Dm644 beyond2lte-rtc.service beyond2lte-rtc-save.path \
+		beyond2lte-rtc-save.service -t "$sys"
+	install -Dm755 beyond2lte-httptime "$pkgdir"/usr/bin/beyond2lte-httptime
+	install -Dm644 timesyncd.conf \
+		"$pkgdir"/usr/lib/systemd/timesyncd.conf.d/50-beyond2lte.conf
+
+	# Bluetooth: real public address from the EFS partition (read-only) when hci0 appears
+	install -Dm755 beyond2lte-bt-addr "$pkgdir"/usr/libexec/beyond2lte-bt-addr
+	install -Dm644 beyond2lte-bt-addr.default "$pkgdir"/etc/default/beyond2lte-bt-addr
+	install -Dm644 beyond2lte-bt-addr.service -t "$sys"
+	install -Dm644 81-beyond2lte-bt-addr.rules -t "$pkgdir"/usr/lib/udev/rules.d
+	install -dm755 "$pkgdir"/var/lib/beyond2lte
+
+	# ALSA UCM2 for the beyond-madera card (speaker/earpiece/headphones/mics, amp gain caps)
+	install -Dm644 beyond-madera.conf \
+		-t "$pkgdir"/usr/share/alsa/ucm2/conf.d/beyond-madera
+	install -Dm644 HiFi.conf -t "$pkgdir"/usr/share/alsa/ucm2/Samsung/beyond2lte
+
+	# DECON KMS takeover wait before greetd (no-op unless exynos9820_decon enable=1, opt-in,
+	# see modprobe.conf)
+	install -Dm755 beyond2lte-display-takeover "$pkgdir"/usr/libexec/beyond2lte-display-takeover
+	install -Dm644 beyond2lte-display-takeover.service -t "$sys"
+
+	# memory/bus DVFS: MIF/INT low while the screen is off and in s2idle (no-op
+	# without the acpm_protocol.dvfs_cmd knob, pmaports 0030)
+	install -Dm755 beyond2lte-dvfs "$pkgdir"/usr/libexec/beyond2lte-dvfs
+	install -Dm644 beyond2lte-dvfs.default "$pkgdir"/etc/default/beyond2lte-dvfs
+	install -Dm644 beyond2lte-dvfs.service -t "$sys"
+	install -Dm755 beyond2lte-dvfs.sleep \
+		"$pkgdir"/usr/lib/systemd/system-sleep/beyond2lte-dvfs
+	install -dm755 "$pkgdir"/usr/bin
+	ln -s ../libexec/beyond2lte-dvfs "$pkgdir"/usr/bin/beyond2lte-dvfs
+
+	install -Dm644 watchdog.conf "$pkgdir"/usr/lib/systemd/system.conf.d/50-beyond2lte-watchdog.conf
+	install -Dm755 beyond2lte-boot-report "$pkgdir"/usr/bin/beyond2lte-boot-report
+	install -Dm644 beyond2lte-feedbackd.conf \
+		"$pkgdir"/usr/lib/sysusers.d/beyond2lte-feedbackd.conf
+	# voice calls (shannon-modem's /run/shannon/call-active): a ringing call
+	# lights the screen, also after a dark modem wake
+	install -Dm755 beyond2lte-call-wake -t "$pkgdir"/usr/libexec
+	install -Dm644 beyond2lte-call-wake.path beyond2lte-call-wake.service -t "$sys"
+
+	install -Dm644 80-device-samsung-beyond2lte.preset \
+		-t "$pkgdir"/usr/lib/systemd/system-preset
+}
+
+autosuspend() {
+	pkgdesc="Samsung Galaxy S10+: deep sleep after 5 min idle; a plugged-in SDR radio keeps it awake"
+	depends="$pkgname=$pkgver-r$pkgrel !$pkgname-nosuspend"
+	replaces="$pkgname-nosuspend"
+	cd "$srcdir"
+	install -Dm644 50_beyond2lte-autosuspend.gschema.override \
+		-t "$subpkgdir"/usr/share/glib-2.0/schemas
+	install -Dm644 62-beyond2lte-sdr-inhibit.rules \
+		-t "$subpkgdir"/usr/lib/udev/rules.d
+	install -Dm644 beyond2lte-sdr-inhibit@.service beyond2lte-boot-nosleep.service \
+		-t "$subpkgdir"/usr/lib/systemd/system
+	mkdir -p "$subpkgdir"/usr/lib/systemd/system/multi-user.target.wants
+	ln -s ../beyond2lte-boot-nosleep.service \
+		"$subpkgdir"/usr/lib/systemd/system/multi-user.target.wants/beyond2lte-boot-nosleep.service
+	# suspend again after wakes without user input (gsd-power does not re-arm)
+	install -Dm755 beyond2lte-resuspend -t "$subpkgdir"/usr/libexec
+	install -Dm644 beyond2lte-resuspend.service -t "$subpkgdir"/usr/lib/systemd/system
+	install -Dm755 beyond2lte-resuspend.sleep \
+		"$subpkgdir"/usr/lib/systemd/system-sleep/beyond2lte-resuspend
+}
+
+nosuspend() {
+	pkgdesc="Samsung Galaxy S10+: never suspend (24/7 server use; replaces -autosuspend)"
+	depends="$pkgname=$pkgver-r$pkgrel !$pkgname-autosuspend"
+	cd "$srcdir"
+	install -Dm644 logind-nosuspend.conf \
+		"$subpkgdir"/usr/lib/systemd/logind.conf.d/50-beyond2lte-nosuspend.conf
+	install -Dm644 sleep-nosuspend.conf \
+		"$subpkgdir"/usr/lib/systemd/sleep.conf.d/50-beyond2lte-nosuspend.conf
+	install -Dm644 50_beyond2lte-nosuspend.gschema.override \
+		-t "$subpkgdir"/usr/share/glib-2.0/schemas
+	local t
+	mkdir -p "$subpkgdir"/etc/systemd/system
+	for t in sleep suspend hibernate hybrid-sleep suspend-then-hibernate; do
+		ln -s /dev/null "$subpkgdir"/etc/systemd/system/$t.target
+	done
+}
+
+pipewire_audio() {
+	# PipeWire is the audio backend for this device (like PinePhone): only its UCM
+	# code supports SplitPCM, which the UCM uses to offer Speaker and Earpiece as two
+	# sinks of one profile (verified 3-r12). Pulled in automatically on UIs with audio.
+	# Under PulseAudio the UCM falls back to the route layout (see ucm/HiFi.conf).
+	pkgdesc="Samsung Galaxy S10+: use PipeWire as the audio backend (Speaker + Earpiece as two outputs)"
+	install_if="$pkgname=$pkgver-r$pkgrel postmarketos-base-ui-audio"
+	depends="$pkgname=$pkgver-r$pkgrel postmarketos-base-ui-audio-backend-pipewire
+		pipewire-echo-cancel pipewire-webrtc"
+	# WebRTC voice-processing source (AGC + noise suppression) on the internal mics
+	install -Dm644 "$srcdir"/60-beyond2lte-voice-mic.conf \
+		-t "$subpkgdir"/usr/share/pipewire/pipewire.conf.d
+	# second, echo-cancelled source for calls/VoIP (reference linked on demand)
+	install -Dm644 "$srcdir"/61-beyond2lte-call-mic.conf \
+		-t "$subpkgdir"/usr/share/pipewire/pipewire.conf.d
+	install -Dm644 "$srcdir"/61-beyond2lte-call-mic.wireplumber.conf \
+		"$subpkgdir"/usr/share/wireplumber/wireplumber.conf.d/61-beyond2lte-call-mic.conf
+	install -Dm644 "$srcdir"/beyond2lte-call-mic-reference.lua \
+		-t "$subpkgdir"/usr/share/wireplumber/scripts
+}
+
+phosh() {
+	pkgdesc="Samsung Galaxy S10+: Phosh display scale and OLED blanking"
+	install_if="$pkgname=$pkgver-r$pkgrel postmarketos-ui-phosh"
+	depends=""
+	# /usr/share/phosh/phoc.ini is owned by phosh
+	replaces="phosh"
+	cd "$srcdir"
+	install -Dm644 phoc.ini "$subpkgdir"/usr/share/phosh/phoc.ini
+	install -Dm755 beyond2lte-blank "$subpkgdir"/usr/libexec/beyond2lte-blank
+	install -Dm644 beyond2lte-blank.service -t "$subpkgdir"/usr/lib/systemd/user
+	install -Dm644 80-device-samsung-beyond2lte.user-preset \
+		"$subpkgdir"/usr/lib/systemd/user-preset/80-device-samsung-beyond2lte.preset
+	install -Dm644 71-beyond2lte-backlight.rules -t "$subpkgdir"/usr/lib/udev/rules.d
+}
+sha512sums="
+abecc280bdb244e9ef1dcfef26e6f63adc97222bec4ff98b7eaf8fed99f238037e944adfb96a3fc12142eab6ba022c36ab824d476143e5ba4cab34a1dc70bbee  deviceinfo
+e533b0c7c583a611e88ff7f6a8df01e832f1803d9e02dc856980d73d6b3e7fa2dcd06fec75eeec94e084ebbfddfeae094db0fc42c6e4b6a49102ed8deace3255  kernel-cmdline.conf
+7670a41341807fa65c096661ac7324642a164b57fb14d16d15344f8a7e13f6df224d9229806c5e04ee4e301d02a5814ff2a9145d4b4c22123ef9ff42c59f75f8  51-wifi-powersave.conf
+814a72e9c7654e3fe628b4dda94538fcc69f619b6aa04f9bf943ab11ada187670d3cfc7368c033d8aecedbc175b55e6986f144ff9769b032f1f60e023593d366  modprobe.conf
+d64f4faefb7320fb03da378993815423f9b76fc3939b47a95f7b48d0647d0f9e0f86dc5558bfbf51846255e127a1f07c268632438bb20c0b6b4dacdfb8fa3262  beyond2lte-usbc.conf
+fdca8ba7b7994b09f5fd9e23b8c3b425bb78318bc1c0a9b8dc0dac33e92c146f2c55c9c53fb1126f1ec5d330ac3fb9a94dc245cd0ab53ec9e20f6485f05fc1e2  usb-gadget-reconnect.sh
+69b2ee3e767829dfaad4e4a9b311f1bc57bd68f494e3081b9a1d9b8c0dfef6f4fa0ce31406b31abb7d4ef5c9520a79a29bdf84e2418b8ec0540abaed80c0a8d8  usb-gadget-reconnect.service
+771fed8dcc1a58144b9063e4d1ab31675ca54b7aa57ab6500a3373dcd663cabe697699a005acccee0be2617375f711e0ad172b664488a284bbf8f57bb052e009  touch-rebind.service
+986c2ece984897d57ccc6af1f5440f33e2382eef528327fb62b3ace385ce7aab04b1c35550d33bd1d3e4850cde7feee91db9f1a884cf131a479a6ff2f39f84c1  touch-wake.service
+853cb1178b7ada934e272a500782b2153d6f80241d873d758637766dd0d5b66c153ad11f5249a7a236ef6cdf1922ba9627d2f77c4442bd81373db93376d80b3f  70-beyond2lte-feedback.rules
+8080b2493b7c2af0856a07a1672b3c74747ba6f20c6a79abd3efc152ee2ea45752e8d1506e0822526a0ebcb8512630af765e91bdba04be75a9075344e754167d  72-beyond2lte-ufs-rpm.rules
+6edbebe9eff48642c78ab9d9124980df33a09b167ed299cd68dd19f359c66f65c855d29531a707ce1827f7a730c18dd09c1cba0a0556f343637221c71616f985  62-beyond2lte-usbc-sleep.rules
+13fc82d2efb586f5dcaf78a2d4c3e36814bb8caf0f232e5f08ea1b15b13006c2031522c3bf649394f8b6b48b35378475440a7056099134881e9362dc4d18e7c7  beyond2lte-usbc-sleep
+e27a99129137c7519b855bbf14b603ef31b1a923378a21d1d50a9bd6b3470ee280374cff0acbdcd9574be6161f5efee7af940d6c703cad23d2d477ee526b8fba  50-wifi-permanent-mac.conf
+d10edbe585078199a520747dc262ebac7f3854d58a4927af9760ce6e9a68d75053f6733b35d33ca3d82fe664a3f63d5ef5cba0445e980b9aef59b89c0f1fd865  beyond2lte-charge
+a1f64685e0d66aa3eec4a991a7594fc1ebc4f2a5459781c263a682121d2ce69c94d4f4c27c881feb0fefd60e8433e0407aec7a1f2b7e7c73d1b2450044c21f72  beyond2lte-charge.default
+1d4f237de6d3ca316332e66d8f86133b6d1bf69affc393e5c307a349787570e414bdad8284c71b5bedb06e3e971f8e30ac248b04eabf3750e9d1fb38029c13c7  beyond2lte-charge.service
+c17e1cb5c6988d01440113c7e28be50af9f472441feaa95bf60bc988fa2e44dfe7e4baa784c6bcf090adb0ab3908e2abe2cba973acedbf6369209c9a0209b29d  beyond2lte-boot
+03a9cb13e8669ab58f8a964d39e1239f137030446bacb1c0d166e1c16b2c8fa7fed35fd7f7f3b429e34a3ded7e982b3f3251ca726781c4a3d584551a4f14ad6d  beyond2lte-boot.default
+9716e582101b8139c9cd76c8d208dbbc6077e1fbbf67302d0b9b9b31ca6c1ea7f856a24340c8a0be7b66638fd25fa5873d9f1806a2436c85b157d254f34c071e  boot-deploy-hook.sh
+c12a5e48ae7858050066269fbb803696e9d114e142ab3b29621c7f30925b7d566b066b03ac202db9e4f2467556b34045edeed669a502313767aa9318b4e2a834  sleep-mem-only.conf
+f1661ef7881e8c860e114d87be772dbdbb9ba9b6aea28903d2a321a1f444a72a82c8cf3674e2c5e3652b13755d9016be0615cf733ba7d22511eafbd6feae8e3c  osk-no-respawn.conf
+8d315041e0f5b319fa697a3211ecd08f21934957dc9b9759395f42459cee6f60400c8131293ccf472587217fdcc1b0035e86e9c2ecb88e9ca1942fc2943b3b82  beyond2lte-sdboot-wchar-fix
+b2680d8dfbe95521e5b34f9baaadc65b705c130deecf2fdc787e647908f1d3c456d0f92923135892966634d79707e803be9fff45493ce65431ae1422cd2e1661  beyond2lte-boot-arm.path
+25299a34d7249174173824a0667fa58fa2ace0382ae3f775485879d1d661db1c190bb147e77261851e6f883798c3b808e742d6f52dbec8982ee01ca06b00a209  beyond2lte-boot-arm.service
+341d93add9f29592d9ba62e735374bc3419fa57714cc3a8c06ec5c6781912cf7338f426d2b9d9650930b28a7343874373e18a480c1cf7bbe04969a93d3fea965  beyond2lte-boot-good.service
+7f0a930f292c9a1a539233d54917aa911396ffd462df0c08838a60fc4eadacee11793a3b7ee28aca354f9a8fd987ac77780113e38a5c084527f0f4e5ec280cc0  beyond2lte-fallback-modules.service
+369e0ecce894f1a601edb8a50d51dd09dbd4cae7b57a1a340f806cce5ee350fa94c4b94e17304b7603afc6e4683a219eff6035a290344b2ee8a5ea711a7afd11  beyond2lte-rtc
+b2e19ef41984b0e7cd582b9f76e16f9223bc88b1cda8f194916ffd4cff70fe703b1558e7340c2deb36c25e3a423abf1c0d78ac3b1df1792bb24f474dca9cf3b6  beyond2lte-rtc.service
+54817b2fdd048cde2b691c579099359657bd553413140dda13371ff4a0c8f4d93ea2499e8c66de2271d1c2c09c41a9c956875edbcb7b10f85688ebcb9626a40d  beyond2lte-rtc-save.path
+05e5bcded9c5f2db7d97cebcf49c7d0bf77dde286d5f16b2916c5b4cd0b01a7cb4d32b647f03a51a4e238c979eabaaf998364480bba2a12208b27094d09225be  beyond2lte-rtc-save.service
+a076fe7055c09176c5ee8a8ea8270f894dd5225e502d5d7545140a2b1fddb2929b617e0d3647ddd0e2963588c3c80194116e82bda9870d05c78051aed8f82012  beyond2lte-httptime
+eaedd413982b0cf66f2a58f4a6b7b8a05bff1b105be92023eef2b10076cb826ef5187b0362660cc5b4790c9134780ca3dffd3d007d15575819a1e07c37256369  timesyncd.conf
+4a1fae681b8992eba3d878f61d21d892bafef7dd180f9cf045af750d61ea568a2ed0db01cf383eb7b0d0a40e3e3d83f13ede791c7686a50ef893cb35b3d662f9  watchdog.conf
+66484a3f8438cf31a9186cb5b6044b8ac4ff1a9da32f274e42005e5ead43102fd54247493099281a448625bc4463ecc148e2902d321c404393c3ea812e0e9b82  beyond2lte-boot-report
+6d492a9053bd3e3aa24dcf04109a514e4b1f1d300de747034ddd820473558500194230e87f5d2f0dae0a383c9e1fbec5736c6a3b5a7724eb11406b1e27d61b55  80-device-samsung-beyond2lte.preset
+7602a28bd650b1557eb00bff36597b9adb16ac122086c965e621a2a40e621941a11f80050b95adc4dd7700a45fe126b35f3b30b93f22d90bfff2d0b151a2de50  50_beyond2lte-autosuspend.gschema.override
+095e3391f69834591fd228774e2ab8aa07940ebf53d8a9dfaeaac84088e2816936d9005b21471c9a68dd7b7f0436a3795e0092c3286ecc2d3c1c9c821ce2a3a4  beyond2lte-feedbackd.conf
+b6ea327d6d10a427d60791dcd1927366436112b79c37ddd8435c920bc039154b1e2f063fa2899a3f9e75eda60ec5cdafaffa84337203f3c32f3408aa758f4e68  62-beyond2lte-sdr-inhibit.rules
+1ddbbc7eaaa7b112cf45ffdd3d8cfab01180259042c0dfe0d59bade102e95d2c880899349a966bd9d05f89ed639e9e909d8ffa0e6ca2c5866d74068e7e1666ec  beyond2lte-boot-nosleep.service
+ec65e2f5b35e4a99053a3d390085dea2f272fc83f7b3f3f971c5bff4f7389d468014c5ad85f03fbf42659c7a872a18041307c92b2a526836edd59df686264a14  beyond2lte-sdr-inhibit@.service
+fd7905ac16a4c9527dc4bf7865d8e55c1e4eef7ccad77c1f65871a6707b8581ba3c1abe22b7d1b9b43c77248ce0fe54bfd7c089715607fd84aff2c7cb07eb9dd  beyond2lte-resuspend
+74176824270c81272558d869f59135b635c01b9bb5cf94d2b1c13afad5078025313e4a9b80e190bb623cc83d4917b7e86e2a38ea1445a517f17ea3846f4e8fc9  beyond2lte-resuspend.service
+c434e4aaa48af679558fcc08d0b417af5c916b166c6134f7e49b79f9776afb9404b2135aa45c1d8c0e7e4c844860730d2ac2798c951e6ce4d1c152a655496555  beyond2lte-resuspend.sleep
+566e59d0f7d55f2fd6d48c0569a2090e1a7b9250ac6253c515e8bc1887ea5694ad95ec5751729d9e1b7f20924412e280f7c06e908c3d7f8d6a282bd14b9ba13d  beyond2lte-call-wake
+6202e44542be32029d8acf5c0160649c6d5de76c98c7bb2ca39a02f441ce012ef0ed699135524cd8d955635bb4b3264ccf61ce25b9113ec253034c47716eeff6  beyond2lte-call-wake.path
+8e14fca616adf40c9329f9c603422d7829659ec5fde038ab2c01edf72c8af89fd5eb4f43789d10eeb789180691a9a2b9876f1e490ab090e91f51be7ce1e89cce  beyond2lte-call-wake.service
+e5d8d10c3c0d5769216bf1967051958a291f076340b9a8491b0cd6a04155cee5c1ac7d5d73b3db3ba6d5c08c643bde4b92d85be1cc60bbd5cbf0dd2a885a537d  logind-nosuspend.conf
+9b3768fa363ea483d70386506a702a71c2194be4d880ee0a360ed247a60551aa744ac60d416bf001b1221237f80ff35e3cbca690661d3efc6aa6b0e1634dba12  sleep-nosuspend.conf
+9d6aa9a525be993a9f7d80f57d223a5d645a54173e94899afc57e4c3c96120dc192b6f814d4477e89a7e6125c5044e7339ec016f4aafc24b870fb87a859d1910  50_beyond2lte-nosuspend.gschema.override
+17e3b5c0aec631649e58f9025f83489e5a3cc050560d16955d34ef12598658db8304121e603a7c26bcbec8f738bc0d1df2387c14cdd325928a9898bd11974681  phoc.ini
+fc554f68ff231d45ba42d41b3563ccb86bfde89013e4b586a3fbc769ce6e10b90955f50f06a09bac39bd5efb828615c205a618cf9a2f4326ed5aa29c36e1faea  beyond2lte-blank
+2141e2e2343cbe16f9866244f83a2dfd4453bbba8e5b6e3575c91327b75be0991727f8634dd6ce5a015eba87cbc7ea13bf169729fc3c11d49478cb1900027a07  beyond2lte-blank.service
+7e883c88adf1eb55da0ef0c2d95531ab2dbb3e483afd20d69ce952f5122a206b3e5c718542b9166053e153bf032e1066e564ea983df0ebef3700567628964c67  71-beyond2lte-backlight.rules
+3465db98da1f4a1062dc3aaf786d81ef53388798cfa399d05164d248c179c07d45320dd39e0ed5342523eecf5eaa4f78c241b59585ba63f69ba0c0945fba1954  80-device-samsung-beyond2lte.user-preset
+55e06ee1b1c89d3262ec19cf64e62edd00dc32960682925992eb0677a46af48b125936bdccbad3ed4c41455c83f50297be04a404538ba20f9101b44bbb895d70  beyond2lte-bt-addr
+1553cdd8b9526a961b75706ee4c901539aec5e58ba00fc6ff3800590910ddee8976214eb6a052a3aa8cfcbdd2e17fe78a52b7337eb47e559090dbe897e6106b7  beyond2lte-bt-addr.default
+e29cc07b5834671df8456c1a4d06de248d1a8e9c2c98cd801171761bc89f7cc59c0263c26478ec2f23a006c780e966da5eb5f30ca1689e762ac7a5785ce14e28  beyond2lte-bt-addr.service
+8ddce97dedf8ecb95caa928c53ee82ded89b9b48bb5ed7e13bdc5df3cc4ef0ca4cb7fddaa250a533ca6080f10e53332b86d498cd1f7aad88d0ca035e464b6713  81-beyond2lte-bt-addr.rules
+771c52808d487b97e9691bdf45576994ccfe7b789a430ebe53b59e4bb63ad7386dbd7e5e37759acc1adee2274ced300c1bf85bc48b58686cd5a72a2b217b16c4  beyond2lte-display-takeover
+e6b406de333fc2640dc943693eb765aa34eac21b745ed3d56edbe4b33bc0f3936dd82932f4fac4202ea8aa0ffb1be5356f3ce484261597dc4e72e10a4fa5ae2f  beyond2lte-display-takeover.service
+abc4ea833dd9b8bfa52ce914b65c1041e865405bedd1c5a6800a514434a1ac7094b14d579c9f29f6c71112e2e9f1cc4e795c7bdf49d2d130e449b2c55c38500c  beyond2lte-dvfs
+f8a565f213bad5a4087012df5e29d2ee8ee37fb2c172830ed41be17790e33a7d4c72a552077775fd8ff418c0216032429671d1708b26b91f0d9bc8fc99935bc6  beyond2lte-dvfs.default
+aa8d3c93e7479d47c8ec977b945b2fb76026c99dddb8a89e47464b529710e2f400a9ffdd397248adcb9541688c1688e7ec6a6f76ea9263398345201226e09e11  beyond2lte-dvfs.service
+00d2ea634894219edb5166b763e9429402168ceea9fd7332c6eb7a3d53d1fa55f5584b6e61d372c057aa109ce0ead06540dc4d475157b040e21b669d2a3d104f  beyond2lte-dvfs.sleep
+c26177d957737c7940866990a0610e4ee517e6bf2fa8edda0254f5e2f1b2bab02145dc899424048c4c329d15b5c9623215bc58c7174d12a6e05ac3aa4e27239b  beyond-madera.conf
+718a9e28e289de21577be8b183e188465ccbbc6d2b695e5662c9c516f8c377179b16ed72b53202bb46ebd7ded358a070463ef4956b5b613c115e1f56714a3f84  HiFi.conf
+475c788b5049b18407e0e25575ee651a1bda1775cbe15aae346a7be711e48741e8e2e73941c4ee59913665ed94f486554a72a9fefeb8b015cb1d822308f30eb7  60-beyond2lte-voice-mic.conf
+ccdc51e09ddc4ca9299290420f9a6c36d3685140b3e755d530e350ae5967439534c846c3db24e04880f9be1d3a2546372a3c3d1f10fda6ccb16afe135cb6eda7  61-beyond2lte-call-mic.conf
+fbad517b596e1b9c590e6d94ba666f50b896762fb71cf9df5a380afdcec51f4d0c1b37e7346546169743bfe05ba170bcfefae0810dd24472a435437bd7e6e3b5  61-beyond2lte-call-mic.wireplumber.conf
+8fa01151ec0e162de321cf75bab6b9298bfd6afc9c4f5fdaaba0425f53c666d3f21c5671de2c1adc4d51f0a94e2410fafdeff9d936ec676e5662338f613b9764  beyond2lte-call-mic-reference.lua
+"

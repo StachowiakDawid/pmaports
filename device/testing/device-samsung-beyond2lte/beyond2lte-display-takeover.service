@@ -1,0 +1,13 @@
+[Unit]
+Description=Wait for the DECON0 KMS takeover before the graphical session
+Before=greetd.service
+After=systemd-udevd.service systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/beyond2lte-display-takeover
+TimeoutStartSec=40
+
+[Install]
+WantedBy=greetd.service

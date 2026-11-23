@@ -1,0 +1,7 @@
+[Unit]
+Description=Suspend again after a wake without user input
+After=sleep.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/beyond2lte-resuspend

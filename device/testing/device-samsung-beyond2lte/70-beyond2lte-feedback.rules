@@ -1,0 +1,11 @@
+# Galaxy S10+ (beyond2lte): haptics + notification LED for feedbackd.
+# Must sort before 73-seat-late.rules (uaccess) and 90-feedbackd.rules.
+
+# MAX77705 haptic motor: input FF device named "max77693-haptic"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="max77693-haptic", \
+	ENV{FEEDBACKD_TYPE}="vibra", TAG+="uaccess"
+
+# MAX77705 RGB LED: /sys/class/leds/rgb:status (multicolor)
+SUBSYSTEM=="leds", KERNEL=="rgb:status", ENV{FEEDBACKD_TYPE}="led", \
+	RUN+="/bin/chgrp feedbackd /sys%p/brightness /sys%p/multi_intensity", \
+	RUN+="/bin/chmod g+w /sys%p/brightness /sys%p/multi_intensity"

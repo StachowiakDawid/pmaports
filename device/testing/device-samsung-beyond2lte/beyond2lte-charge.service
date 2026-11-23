@@ -1,0 +1,12 @@
+[Unit]
+Description=Galaxy S10+ charging policy (thresholds, temperature derating)
+After=systemd-udev-settle.service
+
+[Service]
+ExecStart=/usr/libexec/beyond2lte-charge
+# put the charger back to normal when the policy stops
+ExecStopPost=/bin/sh -c 'echo auto > /sys/class/power_supply/max77705-charger/charge_behaviour || true'
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

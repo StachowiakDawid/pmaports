@@ -1,0 +1,11 @@
+#!/bin/sh
+# systemd-sleep hook: MIF/INT (and DISP with soft_off=N) to the sleep levels
+# before s2idle, back to the screen-on levels after resume (the
+# beyond2lte-dvfs service lowers them again if the screen stays off).
+# Does nothing without the acpm_protocol.dvfs_cmd knob or with ENABLE=0 /
+# SLEEP_LOW=0 in /etc/default/beyond2lte-dvfs.
+case $1 in
+pre) exec /usr/libexec/beyond2lte-dvfs sleep-pre ;;
+post) exec /usr/libexec/beyond2lte-dvfs sleep-post ;;
+esac
+exit 0

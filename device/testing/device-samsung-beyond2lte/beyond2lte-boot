@@ -1,0 +1,241 @@
+#!/bin/sh
+# beyond2lte-boot: TWRP-free kernel fallback for systemd-boot on the Galaxy S10+.
+#
+# Pieces (all in device-samsung-beyond2lte):
+#  - boot-deploy hook  -> writes /boot/loader/loader.conf (menu timeout, so the
+#                         entries are reachable with Vol-Up/Vol-Down + Power)
+#  - "arm"  (beyond2lte-boot-arm.path, on every new /boot/loader/entries/pmos.conf
+#            written by boot-deploy): renames it to pmos+N.conf, i.e. enables
+#            systemd-boot boot counting for the new kernel/initramfs.
+#            systemd-boot decrements N on every boot attempt; at 0 tries left the
+#            entry is "bad", sorted last, and the next entry boots by default:
+#            the last known-good kernel. No key press needed.
+#  - "good" (beyond2lte-boot-good.service, ~GOOD_DELAY s after boot, ordered
+#            before boot-complete.target / systemd-bless-boot.service): if the
+#            main entry booted fine, snapshot vmlinuz+initramfs (ESP) and the
+#            module tree (rootfs) as slot "good" (the old "good" becomes
+#            "previous" when the kernel changed), write the fallback entries and
+#            bless the counted entry (pmos+X-Y.conf -> pmos.conf).
+#  - "modules" (beyond2lte-fallback-modules.service, early boot, only with
+#            b2l.fallback=<slot> on the cmdline): bind-mounts the snapshotted
+#            module tree over /usr/lib/modules/$(uname -r), because all
+#            pkgrels share one release string (uname -r) and the rootfs holds
+#            the NEW kernel's modules.
+#  - "status": print what is armed / saved.
+#
+# Device tree: with deviceinfo_dtb set, boot-deploy copies the DTB to the ESP
+# and adds a "devicetree" line to pmos.conf; systemd-boot then installs it
+# through U-Boot's EFI DT fixup protocol (U-Boot adds memory, /chosen and the
+# serial number as for its own DT).  The DTB is part of the armed/good pair and
+# of every slot (U-Boot's own DT only describes what U-Boot needs, so it is
+# never used to boot the system).
+#
+# Config: /etc/default/beyond2lte-boot
+set -eu
+
+ESP=${ESP:-/boot}
+E=$ESP/loader/entries
+STATE=${STATE:-/var/lib/beyond2lte-boot}
+BOOT_TRIES=3
+GOOD_DELAY=60
+BOOTCOUNT=1
+[ -r /etc/default/beyond2lte-boot ] && . /etc/default/beyond2lte-boot
+
+log() { echo "beyond2lte-boot: $*"; }
+
+file_hash() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# the main entry's DTB (ESP path) if it has a devicetree line
+main_dtb() {
+	local m d
+	m=$(main_entry) || return 1
+	d=$(sed -n 's/^devicetree[[:space:]]*//p' "$m" | head -1)
+	[ -n "$d" ] && [ -f "$ESP/${d#/}" ] && echo "$ESP/${d#/}"
+}
+
+# vmlinuz + initramfs (+ DTB): what an armed entry tries and a slot saves
+pair_hash() {
+	local d
+	d=$(main_dtb || true)
+	cat "$ESP/vmlinuz" "$ESP/initramfs" ${d:+"$d"} | sha256sum | cut -d' ' -f1
+}
+
+# vmlinuz (+ DTB): a change rotates good -> previous
+kernel_hash() {
+	local d
+	d=$(main_dtb || true)
+	cat "$ESP/vmlinuz" ${d:+"$d"} | sha256sum | cut -d' ' -f1
+}
+
+# the main entry file, counted (pmos+N[-M].conf) or not
+main_entry() {
+	for f in "$E"/pmos.conf "$E"/pmos+*.conf; do
+		[ -f "$f" ] && { echo "$f"; return 0; }
+	done
+	return 1
+}
+
+cmdline_slot() {
+	for w in $(cat /proc/cmdline); do
+		case "$w" in b2l.fallback=*) echo "${w#b2l.fallback=}"; return 0 ;; esac
+	done
+	return 1
+}
+
+# systemd-bless-boot will handle the rename when systemd-boot exported the
+# counted entry path
+sd_bless_active() {
+	ls /sys/firmware/efi/efivars/LoaderBootCountPath-* >/dev/null 2>&1
+}
+
+write_entry() { # slot title-suffix sortkey
+	local slot=$1 what=$2 key=$3 name=$1 opts dt=
+	opts=$(sed -n 's/^options[[:space:]]*//p' "$(main_entry)" | head -1 | sed 's/ *b2l\.fallback=[^ ]*//g')
+	[ -f "$ESP/b2l-$slot/devicetree.dtb" ] && dt="/b2l-$slot/devicetree.dtb"
+	{
+		echo "title postmarketOS ($what)"
+		echo "sort-key postmarketOS-$key"
+		echo "linux /b2l-$slot/vmlinuz"
+		echo "initrd /b2l-$slot/initramfs"
+		echo "options $opts b2l.fallback=$slot"
+		[ -n "$dt" ] && echo "devicetree $dt"
+	} > "$E/pmos-$name.conf.tmp"
+	mv "$E/pmos-$name.conf.tmp" "$E/pmos-$name.conf"
+}
+
+cmd_arm() {
+	[ "$BOOTCOUNT" = 1 ] || { log "boot counting disabled (BOOTCOUNT=0)"; return 0; }
+	[ -f "$E/pmos.conf" ] || return 0
+	[ -f "$ESP/vmlinuz" ] && [ -f "$ESP/initramfs" ] || return 0
+	local h
+	h=$(pair_hash)
+	if [ "$h" = "$(cat "$STATE/good.hash" 2>/dev/null)" ]; then
+		# blessed rename, or a re-deploy of the known-good pair: nothing to try
+		rm -f "$E"/pmos+*.conf
+		return 0
+	fi
+	# a stale counted entry would show up as a second "postmarketOS" item
+	rm -f "$E"/pmos+*.conf
+	mv "$E/pmos.conf" "$E/pmos+$BOOT_TRIES.conf"
+	sync "$E" 2>/dev/null || sync
+	log "new kernel/initramfs armed: pmos+$BOOT_TRIES.conf ($BOOT_TRIES tries, then fallback to pmos-good.conf)"
+	[ -f "$E/pmos-good.conf" ] || log "WARNING: no known-good slot yet - nothing to fall back to"
+}
+
+# copy src dst (on the ESP), verifying it
+esp_copy() {
+	cp "$1" "$2.tmp"
+	[ "$(file_hash "$1")" = "$(file_hash "$2.tmp")" ] || { rm -f "$2.tmp"; log "copy verify failed: $2"; return 1; }
+	mv "$2.tmp" "$2"
+}
+
+cmd_good() {
+	local slot booted_at h kver kh need avail v f dtb
+	if slot=$(cmdline_slot); then
+		log "running fallback slot '$slot' - main entry not blessed, nothing saved"
+		return 0
+	fi
+	[ "${1:-}" = --now ] || sleep "$GOOD_DELAY"
+	mkdir -p "$STATE"
+
+	booted_at=$(awk '/^btime/{print $2}' /proc/stat)
+	kver=$(uname -r)
+	# /boot or the modules changed since we booted (upgrade during this boot):
+	# what is on disk is not what we booted, so it is not proven good.
+	for f in "$ESP/vmlinuz" "$ESP/initramfs" "/usr/lib/modules/$kver"; do
+		[ -e "$f" ] || { log "missing $f, skipping"; return 0; }
+	done
+	dtb=$(main_dtb || true)
+	for f in "$ESP/vmlinuz" "$ESP/initramfs" ${dtb:+"$dtb"} "/usr/lib/modules/$kver" "/usr/lib/modules/$kver/modules.dep"; do
+		[ -e "$f" ] || continue
+		if [ "$(stat -c %Y "$f")" -ge "$booted_at" ]; then
+			log "$f changed since boot - not snapshotting (reboot to validate it)"
+			return 0
+		fi
+	done
+
+	h=$(pair_hash)
+	if [ "$h" != "$(cat "$STATE/good.hash" 2>/dev/null)" ]; then
+		kh=$(kernel_hash)
+		# free space: vmlinuz + initramfs, plus 10% (the old previous is freed first)
+		if [ -d "$ESP/b2l-good" ] && [ "$kh" != "$(cat "$ESP/b2l-good/vmlinuz" ${dtb:+"$ESP/b2l-good/devicetree.dtb"} 2>/dev/null | sha256sum | cut -d' ' -f1)" ]; then
+			log "kernel changed: rotating good -> previous"
+			rm -rf "$ESP/b2l-previous" "$STATE/modules-previous"
+			mv "$ESP/b2l-good" "$ESP/b2l-previous"
+			[ -d "$STATE/modules-good" ] && mv "$STATE/modules-good" "$STATE/modules-previous"
+		fi
+		need=$(( ($(stat -c %s "$ESP/vmlinuz") + $(stat -c %s "$ESP/initramfs")) * 11 / 10 ))
+		avail=$(( $(stat -f -c '%a * %S' "$ESP") ))
+		if [ "$avail" -lt "$need" ]; then
+			log "not enough space on $ESP ($avail < $need bytes) - dropping previous slot"
+			rm -rf "$ESP/b2l-previous" "$STATE/modules-previous" "$E/pmos-previous.conf"
+			avail=$(( $(stat -f -c '%a * %S' "$ESP") ))
+			[ "$avail" -ge "$need" ] || { log "still not enough space, giving up"; return 1; }
+		fi
+		mkdir -p "$ESP/b2l-good"
+		esp_copy "$ESP/vmlinuz" "$ESP/b2l-good/vmlinuz"
+		esp_copy "$ESP/initramfs" "$ESP/b2l-good/initramfs"
+		if [ -n "$dtb" ]; then
+			esp_copy "$dtb" "$ESP/b2l-good/devicetree.dtb"
+		else
+			rm -f "$ESP/b2l-good/devicetree.dtb"
+		fi
+		v=$(apk info -v linux-postmarketos-exynos9820 2>/dev/null | head -1 | sed 's/^linux-postmarketos-exynos9820-//')
+		echo "${v:-$kver}" > "$ESP/b2l-good/VERSION"
+		rm -rf "$STATE/modules-good.tmp"
+		cp -a "/usr/lib/modules/$kver" "$STATE/modules-good.tmp"
+		rm -rf "$STATE/modules-good"
+		mv "$STATE/modules-good.tmp" "$STATE/modules-good"
+		echo "$h" > "$STATE/good.hash"
+		log "saved known-good slot ($(cat "$ESP/b2l-good/VERSION"))"
+	fi
+	[ -d "$ESP/b2l-good" ] && write_entry good "last good" fallback-1
+	[ -d "$ESP/b2l-previous" ] && write_entry previous previous fallback-2
+	rm -f "$E/pmos-ubootdt.conf"	# entry of 3-r50/51 (U-Boot DT), no longer bootable
+	sync
+
+	# bless: systemd-bless-boot does it when systemd-boot exported the
+	# counter path; otherwise rename ourselves
+	if ! sd_bless_active; then
+		for f in "$E"/pmos+*.conf; do
+			[ -f "$f" ] || continue
+			mv "$f" "$E/pmos.conf"
+			log "blessed $(basename "$f") -> pmos.conf"
+		done
+	fi
+}
+
+cmd_modules() {
+	local slot kver
+	slot=$(cmdline_slot) || return 0
+	kver=$(uname -r)
+	if [ -d "$STATE/modules-$slot" ]; then
+		mount --bind "$STATE/modules-$slot" "/usr/lib/modules/$kver"
+		log "fallback slot '$slot': using saved modules for $kver"
+	else
+		log "fallback slot '$slot': no saved modules, using rootfs modules (may not match!)"
+	fi
+}
+
+cmd_status() {
+	echo "cmdline slot : $(cmdline_slot || echo main)"
+	echo "entries      :"; ls -l "$E" 2>/dev/null | sed 's/^/  /'
+	for s in good previous; do
+		[ -d "$ESP/b2l-$s" ] && echo "slot $s      : $(cat "$ESP/b2l-$s/VERSION" 2>/dev/null)"
+	done
+	echo "good.hash    : $(cat "$STATE/good.hash" 2>/dev/null || echo none)"
+	[ -f "$ESP/vmlinuz" ] && echo "current hash : $(pair_hash)"
+	echo "main dtb     : $(main_dtb || echo "none")"
+	for s in good previous; do
+		[ -d "$ESP/b2l-$s" ] && echo "slot $s dtb  : $([ -f "$ESP/b2l-$s/devicetree.dtb" ] && echo saved || echo "none")"
+	done
+	echo "loader.conf  :"; sed 's/^/  /' "$ESP/loader/loader.conf" 2>/dev/null || true
+}
+
+case "${1:-}" in
+	arm) cmd_arm ;;
+	good) shift; cmd_good "$@" ;;
+	modules) cmd_modules ;;
+	status) cmd_status ;;
+	*) echo "usage: $0 arm|good [--now]|modules|status" >&2; exit 1 ;;
+esac

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Wait (max 30 s) until the DECON0 KMS driver has taken the display over from
+# simpledrm, so that phoc never starts on simpledrm and then loses its card.
+# Does nothing (exit 0 immediately) when the takeover is not enabled.
+P=/sys/module/exynos9820_decon/parameters/enable
+modprobe exynos9820_decon 2>/dev/null
+[ "$(cat $P 2>/dev/null)" = Y ] || exit 0
+i=0
+while [ $i -lt 150 ]; do
+	[ -e /sys/bus/platform/drivers/exynos9820-decon/19030000.display-controller ] && \
+		ls /sys/class/drm/card*-DSI-1 >/dev/null 2>&1 && exit 0
+	sleep 0.2
+	i=$((i + 1))
+done
+echo "DECON takeover not bound after 30 s, starting the session anyway" >&2
+exit 0

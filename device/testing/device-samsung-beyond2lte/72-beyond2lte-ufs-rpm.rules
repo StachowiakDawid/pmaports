@@ -1,0 +1,8 @@
+# UFS runtime PM (device 3-r22): the Exynos 9820 UFS host has no clock gating and no auto-hibern8, so with
+# runtime PM off (the kernel default for SCSI disks) the link runs at HS-G3 all the time. rpm_lvl 1 = device
+# stays active, link in hibern8 after 2 s without I/O. Awake screen-off idle 261 -> 146 mA (2026-11-18);
+# soak: 100 I/O bursts + 10 deep sleeps entered runtime-suspended, all clean.
+# Rollback: /etc/udev/rules.d/72-beyond2lte-ufs-rpm.rules with ATTR{power/control}="on".
+ACTION=="add", SUBSYSTEM=="platform", KERNEL=="13d60000.ufs", ATTR{rpm_lvl}="1"
+ACTION=="add", SUBSYSTEM=="scsi", ENV{DEVTYPE}=="scsi_device", KERNELS=="13d60000.ufs", \
+  ATTR{power/autosuspend_delay_ms}="2000", ATTR{power/control}="auto"

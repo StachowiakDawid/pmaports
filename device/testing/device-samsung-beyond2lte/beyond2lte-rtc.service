@@ -1,0 +1,17 @@
+[Unit]
+Description=Set system time from the RTC if valid (writes the RTC back at shutdown)
+DefaultDependencies=no
+ConditionPathExists=/dev/rtc0
+After=systemd-remount-fs.service
+Before=time-set.target sysinit.target systemd-timesyncd.service shutdown.target
+Wants=time-set.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/beyond2lte-rtc load
+ExecStop=/usr/libexec/beyond2lte-rtc save
+
+[Install]
+WantedBy=sysinit.target

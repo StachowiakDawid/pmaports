@@ -1,0 +1,4 @@
+# beyond2lte-bt-addr: the Bluetooth public address is read from the Android EFS
+# partition (bluetooth/bt_addr) at every start of hci0. Uncomment to override it
+# with a fixed address, or set BT_ADDR=off to keep the Broadcom default address.
+#BT_ADDR=12:34:56:78:9A:BC

@@ -1,0 +1,9 @@
+# device-samsung-beyond2lte-autosuspend: no auto-suspend while an SDR radio is
+# plugged in (same IDs as the /dev/sdr/* symlinks of 60-beyond2lte-*sdr.rules).
+ACTION!="add", GOTO="beyond2lte_sdr_inhibit_end"
+SUBSYSTEM!="usb", GOTO="beyond2lte_sdr_inhibit_end"
+ENV{DEVTYPE}!="usb_device", GOTO="beyond2lte_sdr_inhibit_end"
+ATTR{idVendor}=="0403", ATTR{idProduct}=="601f", TAG+="systemd", ENV{SYSTEMD_WANTS}+="beyond2lte-sdr-inhibit@lime.service"
+ATTR{idVendor}=="1d50", ATTR{idProduct}=="6108", TAG+="systemd", ENV{SYSTEMD_WANTS}+="beyond2lte-sdr-inhibit@lime.service"
+ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838|2832", TAG+="systemd", ENV{SYSTEMD_WANTS}+="beyond2lte-sdr-inhibit@rtl.service"
+LABEL="beyond2lte_sdr_inhibit_end"

@@ -1,0 +1,4 @@
+# Deep sleep hangs while the phone powers a USB-C device; see /usr/libexec/beyond2lte-usbc-sleep.
+ACTION=="add|change", SUBSYSTEM=="typec", ENV{DEVTYPE}=="typec_port", RUN+="/usr/libexec/beyond2lte-usbc-sleep"
+# dwc3 runtime PM only while nothing is attached (the suspended controller does not wake for device mode)
+ACTION=="add|remove", SUBSYSTEM=="typec", ENV{DEVTYPE}=="typec_partner", RUN+="/usr/libexec/beyond2lte-usbc-sleep"

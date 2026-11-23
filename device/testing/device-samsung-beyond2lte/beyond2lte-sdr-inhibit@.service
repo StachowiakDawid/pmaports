@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep the phone awake while the %i SDR radio is plugged in
+BindsTo=dev-sdr-%i.device
+After=dev-sdr-%i.device
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --mode=block --who=%i-sdr "--why=SDR radio plugged in" /bin/sleep infinity

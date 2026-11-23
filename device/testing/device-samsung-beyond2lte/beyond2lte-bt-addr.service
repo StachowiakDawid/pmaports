@@ -1,0 +1,15 @@
+[Unit]
+Description=Set the Bluetooth public address from the EFS partition
+Documentation=file:///usr/libexec/beyond2lte-bt-addr
+# Started by 81-beyond2lte-bt-addr.rules when hci0 appears (again after every
+# hci_uart reload). Runs before bluetoothd when both start at boot; if
+# bluetoothd already powered the controller, the script power-cycles it.
+After=sys-subsystem-bluetooth-devices-hci0.device local-fs.target
+BindsTo=sys-subsystem-bluetooth-devices-hci0.device
+Before=bluetooth.service
+ConditionPathExists=/sys/class/bluetooth/hci0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/beyond2lte-bt-addr
+TimeoutStartSec=90

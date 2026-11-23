@@ -1,0 +1,13 @@
+[Unit]
+Description=Use the saved module tree when booting a fallback kernel slot
+DefaultDependencies=no
+ConditionKernelCommandLine=b2l.fallback
+Before=systemd-udevd.service systemd-udev-trigger.service systemd-modules-load.service kmod-static-nodes.service sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/beyond2lte-boot modules
+
+[Install]
+WantedBy=sysinit.target

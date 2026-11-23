@@ -1,0 +1,9 @@
+[Unit]
+Description=Light the screen when a voice call rings (shannon-modem call flag)
+
+[Path]
+PathChanged=/run/shannon/call-active
+Unit=beyond2lte-call-wake.service
+
+[Install]
+WantedBy=paths.target

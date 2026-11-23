@@ -1,0 +1,10 @@
+[Unit]
+Description=Arm boot counting when boot-deploy writes a new loader entry
+RequiresMountsFor=/boot
+
+[Path]
+PathChanged=/boot/loader/entries/pmos.conf
+Unit=beyond2lte-boot-arm.service
+
+[Install]
+WantedBy=paths.target

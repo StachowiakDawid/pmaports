@@ -1,0 +1,34 @@
+# Small register/I2C poking tools used by the Galaxy S10+ (beyond2lte) port.
+# i2crw: raw I2C read/write (usb-gadget-reconnect.sh uses it for the MAX77705
+# MUIC opcode interface while the max77705-usbc driver is not loaded).
+# devmem: 32-bit /dev/mem peek/poke (needs CONFIG_DEVMEM, debugging only).
+maintainer="StachowiakDawid <dawidos234@gmail.com>"
+pkgname=beyond2lte-tools
+pkgver=1
+pkgrel=0
+pkgdesc="i2crw and devmem debugging tools for the Samsung Galaxy S10+ port"
+url="https://postmarketos.org"
+arch="aarch64"
+license="MIT"
+makedepends="linux-headers"
+options="!check"
+source="
+	i2crw.c
+	devmem.c
+"
+
+build() {
+	local t
+	for t in i2crw devmem; do
+		${CC:-gcc} $CFLAGS $LDFLAGS -Wall -o $t "$srcdir"/$t.c
+	done
+}
+
+package() {
+	install -Dm755 i2crw "$pkgdir"/usr/bin/i2crw
+	install -Dm755 devmem "$pkgdir"/usr/bin/b2l-devmem
+}
+sha512sums="
+de523fed465f4543c1fd0fe8a57faf7a9c41bc0ae36fe8089902eee83277053d0429c2ad2541129c9b2f25cb3de4ebf04e9b6718df0c39a6965c1faca422a71c  i2crw.c
+ad600fbdccc64f5566fd8d67b26a5327cd50643b2fe0e65c73a0705e9f49cb243c912e75f2998431c1ac1e54409299087df161dafc0af86a36b2b1d3f208597f  devmem.c
+"

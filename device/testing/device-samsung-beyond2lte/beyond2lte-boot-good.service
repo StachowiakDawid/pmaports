@@ -1,0 +1,15 @@
+[Unit]
+Description=Save the running kernel as known-good fallback and bless its boot entry
+RequiresMountsFor=/boot /var/lib
+After=multi-user.target
+# run before systemd-bless-boot so that its rename is recognised as "good"
+Before=boot-complete.target systemd-bless-boot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/beyond2lte-boot good
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=boot-complete.target

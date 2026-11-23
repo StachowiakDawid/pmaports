@@ -1,0 +1,9 @@
+[Unit]
+Description=Write the RTC once timesyncd has synchronised the clock
+
+[Path]
+PathExists=/run/systemd/timesync/synchronized
+Unit=beyond2lte-rtc-save.service
+
+[Install]
+WantedBy=paths.target

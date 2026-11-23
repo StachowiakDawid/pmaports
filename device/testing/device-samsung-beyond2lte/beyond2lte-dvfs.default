@@ -1,0 +1,62 @@
+# shellcheck shell=sh disable=SC2034
+# Memory/bus DVFS policy for the Galaxy S10+ (beyond2lte), read by
+# /usr/libexec/beyond2lte-dvfs (beyond2lte-dvfs.service, the systemd-sleep
+# hook and the beyond2lte-dvfs CLI). Restart the service after changes:
+#   systemctl restart beyond2lte-dvfs
+# Levels are in kHz. An empty level leaves that domain alone.
+# Domains: MIF = memory (LPDDR4X + controller), INT = internal bus,
+# DISP = display bus (DECON). Boot values: MIF 2093000, INT 534000, DISP 534000.
+# Valid MIF levels: 2093000 1794000 1352000 1014000 845000 676000 421000.
+# INT 100000..534000, DISP 134000..534000 (downstream levels).
+
+# 0 = do nothing at all (service exits, sleep hook is a no-op)
+ENABLE=1
+# lower MIF/INT while the screen is off (DPMS Off). Device 3-r24 had this off: switching
+# MIF together with DISP while I/O runs corrupts memory (list_del corruption, ext4 NULL
+# oops, silent resets). Flip tests under a write load, 100 switches each (2026-11-18):
+# MIF, INT, DISP alone, MIF+INT, INT+DISP clean; MIF+DISP and MIF+INT+DISP corrupt.
+# Since 3-r25 only MIF/INT are lowered and DISP is never touched (LOW_DISP/SLEEP_DISP
+# empty).
+SCREEN_OFF_LOW=1
+# lower MIF/INT for system sleep (s2idle)
+SLEEP_LOW=1
+
+# Screen on: the boot values. 1440x3040@60 ARGB scanout needs memory bandwidth;
+# do not go below these without testing for underruns. Untested opt-in middle
+# (saves part of the MIF current with the screen on):
+#HIGH_MIF=1014000
+#HIGH_INT=267000
+HIGH_MIF=2093000
+HIGH_INT=534000
+HIGH_DISP=534000
+
+# Screen off (measured r34: MIF 421000 about -45..-60 mA, INT 200000 about
+# -20 mA more, INT 100000 no further gain)
+LOW_MIF=421000
+LOW_INT=200000
+# DISP: keep EMPTY (never lowered). Lowering DISP together with MIF corrupts memory
+# (see above). Was 134000, only while the screen is off and soft_off=N.
+LOW_DISP=
+
+# s2idle (downstream suspend_freq: MIF 421000, INT 100000)
+SLEEP_MIF=421000
+SLEEP_INT=200000
+SLEEP_DISP=
+
+# exynos9820_decon.soft_off at service start: empty = keep (kernel default Y),
+# N = stop DECON on screen off (about -65 mA, enables the DISP lowering),
+# Y = force the parked scanout.
+DECON_SOFT_OFF=N
+
+# Screen-state check interval in seconds (a sysfs read; the power key and
+# beyond2lte-blank wake the service at once).
+POLL=2
+# consecutive "Off" readings before lowering (filters short modeset blips)
+OFF_SAMPLES=2
+# after a power-key press, beyond2lte-blank "on" or a resume: stay at the
+# screen-on levels for at least this many seconds
+HOLD=5
+# DRM connector (name under /sys/class/drm); empty = first card*-DSI-*
+CONNECTOR=
+# event devices that wake the service at once; auto = all with KEY_POWER
+KEY_DEVICES=auto

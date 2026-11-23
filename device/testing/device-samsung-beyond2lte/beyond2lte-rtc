@@ -1,0 +1,45 @@
+#!/bin/sh
+# beyond2lte-rtc load|save|status - keep system time and the SoC RTC (rtc0,
+# s3c-rtc) consistent.
+#  load: at boot, set the system clock from the RTC only if the RTC holds a
+#        sane time (the RTC currently often comes up invalid after a reboot:
+#        "hctosys: unable to read the hardware clock") and it is not older than
+#        what systemd already restored from /var/lib/systemd/timesync/clock.
+#  save: write the system time to the RTC, only when timesyncd has
+#        synchronised (/run/systemd/timesync/synchronized). Afterwards the
+#        kernel keeps the RTC updated every 11 min (CONFIG_RTC_SYSTOHC).
+RTC=${RTC:-rtc0}
+MIN=1735689600   # 2025-01-01: anything older is a reset RTC
+log() { echo "beyond2lte-rtc: $*"; }
+
+rtc_epoch() { cat /sys/class/rtc/$RTC/since_epoch 2>/dev/null; }
+
+case "$1" in
+load)
+	r=$(rtc_epoch)
+	now=$(date +%s)
+	if [ -z "$r" ]; then
+		log "$RTC unreadable (invalid time), keeping system time $(date -u)"
+	elif [ "$r" -lt "$MIN" ]; then
+		log "$RTC holds $(date -u -d @"$r" 2>/dev/null || echo "$r") - invalid, ignoring"
+	elif [ "$r" -le "$now" ]; then
+		log "$RTC ($r) is not newer than system time ($now), keeping system time"
+	else
+		hwclock -u -s -f /dev/$RTC && log "system time set from $RTC: $(date -u)"
+	fi
+	;;
+save)
+	if [ -e /run/systemd/timesync/synchronized ] || [ "${2:-}" = --force ]; then
+		hwclock -u -w -f /dev/$RTC && log "$RTC set from system time: $(date -u)"
+	else
+		log "time not NTP-synchronised, not writing $RTC"
+	fi
+	;;
+status)
+	echo "system: $(date -u)"
+	r=$(rtc_epoch); echo "$RTC  : ${r:-invalid} $( [ -n "$r" ] && date -u -d @"$r" 2>/dev/null)"
+	timedatectl 2>/dev/null
+	;;
+*) echo "usage: $0 load|save [--force]|status" >&2; exit 1 ;;
+esac
+exit 0

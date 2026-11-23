@@ -3,7 +3,7 @@ maintainer="chiffa <chiffathefoxx@gmail.com>"
 pkgname=device-samsung-exynos9820
 pkgdesc="Samsung Exynos 9820 Generic Device"
 pkgver=2
-pkgrel=0
+pkgrel=1
 url="https://postmarketos.org"
 arch="aarch64"
 license="MIT"
@@ -23,7 +23,6 @@ options="
 "
 provides="
 	device-samsung-beyond1lte=$pkgver-r$pkgrel
-	device-samsung-beyond2lte=$pkgver-r$pkgrel
 "
 
 build() {

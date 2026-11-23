@@ -1,0 +1,190 @@
+#!/bin/sh
+# Re-suspend after a wake without user input (RTC/timer wakes, WakeSystem=
+# timers, charger events). gsd-power's idle-sleep watch fires once when the
+# idle time crosses sleep-inactive-*-timeout; after a resume without input the
+# idle time never resets, so the watch never fires again and the phone stays
+# awake until someone touches it (2026-11-19: ~88 mA for 6 h after a 00:00
+# timer wake). Phosh's IdleMonitor does not implement GetIdletime, so the
+# screen state is the signal: phosh turns the panel on at every resume and
+# blanks it after ~60 s without input.
+#
+# Started (restarted) by the systemd-sleep post hook. Suspends again once the
+# screen has been off for OFF_SECONDS, unless something holds sleep off:
+# a logind block inhibitor on "sleep" (ssh session, SDR radio, boot guard),
+# GNOME's suspend inhibitor (media players, ...), or the user's power settings
+# say "nothing" for the current supply. Exits without doing anything once the
+# screen has been on for ON_SECONDS in one go (someone uses the phone; gsd's
+# own idle timer is armed again by the input).
+#
+# Dark wakes: gsd-power turns the screen on after every resume (~0.2 s after
+# logind's PrepareForSleep(false)). After a wake by the RTC alone (PMU
+# WAKEUP_STAT 0x1, logged by exynos9820-suspend; power key = 0x1000) the screen
+# is switched off again through Phosh's DisplayConfig.PowerSaveMode, the same
+# call gsd uses for blanking, so Phosh's state stays consistent and the power
+# key turns it on as usual. With kernel r85+ the sleep hook also arms the
+# panel's hold_dark before the thaw, so the panel does not light at all
+# (without it: a ~0.1 s flash).
+OFF_SECONDS=60
+ON_SECONDS=150
+POLL=5
+DARK_WAKE=1		# 0: leave the screen as gsd sets it after RTC wakes
+DARK_SECONDS=6		# how long after the resume the screen is kept off
+USER_WAKE_MASK=0x1000	# 3-r39: WAKEUP_STAT bits that mean "someone wants the
+			# screen" (power key); every other wake is kept dark
+CP_OFF_SECONDS=5	# 3-r37: after a wake by the modem (CP mailbox) alone, suspend
+			# again this soon (the kernel holds a wakeup event while the
+			# daemon/ModemManager handle an SMS or packets)
+# 3-r41: voice calls. While shannon-modemd's call flag exists (a call is ringing,
+# dialling or up; beyond2lte-call-wake state), the screen is not kept dark and
+# the phone does not suspend again; a ringing call lights the screen.
+CALL_WAKE=/usr/libexec/beyond2lte-call-wake
+[ -r /etc/default/beyond2lte-resuspend ] && . /etc/default/beyond2lte-resuspend
+[ "${ENABLE:-1}" = 1 ] || exit 0
+
+log() { echo "beyond2lte-resuspend: $*"; }
+
+screen_on() {
+	local f s
+	for f in /sys/class/drm/card*-DSI-*/dpms; do
+		[ -r "$f" ] || continue
+		read -r s < "$f"
+		[ "$s" = On ] && return 0
+	done
+	return 1
+}
+
+on_ac() {
+	local d o t
+	for d in /sys/class/power_supply/*; do
+		[ -r "$d/online" ] || continue
+		read -r t < "$d/type" 2>/dev/null || continue
+		case $t in Mains|USB|USB_*) ;; *) continue ;; esac
+		read -r o < "$d/online"
+		[ "$o" = 1 ] && return 0
+	done
+	return 1
+}
+
+# logind block inhibitors on sleep: prints their "who", empty if none
+sleep_blockers() {
+	busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+		org.freedesktop.login1.Manager ListInhibitors 2>/dev/null |
+	awk -F'"' '{ n = 0; for (i = 2; i <= NF; i += 2) q[n++] = $i
+		for (j = 0; j + 3 < n; j += 4)
+			if (q[j + 3] == "block" && q[j] ~ /(^|:)sleep(:|$)/) print q[j + 1] }'
+}
+
+# run a command on each logged-in user's session bus
+in_sessions() {
+	local b uid u
+	for b in /run/user/*/bus; do
+		[ -S "$b" ] || continue
+		uid=${b#/run/user/}; uid=${uid%/bus}
+		[ "$uid" = 0 ] && continue
+		u=$(id -nu "$uid" 2>/dev/null) || continue
+		runuser -u "$u" -- env DBUS_SESSION_BUS_ADDRESS=unix:path="$b" "$@"
+	done
+}
+
+gnome_inhibited() {
+	in_sessions gdbus call --session --timeout 5 -d org.gnome.SessionManager \
+		-o /org/gnome/SessionManager -m org.gnome.SessionManager.IsInhibited 4 \
+		2>/dev/null | grep -q true
+}
+
+user_disabled() {
+	local k=sleep-inactive-battery-type
+	on_ac && k=sleep-inactive-ac-type
+	in_sessions gsettings get org.gnome.settings-daemon.plugins.power $k \
+		2>/dev/null | grep -q nothing
+}
+
+# WAKEUP_STAT of the last resume (from the kernel log), empty if unknown
+wake_stat() {
+	dmesg 2>/dev/null | sed -n 's/.*exynos9820-suspend: resumed.*WAKEUP_STAT \(0x[0-9a-f]*\) .*/\1/p' |
+		tail -n 1
+}
+
+call_state() {
+	[ -x "$CALL_WAKE" ] && "$CALL_WAKE" state
+}
+
+screen_off_now() {
+	in_sessions gdbus call --session --timeout 2 -d org.gnome.Mutter.DisplayConfig \
+		-o /org/gnome/Mutter/DisplayConfig -m org.freedesktop.DBus.Properties.Set \
+		org.gnome.Mutter.DisplayConfig PowerSaveMode "<3>" >/dev/null 2>&1
+}
+
+ws=$(wake_stat)
+# CP mailbox wake (PMU WAKEUP_STAT bit 8) without the power key (bit 12)
+cp_wake=0
+if [ -n "$ws" ] && [ $(( ws & 0x100 )) -ne 0 ] && [ $(( ws & 0x1000 )) -eq 0 ]; then
+	cp_wake=1
+	OFF_SECONDS=$CP_OFF_SECONDS DARK_SECONDS=2 POLL=1
+fi
+user_wake=0
+[ -n "$ws" ] && [ $(( ws & USER_WAKE_MASK )) -ne 0 ] && user_wake=1
+if [ "${DARK_WAKE:-1}" = 1 ] && [ -n "$ws" ] && [ $user_wake = 0 ]; then
+	# gsd/phosh may switch the screen on a little after we start: keep it
+	# off for DARK_SECONDS (0.2 s steps), then fall through to the watcher
+	n=0 hit=0 call=
+	while [ $n -lt $((DARK_SECONDS * 5)) ]; do
+		call=$(call_state)
+		[ -n "$call" ] && break
+		if screen_on; then screen_off_now; hit=$((hit + 1)); fi
+		n=$((n + 1))
+		sleep 0.2
+	done
+	kind=other
+	[ "$ws" = 0x00000001 ] && kind=RTC
+	[ $cp_wake = 1 ] && kind=modem
+	if [ -n "$call" ]; then
+		log "$kind wake (WAKEUP_STAT $ws): voice call ($call), screen not kept dark"
+		"$CALL_WAKE"
+	else
+		log "$kind wake (WAKEUP_STAT $ws): screen kept dark ($hit off requests)"
+	fi
+else
+	log "wake (WAKEUP_STAT ${ws:-?}): screen left to gsd"
+fi
+
+on=0 off=0 waited="" lit=""
+while :; do
+	call=$(call_state)
+	if [ -n "$call" ]; then
+		# a call: never suspend under it (the daemon also holds an inhibitor);
+		# light the screen once per ringing call
+		if [ "$call" = incoming ] && [ -z "$lit" ] && ! screen_on; then
+			log "incoming call: screen on"
+			"$CALL_WAKE"
+			lit=1
+		fi
+		[ "$call" = incoming ] || lit=""
+		off=0
+		sleep 1
+		continue
+	fi
+	lit=""
+	if screen_on; then
+		off=0 on=$((on + POLL))
+		if [ $on -ge "$ON_SECONDS" ]; then
+			log "screen on for ${on}s: in use, leaving sleep to gsd-power"
+			exit 0
+		fi
+	else
+		on=0 off=$((off + POLL))
+		if [ $off -ge "$OFF_SECONDS" ]; then
+			why=$(sleep_blockers | tr '\n' ' ')
+			[ -z "$why" ] && gnome_inhibited && why="gnome-session suspend inhibitor"
+			[ -z "$why" ] && user_disabled && why="automatic suspend off in settings"
+			if [ -z "$why" ]; then
+				log "screen off for ${off}s, nothing holds sleep: suspending"
+				systemctl suspend
+				exit 0
+			fi
+			[ "$why" = "$waited" ] || log "screen off, waiting: $why"
+			waited=$why
+		fi
+	fi
+	sleep "$POLL"
+done

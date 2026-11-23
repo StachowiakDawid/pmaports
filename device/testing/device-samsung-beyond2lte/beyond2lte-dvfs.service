@@ -1,0 +1,16 @@
+[Unit]
+Description=Galaxy S10+ memory/bus DVFS: lower MIF/INT while the screen is off
+# no knob = other kernel: nothing to do
+ConditionPathExists=/sys/module/acpm_protocol/parameters/dvfs_cmd
+After=systemd-modules-load.service beyond2lte-display-takeover.service
+
+[Service]
+ExecStart=/usr/libexec/beyond2lte-dvfs daemon
+# back to the boot values (MIF 2093000 / INT 534000 / DISP 534000) on stop or crash
+ExecStopPost=/usr/libexec/beyond2lte-dvfs restore
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

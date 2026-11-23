@@ -1,0 +1,9 @@
+[Unit]
+Description=Write NTP-synchronised system time to the RTC
+ConditionPathExists=/dev/rtc0
+
+[Service]
+Type=oneshot
+# stays active so the PathExists= unit does not re-trigger in a loop
+RemainAfterExit=yes
+ExecStart=/usr/libexec/beyond2lte-rtc save

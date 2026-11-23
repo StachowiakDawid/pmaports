@@ -1,0 +1,23 @@
+#!/bin/sh
+# systemd-sleep hook: after every resume, (re)start the watcher that suspends
+# again if nobody uses the phone (see /usr/libexec/beyond2lte-resuspend).
+# --no-block: this hook runs inside systemd-suspend.service.
+#
+# Wake by the RTC alone (PMU WAKEUP_STAT 0x1, logged by exynos9820-suspend):
+# arm the panel's hold_dark (kernel r85+) now, before the session is thawed,
+# so gsd-power's screen-on after resume does not light the panel; the watcher
+# then switches the screen off, which ends the hold (10 s timeout otherwise).
+H=/sys/module/panel_samsung_s6e3ha9/parameters/hold_dark
+case $1 in
+post)
+	DARK_WAKE=1 USER_WAKE_MASK=0x1000
+	[ -r /etc/default/beyond2lte-resuspend ] && . /etc/default/beyond2lte-resuspend
+	if [ "${ENABLE:-1}" = 1 ] && [ "$DARK_WAKE" = 1 ] && [ -w "$H" ]; then
+		ws=$(dmesg | sed -n 's/.*exynos9820-suspend: resumed.*WAKEUP_STAT \(0x[0-9a-f]*\) .*/\1/p' | tail -n 1)
+		# 3-r39: every wake but the power key stays dark (RTC, modem, ...)
+		[ -n "$ws" ] && [ $(( ws & USER_WAKE_MASK )) -eq 0 ] && echo 10000 > "$H"
+	fi
+	systemctl --no-block restart beyond2lte-resuspend.service
+	;;
+esac
+exit 0

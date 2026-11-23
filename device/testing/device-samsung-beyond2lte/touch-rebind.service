@@ -1,0 +1,11 @@
+[Unit]
+Description=Bind s6sy761 touchscreen if its boot-time probe was lost (PMIC/ACPM ordering)
+After=systemd-udev-settle.service systemd-modules-load.service
+Before=greetd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /sys/bus/i2c/devices/0-0048/driver ] && exit 0; echo 0-0048 > /sys/bus/i2c/drivers/s6sy761/bind 2>/dev/null; sleep 1; done; echo "s6sy761 still unbound"'
+
+[Install]
+WantedBy=multi-user.target

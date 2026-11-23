@@ -1,0 +1,39 @@
+#!/bin/sh
+# Charging policy daemon for the Galaxy S10+ (max77705-charger + max17042 FG).
+# - start/stop thresholds via charge_behaviour (auto / inhibit-charge)
+# - optional float-voltage cap and input current limit
+# - temperature derating of the charge current (downstream "swelling" values:
+#   < 5 C or > 45 C: inhibit, 5..15 C: 950 mA, 41..45 C: 1400 mA)
+CHG=/sys/class/power_supply/max77705-charger
+BAT=/sys/class/power_supply/max170xx_battery
+[ -r /etc/default/beyond2lte-charge ] && . /etc/default/beyond2lte-charge
+START=${CHARGE_START_THRESHOLD:-75}
+END=${CHARGE_END_THRESHOLD:-100}
+CC=${CHARGE_CURRENT_UA:-2100000}
+INTERVAL=${INTERVAL:-30}
+
+w() { [ -w "$1" ] && [ "$(cat "$1" 2>/dev/null)" != "$2" ] && echo "$2" > "$1" 2>/dev/null; }
+
+[ -n "$FLOAT_VOLTAGE_UV" ] && w $CHG/constant_charge_voltage "$FLOAT_VOLTAGE_UV"
+
+while :; do
+	if [ -d $CHG ] && [ -d $BAT ]; then
+		cap=$(cat $BAT/capacity 2>/dev/null || echo 50)
+		t=$(cat $BAT/temp 2>/dev/null || echo 250)	# 0.1 C
+		[ -n "$INPUT_CURRENT_UA" ] && [ "$(cat $CHG/online)" = 1 ] && \
+			w $CHG/input_current_limit "$INPUT_CURRENT_UA"
+		cur=$CC; inhibit=0
+		if [ "$t" -lt 50 ] || [ "$t" -gt 450 ]; then inhibit=1
+		elif [ "$t" -lt 150 ]; then [ "$cur" -gt 950000 ] && cur=950000
+		elif [ "$t" -gt 410 ]; then [ "$cur" -gt 1400000 ] && cur=1400000
+		fi
+		w $CHG/constant_charge_current "$cur"
+		beh=$(sed 's/.*\[\(.*\)\].*/\1/' $CHG/charge_behaviour 2>/dev/null)
+		if [ $inhibit = 1 ] || { [ "$END" -lt 100 ] && [ "$cap" -ge "$END" ]; }; then
+			[ "$beh" != inhibit-charge ] && w $CHG/charge_behaviour inhibit-charge
+		elif [ "$beh" = inhibit-charge ] && { [ "$END" -ge 100 ] || [ "$cap" -le "$START" ]; }; then
+			w $CHG/charge_behaviour auto
+		fi
+	fi
+	sleep "$INTERVAL"
+done

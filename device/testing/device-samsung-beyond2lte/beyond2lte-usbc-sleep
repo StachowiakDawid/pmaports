@@ -1,0 +1,43 @@
+#!/bin/sh
+# beyond2lte-usbc-sleep: sleep mode and Wi-Fi PCIe ASPM by USB-C power role (device 3-r23).
+# While the phone SOURCES power over USB-C (dock/hub/OTG: VBUS boost + USB host, combo PHY in DP mode),
+# deep sleep never returns from the firmware (breadcrumb stage 4, forced reset needed) and s2idle with
+# ASPM powersupersave leaves the BCM4375 dongle dead (spurious PME, every dcmd times out). s2idle with
+# ASPM default works (DP, hub and Wi-Fi come back). Tested 2026-11-18 with a Nintendo Switch dock.
+# Run by udev (62-beyond2lte-usbc-sleep.rules) on every typec port add/change.
+P=/sys/class/typec/port0/power_role
+MS=/sys/power/mem_sleep
+A=/sys/module/pcie_aspm/parameters/policy
+cur() { sed 's/.*\[\(.*\)\].*/\1/' "$1"; }
+[ -r "$P" ] || exit 0
+if grep -q '\[source\]' "$P"; then
+	want_ms=s2idle; want_aspm=default
+else
+	want_ms=s2idle
+	[ "$(cat /sys/module/exynos9820_suspend/parameters/deep 2>/dev/null)" = Y ] && grep -qw deep $MS && want_ms=deep
+	want_aspm=$(sed -n 's/.*pcie_aspm\.policy=\([a-z]*\).*/\1/p' /proc/cmdline)
+	[ -n "$want_aspm" ] || want_aspm=default
+fi
+# dwc3 runtime PM (device 3-r34): "auto" saves ~22 mA awake while nothing is plugged in, but a
+# runtime-suspended controller does not wake up for device mode (PC cable: gadget stays "not attached",
+# tested 2026-11-19; host mode wakes it). So: "on" while any USB-C partner is attached, "auto" otherwise.
+U=/sys/devices/platform/soc@0/soc@0:usb@10c00000/10c00000.usb/power/control
+if [ -w "$U" ]; then
+	if [ "$DEVTYPE" = typec_partner ] && [ "$ACTION" = remove ]; then want_u=auto
+	elif [ -e /sys/class/typec/port0-partner ]; then want_u=on
+	else want_u=auto; fi
+	[ "$(cat $U)" = "$want_u" ] || echo "$want_u" > $U
+fi
+[ "$(cur $MS)" = "$want_ms" ] || echo "$want_ms" > $MS
+# systemd-sleep writes MemorySleepMode (40-beyond2lte-mem-only.conf: deep) before every
+# suspend, which overrode the line above (2026-11-22). A runtime drop-in sorts after it.
+D=/run/systemd/sleep.conf.d/50-beyond2lte-usbc.conf
+if [ "$want_ms" = s2idle ]; then
+	mkdir -p "${D%/*}"
+	printf '# written by beyond2lte-usbc-sleep while the phone powers a USB-C device\n[Sleep]\nMemorySleepMode=s2idle\n' > "$D"
+else
+	rm -f "$D"
+fi
+[ -w $A ] && [ "$(cur $A)" != "$want_aspm" ] && echo "$want_aspm" > $A
+logger -t beyond2lte-usbc-sleep "power role $(cur $P): mem_sleep $(cur $MS), aspm $(cur $A), dwc3 rpm $(cat $U 2>/dev/null)"
+exit 0

@@ -1,0 +1,2 @@
+# Galaxy S10+: set the real Bluetooth address (from EFS) whenever hci0 is added.
+ACTION=="add", SUBSYSTEM=="bluetooth", ENV{DEVTYPE}=="host", KERNEL=="hci0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="beyond2lte-bt-addr.service"

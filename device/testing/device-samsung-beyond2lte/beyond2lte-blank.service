@@ -1,0 +1,12 @@
+[Unit]
+Description=Blank the S10+ OLED panel (bl_power) when Phosh turns the screen off
+
+[Service]
+ExecStart=/usr/libexec/beyond2lte-blank
+# put the panel back on when stopped
+ExecStopPost=/bin/sh -c 'for b in /sys/class/backlight/*/bl_power; do [ -w "$b" ] && echo 0 > "$b"; done; true'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

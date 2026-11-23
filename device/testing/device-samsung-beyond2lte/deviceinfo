@@ -1,0 +1,36 @@
+# Reference: <https://postmarketos.org/deviceinfo>
+# Please use double quotes only. You can source this file in shell
+# scripts.
+#
+# Kernel command line: NOT here. deviceinfo_kernel_cmdline is obsolete
+# (deviceinfo_schema.toml, pmaports!7708) and, when set, boot-deploy uses it
+# INSTEAD of generate-kernel-cmdline (dropping quiet/splash/plymouth from
+# /usr/lib/kernel-cmdline.d/). The device options live in kernel-cmdline.conf
+# (-> /usr/lib/kernel-cmdline.d/50-device-samsung-beyond2lte.conf), which
+# boot-deploy re-reads on every kernel/initramfs deploy. Local additions:
+# /etc/kernel-cmdline.d/*.conf, then `sudo mkinitfs`.
+
+deviceinfo_format_version="0"
+deviceinfo_name="Samsung Galaxy S10+ (SM-G975F)"
+deviceinfo_manufacturer="Samsung"
+deviceinfo_codename="samsung-beyond2lte"
+deviceinfo_year="2019"
+deviceinfo_arch="aarch64"
+
+# Device related
+deviceinfo_chassis="handset"
+deviceinfo_drm="true"
+deviceinfo_external_storage="true"
+deviceinfo_screen_width="1440"
+deviceinfo_screen_height="3040"
+
+# Bootloader related (U-Boot EFI -> systemd-boot)
+# The DT ships with the kernel package: boot-deploy copies it to the ESP and
+# adds a "devicetree" line, systemd-boot installs it (U-Boot applies its
+# fixups).
+deviceinfo_dtb="exynos/exynos9820-beyond2lte"
+deviceinfo_boot_filesystem="fat32"
+# Heimdall fails mid-transfer when flashing rootfs. Use TWRP instead
+deviceinfo_flash_method="none"
+deviceinfo_initfs_compression="zstd:fast"
+deviceinfo_rootfs_image_sector_size="4096"
