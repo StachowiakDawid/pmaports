@@ -1,0 +1,75 @@
+# Maintainer: beyond2lte port <noreply@example.org>
+pkgname=shannon-modem
+pkgver=0.25
+pkgrel=0
+pkgdesc="Shannon S5000AP modem bring-up for Exynos 9820 (CP boot, RFS server, IPC client)"
+url="https://postmarketos.org"
+arch="noarch"
+license="GPL-2.0-only"
+depends="python3 e2fsprogs-extra systemd util-linux-misc iproute2 alsa-utils"
+# VoLTE (off unless VOLTE= in modem.conf or "ims ..." on the ctl FIFO): AMR codecs, pw-cat
+depends="$depends opencore-amr vo-amrwbenc pipewire-tools py3-gobject3 speexdsp"
+# optional: modemmanager + networkmanager for the normal UI (MBIM on /dev/wwan0mbim0)
+install_if="linux-postmarketos-exynos9820"
+options="!check"
+backup="etc/shannon/modem.conf"
+source="
+	shannon-modem
+	shannon-modem.service
+	modem.conf
+	README
+	shannon-modemd.py
+	shannon-efs-scratch.sh
+	s5000ap-load.py
+	ipcmon.py
+	mbim_function.py
+	call-audio
+	shannon_ims.py
+	shannon_media.py
+	shannon_volte.py
+	00_shannon-ims.nft
+	shannon-callaudio-bridge
+	shannon-callaudio-bridge.desktop
+	shannon-soak.py
+	"
+
+package() {
+	install -Dm755 "$srcdir"/shannon-modem -t "$pkgdir"/usr/libexec/shannon/
+	install -Dm755 "$srcdir"/shannon-modemd.py "$srcdir"/shannon-efs-scratch.sh \
+		"$srcdir"/s5000ap-load.py "$srcdir"/ipcmon.py -t "$pkgdir"/usr/libexec/shannon/
+	install -Dm644 "$srcdir"/shannon-modem.service -t "$pkgdir"/usr/lib/systemd/system/
+	install -Dm644 "$srcdir"/modem.conf -t "$pkgdir"/etc/shannon/
+	install -Dm644 "$srcdir"/README -t "$pkgdir"/usr/share/doc/shannon-modem/
+	install -Dm644 "$srcdir"/mbim_function.py -t "$pkgdir"/usr/libexec/shannon/
+	install -Dm755 "$srcdir"/call-audio -t "$pkgdir"/usr/libexec/shannon/
+	install -Dm644 "$srcdir"/shannon_ims.py "$srcdir"/shannon_media.py \
+		"$srcdir"/shannon_volte.py -t "$pkgdir"/usr/libexec/shannon/
+	# VoLTE: accept IPsec-protected SIP and RTP on the IMS PDN before 01_wwan.nft drops wwan*
+	install -Dm644 "$srcdir"/00_shannon-ims.nft -t "$pkgdir"/etc/nftables.d/
+	# GNOME Calls speaker/mute buttons -> daemon: XDG autostart (Phosh reaches no
+	# systemd graphical-session.target); FIFO and missed-calls file are group netdev
+	install -Dm755 "$srcdir"/shannon-callaudio-bridge "$srcdir"/shannon-soak.py \
+		-t "$pkgdir"/usr/libexec/shannon/
+	install -Dm644 "$srcdir"/shannon-callaudio-bridge.desktop -t "$pkgdir"/etc/xdg/autostart/
+	install -d "$pkgdir"/usr/lib/systemd/system/multi-user.target.wants
+	ln -s ../shannon-modem.service "$pkgdir"/usr/lib/systemd/system/multi-user.target.wants/shannon-modem.service
+}
+sha512sums="
+8be18316942d2bb330528b3d0a0c70b03cf8ff16f7b9356f40aa11df99624473fee3f4d9d2852374a2530073b2ba03b3af3f7f3d73f4140b0a34693cb3e861c1  shannon-modem
+a59ab4acbc7d7c8110d7c4b8fbd1ba137d6111eb5eb78d8f85435a45eaada6c0eec6ea2bcd9efab6de891849dd7859f37c18cf0a785726ed3409224c51d025e3  shannon-modem.service
+46d6c02b940d5ed02c41714af1838813fea8fe046453c6ac9b36a7a762f04674eda67ef683a358816cf04c493189f8540d3689d8fd60d411e94a000174650599  modem.conf
+acd333615e93b14d3fff549b7b93a71cc3d53b544b327c6ec697de87000e00a1b1464018aae48b31a4a4cd2093892cce6d913fec369dc31a9d8d4efce4d42421  README
+c5411510b5caedb6edc1c6172a153972538a1c20d667fa4b73a840c9fbc0f6fc93d144a320a37bcea10dbfebb645439e4614558f1342b6101b886b752d201a9e  shannon-modemd.py
+3b7666a11515ef7b106096f1f7d78e0373b6b82c9d80e15d037576a0a1112e514c3374412baece80ae2e34e0d1bceba96ee407c2ceb1b88d0f0a0247acdf0e22  shannon-efs-scratch.sh
+bbbe2e59031a44a49c69e42fd16efdcea694853471f803504fa330a6db0febe47e611652ff355615b0ac43791d0736ea984591c7d90e453575dbc41da3ffb545  s5000ap-load.py
+c0a19e762ea8f09eefadfca275ef390b5f97c75054e8d92ae4722b66019e50191c8e164cd5643599ba167e8ca54c4374a250ed0f656aaecc4e1b191060759ac7  ipcmon.py
+9de36b2dee9dceaf7859055c536d85519f69398cf37a9ced3fe4107b6c0da70aa70ef324cd62ef79f333d5af1dbe8465582483997c801c9876b29223f4245244  mbim_function.py
+6342a1155942e77ae6ed26f967a741564ead7666798f726d2efa8ca5888eff4bc284c29e52d4987634da84d816019539b9948a76cabce27e8399d1a8eb6277ca  call-audio
+2dfd67e71bc857247edaca9c198e79e2cd4f86b6cba397e4e6b762c8a2ff4811b330983d2e7d43a813792533ca294f6c6fff6828247dc6ed227067e8b9bbc8ad  shannon_ims.py
+9d9b2848d9cc192d3252b0aa6d12330b2843dda1e41bd2a2707db339b9e2b532d2b5fa0fc75dfb0f54293d2c96c42127f26cdd4d09f6c1c403400d0845841c8e  shannon_media.py
+e7e18f1feda5ed6a9cc9547099e1ac659b24445a9fa5156258b551bffe697c215c869952f64dd81b8ff7ee59f49cb8014e1f9bb6127bfd491f728619021070ff  shannon_volte.py
+bbc821574cbebaf7b5e9aa8f8c624c90d32de8dd8e1efdbb7b22c333b9d3a848c9219d755eb77f6697172618e8e5b9fec79be7941cdb58b63138c327ae382014  00_shannon-ims.nft
+8bfc315975345af4bfe2218ece32fe3819b4ee7adc7953dac84b8acec509e8b72e4e15bce88a81d803157416d8973d784b89f5321ece54a2650af5f0ae4b2b45  shannon-callaudio-bridge
+43ff0a0c92eebfbe0473bf851f7b64daed3e4d1dadf8bc71f0ba32e1954ef63569071141218c211afcdadf0c43e6f67aa283cc4dfa3faae4eb3e2b54a1150e1e  shannon-callaudio-bridge.desktop
+263983ecb41b76e5802f921911283ceeb7f83ec05d788bbdf1a53ea8f2938070dd9cc3f3c9f5ca3d7801e4f8e374fd2b188dad5228626ef286f404b11acb3f3e  shannon-soak.py
+"

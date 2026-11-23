@@ -1,0 +1,109 @@
+#!/bin/sh
+# Bring up the Shannon S5000AP modem and run the RFS/FMT daemon (shannon-modem.service).
+#
+# Cold start: fresh scratch EFS on tmpfs, load s5000ap-boot, start the daemon, boot the CP
+# from the radio partition (read-only).  If the CP link is already up (service restart while
+# the CP runs) the daemon just reattaches.  If a CP was booted before and its link is gone
+# (crash), it is powered off and booted again.
+set -eu
+
+CONF=/etc/shannon/modem.conf
+APN=internet
+RADIO_ALLOWED=yes
+SLEEP=allow
+DATA=on
+CP_RESTART=yes
+IDLE=yes
+[ -r "$CONF" ] && . "$CONF"
+
+LIB=/usr/libexec/shannon
+DBG=/sys/kernel/debug/s5000ap
+EFS=/run/shannon-efs
+STATE=/var/lib/shannon
+
+if [ "${1:-}" != --inner ] && [ "$SLEEP" = block ]; then
+	# Suspend with the CP running is not validated yet: keep the system awake.
+	exec systemd-inhibit --what=sleep --mode=block --who=shannon-modem \
+		--why="modem is up (suspend with a running CP not supported yet)" "$0" --inner
+fi
+
+mkdir -p /run/shannon "$STATE"
+chmod 700 /run/shannon "$STATE"
+[ -e "$STATE/radio" ] || echo on > "$STATE/radio"
+[ -e "$STATE/data" ] || echo "$DATA" > "$STATE/data"
+
+mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+modprobe s5000ap-boot allow_boot=1
+
+link=$(cat "$DBG/link_up" 2>/dev/null || echo N)
+boot=0
+# a running CP with its link up: whatever booted it did not take the phone down
+[ "$link" = Y ] && rm -f "$STATE/boot-pending"
+if [ "$link" != Y ]; then
+	boot=1
+	if [ -e /run/shannon/cp-booted ]; then
+		# CP crash: one restart per AP boot (kernel 0277: re-init releases the
+		# image area), if enabled; otherwise power it off and wait for a reboot.
+		if [ "$CP_RESTART" = yes ] && [ ! -e /run/shannon/cp-restarted ]; then
+			echo "CP link gone after a boot: restarting the CP (once)" >&2
+			# VSS on the ABOX talks to the dead CP: ABOX_RESET_VSS (kernel 0281)
+			echo reset > /sys/kernel/debug/18c50000.audio-controller/vss 2>/dev/null || true
+			[ -x "$LIB/call-audio" ] && "$LIB/call-audio" stop 2>/dev/null || true
+			touch /run/shannon/cp-restarted "$STATE/boot-pending"
+			sync
+			set -- --efs "$EFS" --radio-state "$STATE/radio" --data-state "$STATE/data" \
+				--boot-marker "$STATE/boot-pending" --sms "$STATE/sms-inbox.txt"
+			[ -n "$APN" ] && set -- "$@" --apn "$APN"
+			[ "$RADIO_ALLOWED" = yes ] && set -- "$@" --allow-radio
+			[ "$IDLE" = no ] && set -- "$@" --no-idle
+			python3 -u "$LIB/shannon-modemd.py" "$@" --fresh-cp &
+			daemon=$!
+			trap 'kill $daemon 2>/dev/null' TERM INT
+			sleep 1
+			if python3 "$LIB/s5000ap-load.py" restart --nv "$EFS/nv_data.bin"; then
+				wait $daemon
+				exit $?
+			fi
+			kill $daemon 2>/dev/null || true
+		fi
+		echo "CP was booted before and its link is gone (crash?): powering it off." >&2
+		echo "Reboot the phone to start the modem again." >&2
+		python3 "$LIB/s5000ap-load.py" step off || true
+		exit 4
+	fi
+	if [ -e "$STATE/boot-pending" ]; then
+		# Set before every CP boot, cleared 2 min after a good one: if it survived a
+		# phone reset, the last boot froze or crashed the phone - do not loop on that.
+		echo "The previous CP boot did not finish (phone reset during it?)." >&2
+		echo "Not booting the CP automatically; rm $STATE/boot-pending to re-enable." >&2
+		exit 4
+	fi
+	rm -rf "$EFS"
+	"$LIB/shannon-efs-scratch.sh" "$EFS"
+fi
+
+set -- --efs "$EFS" --radio-state "$STATE/radio" --data-state "$STATE/data" \
+	--boot-marker "$STATE/boot-pending" \
+	--sms "$STATE/sms-inbox.txt"
+[ -n "$APN" ] && set -- "$@" --apn "$APN"
+[ "$RADIO_ALLOWED" = yes ] && set -- "$@" --allow-radio
+[ "$IDLE" = no ] && set -- "$@" --no-idle
+[ $boot = 1 ] && set -- "$@" --fresh-cp
+python3 -u "$LIB/shannon-modemd.py" "$@" &
+daemon=$!
+trap 'kill $daemon 2>/dev/null' TERM INT
+
+if [ $boot = 1 ]; then
+	sleep 1
+	touch "$STATE/boot-pending"
+	sync
+	if ! python3 "$LIB/s5000ap-load.py" boot --nv "$EFS/nv_data.bin"; then
+		echo "CP boot failed" >&2
+		touch /run/shannon/cp-booted
+		kill $daemon 2>/dev/null || true
+		exit 1
+	fi
+	touch /run/shannon/cp-booted
+fi
+
+wait $daemon

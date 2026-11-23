@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Shannon modem call audio bridge
+Comment=GNOME Calls and Plasma Dialer speaker/mute buttons to the modem daemon, missed calls before login
+Exec=/usr/libexec/shannon/shannon-callaudio-bridge
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-AutoRestart=true

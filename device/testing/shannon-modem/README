@@ -1,0 +1,14 @@
+shannon-modem: userspace for the Samsung Shannon S5000AP modem (Galaxy S10/S10+, Exynos 9820)
+with the s5000ap-boot kernel module (linux-postmarketos-exynos9820 patches 0250-0258).
+
+shannon-modem.service boots the CP from the radio partition (read-only) and runs
+shannon-modemd.py: an RFS server (NV/EFS requests, answered from a scratch copy of the EFS on
+tmpfs - the real efs/cpefs partitions are never mounted or written) and a minimal IPC client
+(power, SIM, registration, signal, SMS store-then-acknowledge).
+
+Config: /etc/shannon/modem.conf.  Control: /run/shannon/ctl (see the config file).
+ModemManager: the kernel exposes a WWAN MBIM port (/dev/wwan0mbim0) and netdev wwan0; the
+daemon emulates the MBIM function (mbim_function.py), so ModemManager, NetworkManager and Phosh
+see a normal modem (registration, signal, data via an NM gsm connection, SMS receive).
+Without ModemManager the daemon runs data on wwan0 itself (data on|off).
+Not yet: calls and SMS sending (CS registration), suspend with the CP running.

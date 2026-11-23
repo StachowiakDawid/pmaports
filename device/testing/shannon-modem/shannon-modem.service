@@ -1,0 +1,19 @@
+[Unit]
+Description=Shannon S5000AP modem (CP boot, RFS server, IPC client)
+Documentation=file:///usr/share/doc/shannon-modem/README
+After=local-fs.target systemd-modules-load.service
+ConditionPathExists=/dev/disk/by-partlabel/radio
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/shannon/shannon-modem
+Restart=on-failure
+# 4 = the CP crashed after a boot; restarting it needs a phone reboot for now.
+RestartPreventExitStatus=4
+RestartSec=5
+# A crashed CP makes the daemon exit 3; the restarted launcher powers the CP off (exit 4).
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,275 @@
+#!/bin/sh
+# Voice call audio path of the Galaxy S10+ (ABOX VSS), run by shannon-modemd as root.
+#
+#   call-audio start [earpiece|speaker]   call connected: ABOX mode/type, keep-alive streams,
+#                                         "ABOX Voice Call Switch" (RDMA4/WDMA2 in the firmware)
+#   call-audio route earpiece|speaker     switch the output during a call
+#   call-audio stop                       call released: everything back
+#   call-audio status
+#
+# The speech itself never passes the AP: VSS (CP image code running on the ABOX) plays the
+# downlink into RDMA4 and takes the uplink from WDMA2. What the AP must provide is a running
+# UAIF1 (amplifier TDM) and UAIF0 capture (mics) with the codec/amp path set up, so a silent
+# playback stream (earpiece or speaker) and a mic capture stream are kept open for the call:
+# through the user's PipeWire when it owns the card (Phosh session), else directly on ALSA
+# (no session; for tests at the greeter) with the UCM sequences applied by alsaucm.
+set -u
+
+CARD=0
+RUN=/run/shannon/call-audio
+ABOX_DBG=/sys/kernel/debug/18c50000.audio-controller
+DVFS=/sys/module/acpm_protocol/parameters/dvfs_cmd
+CONF=/etc/shannon/modem.conf
+# ABOX CA32 clock during a call (ACPM AUD domain 8): VSS asks for up to 1.2 GHz; 0 = leave it
+CALL_AUD_KHZ=1180000
+IDLE_AUD_KHZ=295000
+# stock route-cp-tx-bridge also links WDMA1 (the mic capture) into the firmware's virtual PCM
+# input VPCMIN_DAI0, which only VSS reads: calliope2.dt controls (debugfs "component", ids as
+# the firmware numbers them): WDMA1_EN 139, VPCMIN_DAI0_EN 197, VPCMIN_DAI0_A 198 (14 = WDMA1)
+CALL_VPCMIN=0
+[ -r "$CONF" ] && . "$CONF"
+
+mkdir -p "$RUN"
+
+log() { echo "call-audio: $*" >&2; }
+
+cset() { amixer -q -c $CARD cset "name=$1" "$2" >/dev/null 2>&1 || log "cset $1 = $2 failed"; }
+
+session_user() {
+	# the user whose PipeWire owns the sound card (logged-in seat session)
+	for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+		[ "$(loginctl show-session "$s" -p Active --value 2>/dev/null)" = yes ] || continue
+		[ "$(loginctl show-session "$s" -p Class --value 2>/dev/null)" = user ] || continue
+		loginctl show-session "$s" -p Name --value
+		return
+	done
+}
+
+as_user() {
+	u=$1; shift
+	uid=$(id -u "$u")
+	runuser -u "$u" -- env XDG_RUNTIME_DIR=/run/user/$uid "$@"
+}
+
+pw_node() {
+	# node.name of the first sink/source whose description matches $2
+	as_user "$1" pw-dump 2>/dev/null | python3 -c '
+import json, sys
+cls, want = sys.argv[1], sys.argv[2].lower()  # haystack lowered too
+for o in json.load(sys.stdin):
+    p = (o.get("info") or {}).get("props") or {}
+    if p.get("media.class") == cls and want in (p.get("node.description", "") + p.get("node.name", "")).lower():
+        print(p["node.name"]); break' "$2" "$3"
+}
+
+bg() {
+	# own session and process group: no SIGHUP from a closing terminal/sudo pty, and the
+	# whole pipeline can be killed through the group; pid file = group id
+	pidf=$1; shift
+	setsid sh -c "$*" > /dev/null 2>&1 < /dev/null &
+	echo $! > "$RUN/$pidf.pid"
+}
+
+# amplifier switches for the call output (PipeWire path; the profile may be stereo speaker,
+# whose sink drives both amps): saved at start, restored at stop
+AMP_CTLS="SPEAKER Switch|RECEIVER Switch|Left Digital PCM Volume|Right Digital PCM Volume"
+EARPIECE_CAP=657	# -20 dB, as UCM EarpieceDigitalCap
+SPEAKER_CAP=721		# -12 dB, as UCM SpeakerDigitalCap
+
+amps_save() {
+	[ -e "$RUN/amps" ] && return
+	echo "$AMP_CTLS" | tr '|' '\n' | while read -r c; do
+		v=$(amixer -c $CARD cget "name=$c" 2>/dev/null | sed -n 's/^  : values=//p')
+		[ -n "$v" ] && printf '%s=%s\n' "$c" "$v"
+	done > "$RUN/amps"
+}
+
+amps_restore() {
+	[ -e "$RUN/amps" ] || return
+	while IFS='=' read -r c v; do cset "$c" "$v"; done < "$RUN/amps"
+	rm -f "$RUN/amps"
+}
+
+amps_route() {
+	if [ "$1" = speaker ]; then
+		cset "RECEIVER Switch" off
+		cset "Right Digital PCM Volume" $SPEAKER_CAP
+		cset "SPEAKER Switch" on
+	else
+		cset "SPEAKER Switch" off
+		cset "Left Digital PCM Volume" $EARPIECE_CAP
+		cset "RECEIVER Switch" on
+	fi
+}
+
+keepalive_start() {
+	dev=$1
+	u=$(session_user)
+	sink=
+	# the raw 4-slot amp PCM (hidden node of the split layout): runs UAIF1 whatever the
+	# profile; the amp switches below pick earpiece or speaker
+	[ -n "$u" ] && sink=$(pw_node "$u" Audio/Sink/Internal "hw_S10_1")
+	if [ -n "$sink" ]; then
+		uid=$(id -u "$u")
+		src=$(pw_node "$u" Audio/Source "Mic__source")
+		[ -n "$src" ] || src=$(pw_node "$u" Audio/Source "internal")
+		amps_save
+		amps_route "$dev"
+		log "PipeWire ($u): silence -> $sink, capture <- ${src:-default}"
+		pw="runuser -u $u -- env XDG_RUNTIME_DIR=/run/user/$uid pw-cat --raw --format s16 --rate 48000 -P media.role=Phone"
+		bg play "head -c 100000000000 /dev/zero | $pw --playback --channels 4 --target '$sink' -"
+		bg rec "$pw --record --channels 2 ${src:+--target '$src'} - > /dev/null"
+		echo pw > "$RUN/mode"
+	else
+		ucmdev=Earpiece
+		[ "$dev" = speaker ] && ucmdev=Speaker
+		log "no PipeWire sink for $dev (session user: ${u:-none}): ALSA directly ($ucmdev + Mic via alsaucm)"
+		alsaucm -c hw:$CARD set _verb HiFi set _enadev "$ucmdev" set _enadev Mic >/dev/null 2>&1 ||
+			log "alsaucm failed"
+		bg play "exec aplay -q -D hw:$CARD,1 -f S32_LE -c 4 -r 48000 --period-size=1024 --buffer-size=4096 /dev/zero"
+		bg rec "exec arecord -q -D hw:$CARD,0 -f S16_LE -c 2 -r 48000 --period-size=480 --buffer-size=1920 /dev/null"
+		echo alsa > "$RUN/mode"
+		echo "$ucmdev" > "$RUN/ucmdev"
+	fi
+}
+
+keepalive_stop() {
+	for f in play rec; do
+		[ -e "$RUN/$f.pid" ] && kill -- "-$(cat "$RUN/$f.pid")" 2>/dev/null
+		rm -f "$RUN/$f.pid"
+	done
+	if [ "$(cat "$RUN/mode" 2>/dev/null)" = alsa ]; then
+		sleep 0.3
+		# the Mic device stays enabled: a PipeWire that takes the card later assumes the
+		# UCM state it set itself (disabling it here left PipeWire with a silent mic)
+		alsaucm -c hw:$CARD set _verb HiFi set _disdev "$(cat "$RUN/ucmdev")" >/dev/null 2>&1
+	fi
+	amps_restore
+	rm -f "$RUN/mode" "$RUN/ucmdev"
+}
+
+wait_running() {
+	# both ABOX ports must run before the firmware call channels start
+	i=0
+	while [ $i -lt 40 ]; do
+		grep -q RUNNING /proc/asound/card$CARD/pcm1p/sub0/status 2>/dev/null &&
+			grep -q RUNNING /proc/asound/card$CARD/pcm0c/sub0/status 2>/dev/null && return 0
+		sleep 0.1
+		i=$((i + 1))
+	done
+	log "keep-alive streams not running after 4 s (pcm1p: $(head -1 /proc/asound/card$CARD/pcm1p/sub0/status), pcm0c: $(head -1 /proc/asound/card$CARD/pcm0c/sub0/status))"
+	return 1
+}
+
+component() { [ -w "$ABOX_DBG/component" ] && echo "$1 $2" > "$ABOX_DBG/component" 2>/dev/null; }
+
+vpcmin() {
+	[ "$CALL_VPCMIN" = 1 ] || return 0
+	if [ "$1" = on ]; then
+		component 139 1; component 197 1; component 198 14
+	else
+		component 198 0; component 197 0; component 139 0
+	fi
+}
+
+aud_clock() {
+	[ "$1" -gt 0 ] 2>/dev/null || return 0
+	[ -w "$DVFS" ] && echo "8 $1" > "$DVFS" 2>/dev/null
+	[ -w "$ABOX_DBG/gear" ] && echo "$1" > "$ABOX_DBG/gear" 2>/dev/null
+}
+
+case "${1:-}" in
+start)
+	dev=${2:-earpiece}
+	[ -e "$RUN/on" ] && { log "already on"; exit 0; }
+	touch "$RUN/on"
+	cset "ABOX Audio Mode" IN_CALL
+	if [ "$dev" = speaker ]; then cset "ABOX Sound Type" SPEAKER; else cset "ABOX Sound Type" VOICE; fi
+	aud_clock "$CALL_AUD_KHZ"
+	keepalive_start "$dev"
+	wait_running
+	cset "ABOX Voice Call Switch" on
+	vpcmin on
+	echo "$dev" > "$RUN/dev"
+	log "on ($dev)"
+	;;
+route)
+	[ -e "$RUN/on" ] || exit 0
+	dev=${2:-earpiece}
+	[ "$(cat "$RUN/dev" 2>/dev/null)" = "$dev" ] && exit 0
+	cset "ABOX Voice Call Switch" off
+	keepalive_stop
+	if [ "$dev" = speaker ]; then cset "ABOX Sound Type" SPEAKER; else cset "ABOX Sound Type" VOICE; fi
+	keepalive_start "$dev"
+	wait_running
+	cset "ABOX Voice Call Switch" on
+	echo "$dev" > "$RUN/dev"
+	log "route $dev"
+	;;
+stop)
+	vpcmin off
+	cset "ABOX Voice Call Switch" off
+	keepalive_stop
+	cset "ABOX Audio Mode" NORMAL
+	cset "ABOX Sound Type" VOICE
+	aud_clock "$IDLE_AUD_KHZ"
+	rm -f "$RUN/on" "$RUN/dev"
+	log "off"
+	;;
+voip-start)
+	# VoLTE with media on the AP (shannon_media.py): no VSS, no ABOX call mode. Only the
+	# output amps are set (same switches as a CS call) and the nodes are printed on stdout
+	# as key=value for the daemon, which runs pw-cat (or aplay/arecord) itself.
+	dev=${2:-earpiece}
+	u=$(session_user)
+	sink=
+	[ -n "$u" ] && sink=$(pw_node "$u" Audio/Sink/Internal "hw_S10_1")
+	if [ -n "$sink" ]; then
+		src=$(pw_node "$u" Audio/Source "Mic__source")
+		[ -n "$src" ] || src=$(pw_node "$u" Audio/Source "internal")
+		amps_save
+		amps_route "$dev"
+		echo pw > "$RUN/voip"
+		log "voip: PipeWire ($u): -> $sink, <- ${src:-default} ($dev)"
+		echo "mode=pw user=$u sink=$sink source=$src"
+	else
+		ucmdev=Earpiece
+		[ "$dev" = speaker ] && ucmdev=Speaker
+		alsaucm -c hw:$CARD set _verb HiFi set _enadev "$ucmdev" set _enadev Mic >/dev/null 2>&1 ||
+			log "alsaucm failed"
+		echo alsa > "$RUN/voip"
+		echo "$ucmdev" > "$RUN/voip-ucmdev"
+		log "voip: no PipeWire session: ALSA directly ($ucmdev + Mic)"
+		echo "mode=alsa"
+	fi
+	;;
+voip-route)
+	dev=${2:-earpiece}
+	if [ "$(cat "$RUN/voip" 2>/dev/null)" = pw ]; then
+		amps_route "$dev"
+	elif [ -e "$RUN/voip" ]; then
+		ucmdev=Earpiece
+		[ "$dev" = speaker ] && ucmdev=Speaker
+		alsaucm -c hw:$CARD set _verb HiFi set _disdev "$(cat "$RUN/voip-ucmdev")" \
+			set _enadev "$ucmdev" >/dev/null 2>&1
+		echo "$ucmdev" > "$RUN/voip-ucmdev"
+	fi
+	log "voip: route $dev"
+	;;
+voip-stop)
+	if [ "$(cat "$RUN/voip" 2>/dev/null)" = alsa ]; then
+		alsaucm -c hw:$CARD set _verb HiFi set _disdev "$(cat "$RUN/voip-ucmdev")" >/dev/null 2>&1
+	fi
+	amps_restore
+	rm -f "$RUN/voip" "$RUN/voip-ucmdev"
+	log "voip: off"
+	;;
+status)
+	[ -e "$RUN/on" ] && echo "on ($(cat "$RUN/dev" 2>/dev/null), $(cat "$RUN/mode" 2>/dev/null))" || echo off
+	amixer -c $CARD cget "name=ABOX Voice Call Switch" 2>/dev/null | grep ': values'
+	;;
+*)
+	echo "usage: $0 start [earpiece|speaker] | route earpiece|speaker | stop | status | voip-start|voip-route DEV | voip-stop" >&2
+	exit 2
+	;;
+esac

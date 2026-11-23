@@ -1,0 +1,226 @@
+#!/usr/bin/python3 -I
+"""GNOME Calls speaker / mute buttons -> shannon-modemd (CS and VoLTE calls).
+
+GNOME Calls switches audio through callaudiod (org.mobian_project.CallAudio on the
+session bus), which only changes PipeWire.  On this phone CS call audio runs on the
+modem/ABOX and VoLTE audio is driven by shannon-modemd, so follow callaudiod's
+SpeakerState / MicState properties and write the matching command to the daemon's
+audio FIFO (/run/shannon-audio/ctl, group netdev, accepts only audio/mute/volume and
+"missed clear <t>").
+
+The daemon resets mute/speaker when the last call ends.  When a call starts
+(callaudiod AudioMode -> 1 = call) or callaudiod (re)appears during a call, the current
+SpeakerState / MicState are sent again, so the modem follows what the Calls UI shows.
+
+Plasma Mobile: Plasma Dialer does not use callaudiod. Its speaker and mute buttons only
+set state in kde-telephony-daemon (org.kde.telephony.DialerUtils on the session bus),
+and that daemon switches PulseAudio ports only for a card with a "VoiceCall" profile,
+which this phone does not have. So in a KDE session, also follow DialerUtils'
+speakerModeChanged / muteChanged signals. DialerUtils keeps its state after a call. When
+Plasma Dialer's last call is deleted (CallUtils callDeleted), the bridge sets it back
+to earpiece / unmuted, the same as the daemon. When the first call is added, the
+current DialerUtils state is sent again.
+
+Missed calls: shannon-modemd lists incoming calls that were not answered in
+/var/lib/shannon-calls/missed-calls ("<epoch> <users running gnome-calls or -> <number>",
+root:netdev 0640).  Calls that rang while this user had no GNOME Calls running (before
+the first login) are shown as a desktop notification; then the lines are cleared.
+Numbers are only shown on screen, never printed.
+"""
+import os
+import sys
+import time
+
+from gi.repository import Gio, GLib
+
+NAME = "org.mobian_project.CallAudio"
+PATH = "/org/mobian_project/CallAudio"
+CTL = "/run/shannon-audio/ctl"
+MISSED = "/var/lib/shannon-calls/missed-calls"
+SPEAKER = {0: "audio earpiece", 1: "audio speaker"}     # 2 = unknown
+MIC = {0: "mute on", 1: "mute off"}                     # MicState 0 = microphone off
+MODE_CALL = 1                                           # AudioMode: 0 default, 1 call
+# Plasma Dialer (kde-telephony-daemon / modem-daemon)
+KDE_DIALER = ("org.kde.telephony.DialerUtils", "/org/kde/telephony/DialerUtils/tel/mm",
+              "org.kde.telephony.DialerUtils")
+KDE_CALLS = ("/org/kde/telephony/CallUtils/tel/mm", "org.kde.telephony.CallUtils")
+
+
+def note(msg):
+    print(f"shannon-callaudio-bridge: {msg}", file=sys.stderr)
+
+
+def send(line):
+    try:
+        fd = os.open(CTL, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        note(f"{CTL}: {e.strerror}")
+        return False
+    try:
+        os.write(fd, (line + "\n").encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+def when(t):
+    lt = time.localtime(t)
+    if time.strftime("%Y%m%d", lt) == time.strftime("%Y%m%d"):
+        return time.strftime("%H:%M", lt)
+    return time.strftime("%d.%m. %H:%M", lt)
+
+
+def show_missed(bus, me):
+    """Notify about calls this user could not see, then clear what was read."""
+    try:
+        with open(MISSED) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        note(f"{MISSED}: {e.strerror} (user not in group netdev?)")
+        return
+    upto, unseen = 0, []
+    for l in lines:
+        w = l.split()
+        if len(w) != 3 or not w[0].isdigit():
+            continue
+        t = int(w[0])
+        upto = max(upto, t)
+        if me not in w[1].split(","):
+            unseen.append((t, w[2]))
+    if not upto:
+        return
+    if unseen:
+        body = "\n".join(f"{num} at {when(t)}" for t, num in unseen)
+        summary = "Missed call" if len(unseen) == 1 else f"{len(unseen)} missed calls"
+        try:
+            bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                          "org.freedesktop.Notifications", "Notify",
+                          GLib.Variant("(susssasa{sv}i)",
+                                       ("Calls", 0, "call-missed-symbolic", summary,
+                                        body + "\n(the phone was not logged in)", [],
+                                        {"urgency": GLib.Variant("y", 2)}, -1)),
+                          None, Gio.DBusCallFlags.NONE, 5000, None)
+        except GLib.Error as e:
+            note(f"notification failed: {e.message}; missed calls kept")
+            return
+        note(f"{len(unseen)} missed call(s) shown")
+    send(f"missed clear {upto}")
+
+
+def kde_session():
+    return "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
+
+
+def follow_plasma_dialer(bus):
+    """Speaker / mute buttons of Plasma Dialer -> the daemon (see the module doc)."""
+    name, path, iface = KDE_DIALER
+    calls = set()
+
+    def dialer(method, arg=None):
+        params = None if arg is None else GLib.Variant("(b)", (arg,))
+        try:
+            return bus.call_sync(name, path, iface, method, params, None,
+                                 Gio.DBusCallFlags.NO_AUTO_START, 2000, None)
+        except GLib.Error as e:
+            note(f"Plasma Dialer {method}: {e.message}")
+            return None
+
+    def push_state():
+        for method, on, off in (("speakerMode", "audio speaker", "audio earpiece"),
+                                ("mute", "mute on", "mute off")):
+            r = dialer(method)
+            if r is not None:
+                send(on if r.unpack()[0] else off)
+
+    def on_signal(conn, sender, opath, oiface, member, params):
+        args = params.unpack()
+        if member == "speakerModeChanged":
+            send("audio speaker" if args[0] else "audio earpiece")
+        elif member == "muteChanged":
+            send("mute on" if args[0] else "mute off")
+        elif member == "callAdded":
+            first = not calls
+            calls.add(args[1])
+            if first:
+                push_state()
+        elif member == "callDeleted":
+            calls.discard(args[1])
+            if not calls:
+                # the daemon starts the next call on the earpiece, unmuted: show that
+                dialer("setSpeakerMode", False)
+                dialer("setMute", False)
+
+    for opath, oiface in ((path, iface), KDE_CALLS):
+        bus.signal_subscribe(None, oiface, None, opath, None, Gio.DBusSignalFlags.NONE,
+                             on_signal)
+
+
+def main():
+    last = {}
+    state = {}
+    me = GLib.get_user_name()
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def apply(props, force=False):
+        for key, table in (("SpeakerState", SPEAKER), ("MicState", MIC)):
+            v = props.get(key)
+            if v is None or v not in table or (not force and last.get(key) == v):
+                continue
+            last[key] = v
+            send(table[v])
+
+    def cached(proxy):
+        out = {}
+        for key in ("AudioMode", "SpeakerState", "MicState"):
+            v = proxy.get_cached_property(key)
+            if v is not None:
+                out[key] = v.unpack()
+        return out
+
+    def on_props(proxy, changed, invalidated):
+        ch = changed.unpack()
+        if ch.get("AudioMode") == MODE_CALL:
+            # a call starts: the daemon reset mute/speaker at the last call's end,
+            # so send what the UI shows now
+            apply(cached(proxy), force=True)
+        else:
+            apply(ch)
+
+    def appeared(conn, name, owner):
+        proxy = Gio.DBusProxy.new_sync(conn, Gio.DBusProxyFlags.NONE, None, NAME, PATH, NAME, None)
+        proxy.connect("g-properties-changed", on_props)
+        state["proxy"] = proxy
+        last.clear()
+        props = cached(proxy)
+        if props.get("AudioMode") == MODE_CALL:
+            # callaudiod (re)started during a call: follow its state
+            apply(props, force=True)
+        else:
+            last.update({k: v for k, v in props.items() if k != "AudioMode"})
+
+    def vanished(conn, name):
+        state.pop("proxy", None)
+
+    def missed_changed(mon, f, other, event):
+        # appended by the daemon (CHANGES_DONE_HINT), first created, or replaced by
+        # "missed clear" (MOVED_IN / RENAMED; reads an empty list then, no loop)
+        if event in (Gio.FileMonitorEvent.CHANGES_DONE_HINT, Gio.FileMonitorEvent.CREATED,
+                     Gio.FileMonitorEvent.MOVED_IN, Gio.FileMonitorEvent.RENAMED):
+            show_missed(bus, me)
+
+    Gio.bus_watch_name(Gio.BusType.SESSION, NAME, Gio.BusNameWatcherFlags.NONE,
+                       appeared, vanished)
+    if kde_session():
+        follow_plasma_dialer(bus)
+    # the notification daemon (Phosh) may come up a little after us
+    GLib.timeout_add_seconds(10, lambda: show_missed(bus, me) and False)
+    mon = Gio.File.new_for_path(MISSED).monitor_file(Gio.FileMonitorFlags.WATCH_MOVES, None)
+    mon.connect("changed", missed_changed)
+    state["monitor"] = mon
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

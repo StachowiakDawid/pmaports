@@ -1,0 +1,22 @@
+#!/usr/sbin/nft -f
+# shannon-modem (VoLTE): postmarketOS drops every connection arriving on wwan*
+# (01_wwan.nft).  The IMS PDN (wwan1, reaches only the operator's IMS core)
+# must accept SIP from the P-CSCF, which arrives IPsec-protected (requests and
+# UDP responses go to our protected server port), and the RTP media of calls.
+# Loaded before 01_wwan.nft, so these accepts come before its drop.
+#
+# The input hook sees the ESP packet twice: encrypted, then (transport mode)
+# decrypted with a secpath.  Without the first rule the encrypted one passes only as
+# "established" in conntrack's generic tracker, whose entry expires after
+# nf_conntrack_generic_timeout (600 s) without ESP in either direction.  Between
+# two re-REGISTERs (50 min) the AP sends nothing, so an MT INVITE or NOTIFY more
+# than 10 min after our last request would be dropped before decryption.  ESP
+# without a matching SA is dropped by xfrm, so accepting it here admits nothing
+# that the SAs do not.
+table inet filter {
+	chain input {
+		iifname "wwan1" meta l4proto 50 counter accept comment "IMS: ESP from the P-CSCF (decrypted below)"
+		iifname "wwan1" meta ipsec exists counter accept comment "IMS SIP over IPsec on the IMS PDN"
+		iifname "wwan1" udp dport 30000-50001 counter accept comment "VoLTE RTP on the IMS PDN"
+	}
+}
