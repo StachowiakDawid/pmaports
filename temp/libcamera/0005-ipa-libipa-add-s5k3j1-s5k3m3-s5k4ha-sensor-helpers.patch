@@ -1,0 +1,66 @@
+From: beyond2lte camera enablement <noreply@localhost>
+Date: 2026-11-23
+Subject: [PATCH] ipa: libipa: add CameraSensorHelpers for S5K3J1, S5K3M3 and S5K4HA
+
+The other beyond2lte sensors use the same analogue gain register model as
+the S5K3P9 (0x0204, code = 32 * gain, 32..512) and the same 10 bit black
+level of 64. Gain range confirmed on hardware for the S5K3M3 (the sensor
+reports 32..512) and through the working auto exposure of camcap for the
+S5K3J1 and S5K4HA.
+
+Applies on top of 0004 (S5K3P9 helper). Not built yet.
+
+Signed-off-by: beyond2lte camera enablement <noreply@localhost>
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -564,6 +564,42 @@
+ 	}
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("s5k3p9", CameraSensorHelperS5k3p9)
++
++class CameraSensorHelperS5k3j1 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k3j1()
++	{
++		/* front camera, S5K3J1: black level 64 at 10 bits; gain code = 32 * gain. */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k3j1", CameraSensorHelperS5k3j1)
++
++class CameraSensorHelperS5k3m3 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k3m3()
++	{
++		/* rear telephoto, S5K3M3: black level 64 at 10 bits; gain code = 32 * gain. */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k3m3", CameraSensorHelperS5k3m3)
++
++class CameraSensorHelperS5k4ha : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k4ha()
++	{
++		/* front depth camera, S5K4HA: black level 64 at 10 bits; gain code = 32 * gain. */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k4ha", CameraSensorHelperS5k4ha)
+ 
+ class CameraSensorHelperImx258 : public CameraSensorHelper
+ {
+ public:
+-- 
+2.43.0

@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: take the sensor information of the configured
+ mode
+
+The IPA module got the IPACameraSensorInfo once, at init(), for the
+sensor mode that was active then (the full resolution one), and kept
+using it for every configuration. A binned mode with another line length
+had the wrong line duration: the S5K3J1 and the S5K3M3 double the line
+length in their 2x2 binned modes, so the AGC worked with half the real
+exposure time (ExposureTime and FrameDuration metadata 16.7 ms for a
+33.4 ms exposure), and anything that needs real time, like an exposure
+of whole mains flicker periods, was off by that factor. The output size
+(frame length arithmetic) and the analogue crop (lens shading) were the
+ones of the full mode as well.
+
+Pass the sensor information of the mode being configured in
+IPAConfigInfo and use it from configure() on.
+---
+ include/libcamera/ipa/softisp.mojom      | 1 +
+ src/ipa/softisp/softisp.cpp              | 6 ++++++
+ src/libcamera/pipeline/simple/simple.cpp | 2 ++
+ 3 files changed, 9 insertions(+)
+
+diff --git a/include/libcamera/ipa/softisp.mojom b/include/libcamera/ipa/softisp.mojom
+index 1656668..65c32b1 100644
+--- a/include/libcamera/ipa/softisp.mojom
++++ b/include/libcamera/ipa/softisp.mojom
+@@ -9,6 +9,7 @@ module ipa.softisp;
+ import "include/libcamera/ipa/core.mojom";
+ 
+ struct IPAConfigInfo {
++	libcamera.IPACameraSensorInfo sensorInfo;
+ 	libcamera.ControlInfoMap sensorControls;
+ 	libcamera.ControlInfoMap lensControls;
+ };
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index 5741810..f5d2a0c 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -216,6 +216,12 @@ int IPASoftIsp::init(const IPASettings &settings,
+ 
+ int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaControls)
+ {
++	/*
++	 * init() got the sensor information of the mode that was active
++	 * then; the line length, the output size and the crop of the mode
++	 * that has been configured now may differ.
++	 */
++	context_.sensorInfo = configInfo.sensorInfo;
+ 	context_.sensorControls = configInfo.sensorControls;
+ 	context_.lensControls = configInfo.lensControls;
+ 
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index de43c97..cb59337 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1693,6 +1693,8 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
+ 		return data->converter_->configure(inputCfg, outputCfgs);
+ 	} else {
+ 		ipa::softisp::IPAConfigInfo configInfo;
++		/* The line length and the output size depend on the sensor mode. */
++		configInfo.sensorInfo = sensorInfo;
+ 		configInfo.sensorControls = data->sensor_->controls();
+ 		CameraLens *lens = data->sensor_->focusLens();
+ 		if (lens)

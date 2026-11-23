@@ -1,0 +1,34 @@
+From: beyond2lte camera enablement <noreply@localhost>
+Date: 2026-11-23
+Subject: [PATCH] pipeline: simple: match the exynos9820-csis media device with SoftISP
+
+The beyond2lte (Exynos 9820, SM-G975F) out-of-tree CSI receiver driver
+`exynos9820-csis` does raw Bayer capture with no hardware ISP: the sensor
+subdev links straight to a V4L2 video node that DMAs unpacked 10-bit Bayer
+(V4L2_PIX_FMT_SGRBG10) into memory. That is exactly the shape the simple
+pipeline handler drives with the CPU software ISP (debayer + AGC/AWB/BLC).
+
+The simple pipeline handler only acquires media devices whose driver name is
+in `supportedDevices[]`, so the receiver has to be whitelisted here. No
+converter hardware exists, so an empty converter list and swIspAllowed=true
+select the software ISP path.
+
+Tested against libcamera v0.8.0 (pmaports temp/libcamera fork).
+
+Signed-off-by: beyond2lte camera enablement <noreply@localhost>
+---
+ src/libcamera/pipeline/simple/simple.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -258,6 +258,7 @@
+ 
+ static const SimplePipelineInfo supportedDevices[] = {
+ 	{ "dcmipp", {}, false },
++	{ "exynos9820-csis", {}, true },
+ 	{ "imx7-csi", { { "pxp", 1 } }, true },
+ 	{ "intel-ipu6", {}, true },
+ 	{ "intel-ipu7", {}, true },
+-- 
+2.43.0

@@ -1,0 +1,287 @@
+From 8c3afd1a21ee917848498ff3f835ba63cae8fae4 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] software_isp, ipa: softisp: awb: near-grey AWB option (grey
+ world over low-chroma mid-brightness pixels)
+
+Plain grey world assumes the average of the whole picture is grey; a big
+coloured object pulls the white balance towards its complementary colour.
+
+The CPU statistics now also bin the unsaturated mid-brightness samples
+(green 48..200 of 255, so no near-black and no near-clipped ones) by raw
+R/G and B/G (32 x 32 bins over [0, 2), sums + counts, 16 KiB). With
+"neutral: true" in the Awb tuning block the softisp Awb uses only the bins
+whose black-corrected colour, balanced with the current estimate, is
+within neutralChroma (0.25) of grey, in two passes starting from the last
+result (plain grey world at the start). With fewer than
+neutralMinFraction (5 %) of the binned samples qualifying it falls back to
+plain grey world. The R/G and B/G result is smoothed with neutralSpeed
+(0.5) on top of the AWB gain smoothing. Default off: without the option
+nothing changes.
+---
+ .../internal/software_isp/swisp_stats.h       |  21 ++++
+ src/ipa/softisp/algorithms/awb.cpp            | 102 +++++++++++++++++-
+ src/ipa/softisp/algorithms/awb.h              |  14 ++-
+ src/libcamera/software_isp/swstats_cpu.cpp    |  22 ++++
+ 4 files changed, 157 insertions(+), 2 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index 39f8b9f..f926c11 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -80,6 +80,27 @@ struct SwIspStats {
+ 	 *        (4 for unpacked 10 bit input, 16 for 12 bit, 1 otherwise)
+ 	 */
+ 	uint32_t afDiv;
++	/**
++	 * \brief Number of bins per axis of the neutral (chroma) grid
++	 */
++	static constexpr unsigned int kNeutralBins = 32;
++	/**
++	 * \brief One bin of the chroma grid: sums of the raw channel values
++	 *        (scale: divide by \a afDiv for 8 bit) and the sample count
++	 */
++	struct NeutralBin {
++		uint32_t r;
++		uint32_t g;
++		uint32_t b;
++		uint32_t n;
++	};
++	/**
++	 * \brief Unsaturated mid-brightness samples (green 48..200 in 8 bit
++	 *        units, black level included) binned by R/G and B/G, each in
++	 *        [0, 2) in 1/16 steps, index = bg * kNeutralBins + rg; for an AWB
++	 *        that only uses the near-grey part of the picture
++	 */
++	std::array<NeutralBin, kNeutralBins * kNeutralBins> neutral;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/src/ipa/softisp/algorithms/awb.cpp b/src/ipa/softisp/algorithms/awb.cpp
+index fb9bcb0..4ff0e37 100644
+--- a/src/ipa/softisp/algorithms/awb.cpp
++++ b/src/ipa/softisp/algorithms/awb.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "awb.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
+@@ -73,17 +75,102 @@ private:
+ /**
+  * \copydoc libcamera::ipa::Algorithm::init
+  */
++/*
++ * Near-grey AWB ("neutral: true" in the Awb tuning block): grey world over
++ * the near-grey part of the picture only. The statistics bin unsaturated
++ * mid-brightness samples (no near-black, no near-clipped ones) by their raw
++ * R/G and B/G. A bin is used when its black-corrected colour, balanced with
++ * the current estimate, is within neutralChroma of grey in R/G and B/G; two
++ * passes, starting from the last result (or plain grey world). Fewer than
++ * neutralMinFraction of the binned samples qualifying (a scene with nothing
++ * near grey) falls back to plain grey world. The ratios are smoothed with
++ * neutralSpeed before the common AWB smoothing of the gains.
++ */
+ int Awb::init(IPAContext &context, const ValueNode &tuningData)
+ {
++	neutral_ = tuningData["neutral"].get<bool>(false);
++	neutralChroma_ = std::clamp(tuningData["neutralChroma"].get<double>(neutralChroma_), 0.02, 1.0);
++	neutralMinFraction_ = std::clamp(tuningData["neutralMinFraction"].get<double>(neutralMinFraction_), 0.0, 1.0);
++	neutralSpeed_ = std::clamp(tuningData["neutralSpeed"].get<double>(neutralSpeed_), 0.01, 1.0);
++	if (neutral_)
++		LOG(IPASoftIspAwb, Info)
++			<< "Near-grey AWB, chroma tolerance " << neutralChroma_
++			<< ", minimum fraction " << neutralMinFraction_;
++
+ 	return awbAlgo_.init(tuningData, context.ctrlMap);
+ }
+ 
++bool Awb::neutralMeans(IPAContext &context, const SwIspStats *stats,
++		       const RGB<double> &greyWorld, RGB<double> &means)
++{
++	const double div = stats->afDiv ? stats->afDiv : 1.0;
++	const double black = context.activeState.blc.level;
++	double rg = neutralValid_ ? neutralRg_ : greyWorld.r() / greyWorld.g();
++	double bg = neutralValid_ ? neutralBg_ : greyWorld.b() / greyWorld.g();
++	uint64_t total = 0;
++	double sr = 0, sg = 0, sb = 0;
++	uint64_t used = 0;
++
++	for (const auto &bin : stats->neutral)
++		total += bin.n;
++	if (!total)
++		return false;
++
++	for (unsigned int pass = 0; pass < 2; pass++) {
++		sr = sg = sb = 0;
++		used = 0;
++		for (const auto &bin : stats->neutral) {
++			if (!bin.n)
++				continue;
++			double r = std::max(bin.r / div / bin.n - black, 0.5);
++			double g = std::max(bin.g / div / bin.n - black, 0.5);
++			double b = std::max(bin.b / div / bin.n - black, 0.5);
++			/* colour after balancing with the current estimate */
++			double cr = (r / g) / rg;
++			double cb = (b / g) / bg;
++			if (std::abs(cr - 1.0) > neutralChroma_ ||
++			    std::abs(cb - 1.0) > neutralChroma_)
++				continue;
++			sr += r * bin.n;
++			sg += g * bin.n;
++			sb += b * bin.n;
++			used += bin.n;
++		}
++		if (!used || used < neutralMinFraction_ * total)
++			return false;
++		rg = sr / sg;
++		bg = sb / sg;
++	}
++
++	if (neutralValid_) {
++		rg = neutralSpeed_ * rg + (1.0 - neutralSpeed_) * neutralRg_;
++		bg = neutralSpeed_ * bg + (1.0 - neutralSpeed_) * neutralBg_;
++	}
++	neutralRg_ = rg;
++	neutralBg_ = bg;
++	neutralValid_ = true;
++
++	/* Same scale as the grey-world means, only the ratios matter */
++	double gMean = sg / used;
++	means = RGB<double>({ rg * gMean, gMean, bg * gMean });
++
++	LOG(IPASoftIspAwb, Debug)
++		<< "Near-grey AWB: " << used << " of " << total
++		<< " samples, R/G " << rg << ", B/G " << bg
++		<< " (grey world " << greyWorld.r() / greyWorld.g()
++		<< ", " << greyWorld.b() / greyWorld.g() << ")";
++	return true;
++}
++
+ /**
+  * \copydoc libcamera::ipa::Algorithm::configure
+  */
+ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
++	neutralValid_ = false;
++	lastNeutral_ = false;
++
+ 	return awbAlgo_.configure(context.activeState.awb);
+ }
+ 
+@@ -112,7 +199,7 @@ void Awb::prepare(IPAContext &context,
+ }
+ 
+ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+-				       const SwIspStats *stats) const
++				       const SwIspStats *stats)
+ {
+ 	if (!stats->valid)
+ 		return {};
+@@ -147,6 +234,19 @@ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+ 				   static_cast<double>(sum.g()) / nPixels,
+ 				   static_cast<double>(sum.b()) / nPixels } };
+ 
++	if (neutral_) {
++		RGB<double> means;
++		bool ok = neutralMeans(context, stats, rgbMeans, means);
++
++		if (ok != lastNeutral_)
++			LOG(IPASoftIspAwb, Debug)
++				<< (ok ? "Near-grey AWB active"
++				       : "Too few near-grey samples, plain grey world");
++		lastNeutral_ = ok;
++		if (ok)
++			return SoftIspAwbStats(means);
++	}
++
+ 	return SoftIspAwbStats(rgbMeans);
+ }
+ 
+diff --git a/src/ipa/softisp/algorithms/awb.h b/src/ipa/softisp/algorithms/awb.h
+index c92bdbf..d1d3547 100644
+--- a/src/ipa/softisp/algorithms/awb.h
++++ b/src/ipa/softisp/algorithms/awb.h
+@@ -49,7 +49,19 @@ public:
+ 
+ private:
+ 	SoftIspAwbStats calculateRgbMeans(IPAContext &context,
+-					  const SwIspStats *stats) const;
++					  const SwIspStats *stats);
++	bool neutralMeans(IPAContext &context, const SwIspStats *stats,
++			  const RGB<double> &greyWorld, RGB<double> &means);
++
++	/* Near-grey AWB (tuning "neutral"); plain grey world otherwise */
++	bool neutral_ = false;
++	double neutralChroma_ = 0.25;
++	double neutralMinFraction_ = 0.05;
++	double neutralSpeed_ = 0.5;
++	bool neutralValid_ = false;
++	double neutralRg_ = 0.0;
++	double neutralBg_ = 0.0;
++	bool lastNeutral_ = false;
+ 
+ 	/*
+ 	 * There actually is no Q register format for SoftISP, but allow the
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 2e36cb0..3c76ea9 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
++#include <algorithm>
++
+ #include <libcamera/base/log.h>
+ 
+ #include <libcamera/stream.h>
+@@ -202,6 +204,17 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 		sumG += g;                      \
+ 		sumB += b;                      \
+ 		nSamples++;                     \
++		if (g >= 48 * (div) && g <= 200 * (div)) { \
++			unsigned int nx = std::min<unsigned int>( \
++				SwIspStats::kNeutralBins - 1, r * 16 / g); \
++			unsigned int ny = std::min<unsigned int>( \
++				SwIspStats::kNeutralBins - 1, b * 16 / g); \
++			auto &bin = stats.neutral[ny * SwIspStats::kNeutralBins + nx]; \
++			bin.r += r;             \
++			bin.g += g;             \
++			bin.b += b;             \
++			bin.n++;                \
++		}                               \
+ 	}                                       \
+                                                 \
+ 	yVal = r * kRedYMul;                    \
+@@ -463,6 +476,7 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 		s.afContrast = 0;
+ 		s.afLuma = 0;
+ 		s.afSamples = 0;
++		s.neutral.fill({});
+ 	}
+ }
+ 
+@@ -493,7 +507,15 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 		sharedStats_->afContrast = 0;
+ 		sharedStats_->afLuma = 0;
+ 		sharedStats_->afSamples = 0;
++		sharedStats_->neutral.fill({});
+ 		for (const auto &s : stats_) {
++			for (unsigned int i = 0; i < s.neutral.size(); i++) {
++				auto &d = sharedStats_->neutral[i];
++				d.r += s.neutral[i].r;
++				d.g += s.neutral[i].g;
++				d.b += s.neutral[i].b;
++				d.n += s.neutral[i].n;
++			}
+ 			sharedStats_->afContrast += s.afContrast;
+ 			sharedStats_->afLuma += s.afLuma;
+ 			sharedStats_->afSamples += s.afSamples;
+-- 
+2.56.1
+

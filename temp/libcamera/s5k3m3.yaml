@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# Software-ISP tuning for the beyond2lte rear telephoto Samsung S5K3M3.
+# Installed as /usr/share/libcamera/ipa/softisp/s5k3m3.yaml and selected by the
+# sensor model name ("s5k3m3"). Same content as s5k3p9.yaml: black level 64 at
+# 10 bits (measured on raw frames of this sensor), grey-world AWB, no colour
+# matrix and no lens shading table until calibration captures exist.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+      # Near-grey AWB (0013): grey world over low-chroma, mid-brightness pixels
+      # only, plain grey world when too few qualify. false = plain grey world.
+      neutral: true
+  - Adjust:
+  - Agc:
+      # Exposures of 10 ms and more are whole multiples of the flicker period
+      # of the lamps (0021; microseconds: 10000 = 50 Hz mains, 8333 = 60 Hz,
+      # 0 = off), the gain makes up for the rest.
+      flickerPeriod: 10000
+      # The exposure may lengthen the frame up to this (0020; microseconds,
+      # 0 = keep the frame length of the sensor mode).
+      maxFrameDuration: 33334
+  # Contrast detection autofocus on the AK7374 lens (0007). Without a lens
+  # sub-device linked to the sensor (DT lens-focus) it disables itself.
+  # Continuous so that applications without AF controls get a focused
+  # picture; AfMode/AfTrigger switch to Auto with a one-shot trigger.
+  - Af:
+      mode: continuous
+...

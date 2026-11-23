@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# Software-ISP tuning for the beyond2lte rear ultra-wide Samsung S5K3P9.
+# Installed as /usr/share/libcamera/ipa/softisp/s5k3p9.yaml and selected by the
+# sensor model name ("s5k3p9").
+#
+# blackLevel 4096 == 64 at 10 bits (64 << 6), matching the measured black level
+# of our raw frames (PROGRESS: "black level 64"). With this set, the BlackLevel
+# algorithm uses it directly instead of auto-estimating from the histogram.
+#
+# No Ccm block yet: colour is left to grey-world AWB until a colour-chart
+# calibration exists. The ultra-wide lens shading
+# grid lives on the kernel/camcap side today; a libcamera Lsc block can be added
+# once a flat field is captured as a libcamera tuning (lsc.cpp supports it).
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+      # Near-grey AWB (0013): grey world over low-chroma, mid-brightness pixels
+      # only, plain grey world when too few qualify. false = plain grey world.
+      neutral: true
+  - Adjust:
+  - Agc:
+      # Exposures of 10 ms and more are whole multiples of the flicker period
+      # of the lamps (0021; microseconds: 10000 = 50 Hz mains, 8333 = 60 Hz,
+      # 0 = off), the gain makes up for the rest.
+      flickerPeriod: 10000
+      # The exposure may lengthen the frame up to this (0020; microseconds,
+      # 0 = keep the frame length of the sensor mode).
+      maxFrameDuration: 33334
+...

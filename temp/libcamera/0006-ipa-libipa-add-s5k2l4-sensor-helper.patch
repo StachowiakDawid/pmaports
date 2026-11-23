@@ -1,0 +1,39 @@
+From: beyond2lte camera enablement <noreply@localhost>
+Date: 2026-11-23
+Subject: [PATCH] ipa: libipa: add a CameraSensorHelper for the Samsung S5K2L4
+
+The rear wide / main camera (S5K2L4) uses the same SMIA analogue gain register
+model as the other beyond2lte sensors (0x0204, code = 32 * gain) and the same
+10 bit black level of 64, so the helper is identical in form to the s5k3p9 one.
+
+Applies on top of 0005 (s5k3j1/s5k3m3/s5k4ha helpers). Not built yet.
+
+Signed-off-by: beyond2lte camera enablement <noreply@localhost>
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -600,6 +600,18 @@
+ 	}
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("s5k4ha", CameraSensorHelperS5k4ha)
++
++class CameraSensorHelperS5k2l4 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k2l4()
++	{
++		/* rear wide / main, S5K2L4: black level 64 at 10 bits; gain code = 32 * gain. */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k2l4", CameraSensorHelperS5k2l4)
+ 
+ class CameraSensorHelperImx258 : public CameraSensorHelper
+ {
+-- 
+2.43.0

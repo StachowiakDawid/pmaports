@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: agc: skip statistics from before an exposure
+ change
+
+The AGC used every statistics, including those of frames captured after
+it had sent a new exposure but before the sensor applied it. The
+delayed controls report the new values for such a frame when the
+software ISP runs a frame or more behind the sensor, the AGC then takes
+the unchanged brightness for the result of the new exposure and
+corrects again: after a large step it overshot (gain 7.8, 14.3, 8.2 on
+the first three rounds of a dim scene), and with a scene darker than
+the exposure range it swung between the maximum and a low value for
+more than a second before settling.
+
+Remember the frame whose context first carried an exposure x gain that
+differs from the one before by more than a quarter, and leave out the
+statistics of frames less than five frames after it. With statistics on
+every fourth frame that is one skipped round after a large step; small
+steps, which the filter of the regulation damps anyway, and a steady
+exposure use every round as before.
+---
+ src/ipa/softisp/algorithms/agc.cpp | 47 +++++++++++++++++++++++++++---
+ src/ipa/softisp/algorithms/agc.h   |  6 ++++
+ 2 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index e1322bc..82c9d96 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -28,6 +28,11 @@ namespace ipa::softisp::algorithms {
+ 
+ namespace {
+ 
++/* Frames from sending an exposure to the first statistics that show it */
++constexpr uint32_t kSettleFrames = 5;
++/* Change of exposure x gain from which on that wait is worth it */
++constexpr double kSettleStep = 1.25;
++
+ /* Light flicker period by default: 50 Hz mains, 100 Hz flicker */
+ constexpr uint32_t kFlickerPeriod = 10000;
+ 
+@@ -97,6 +102,8 @@ int Agc::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &co
+ 		return ret;
+ 
+ 	flickerPeriods_ = 0;
++	sentChanged_ = false;
++	sentExposure_ = 0;
+ 
+ 	/*
+ 	 * The exposure limit of the sensor is the one of the frame length
+@@ -176,12 +183,44 @@ void Agc::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
+ }
+ 
+ void Agc::process(IPAContext &context,
+-		  [[maybe_unused]] const uint32_t frame,
++		  const uint32_t frame,
+ 		  IPAFrameContext &frameContext,
+ 		  const SwIspStats *stats,
+ 		  ControlList &metadata)
+ {
+-	if (stats->valid) {
++	/*
++	 * The exposure and gain of this frame context go to the sensor after
++	 * this call. They take effect a few frames later: the frame being
++	 * captured now is already ahead of the one whose statistics are
++	 * processed here, and the sensor applies them with its own delay.
++	 * Statistics of frames from before that carry the old exposure,
++	 * whatever the delayed controls say about them; regulating on them
++	 * overshoots and makes the exposure swing between two values for
++	 * several rounds. Leave those statistics out after a large step;
++	 * small steps are what the filter of the regulation is for.
++	 */
++	if (frameContext.agc.exposure != sentExposure_ ||
++	    frameContext.agc.gain != sentGain_) {
++		double before = sentExposure_ * sentGain_;
++		double step = before > 0.0
++			    ? frameContext.agc.exposure * frameContext.agc.gain / before
++			    : 1.0;
++
++		if (step > kSettleStep || step < 1.0 / kSettleStep) {
++			sentChanged_ = true;
++			sentFrame_ = frame;
++		}
++		sentExposure_ = frameContext.agc.exposure;
++		sentGain_ = frameContext.agc.gain;
++	}
++
++	bool settled = !sentChanged_ ||
++		       (stats->valid && stats->frame - sentFrame_ >= kSettleFrames &&
++			stats->frame >= sentFrame_);
++	if (settled)
++		sentChanged_ = false;
++
++	if (stats->valid && settled) {
+ 		/* \todo The histogram should come already adjusted. */
+ 		auto histogram = stats->yHistogram;
+ 
+@@ -203,11 +242,11 @@ void Agc::process(IPAContext &context,
+ 	}
+ 
+ 	const agc::ActiveState &state = context.activeState.agc;
+-	if (stats->valid && frameContext.agc.autoExposureEnabled &&
++	if (stats->valid && settled && frameContext.agc.autoExposureEnabled &&
+ 	    frameContext.agc.autoGainEnabled)
+ 		avoidFlicker(context);
+ 
+-	if (stats->valid && state.autoExposureEnabled && state.autoGainEnabled) {
++	if (stats->valid && settled && state.autoExposureEnabled && state.autoGainEnabled) {
+ 		lastExposureTime_ = state.automatic.exposure *
+ 				    context.configuration.agc.lineDuration;
+ 		lastGain_ = state.automatic.gain;
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index b5d6196..96d5d54 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -46,6 +46,12 @@ private:
+ 	/* Tuning: longest frame the exposure may ask for, 0 = as configured */
+ 	utils::Duration maxFrameDuration_;
+ 
++	/* Last exposure and gain sent to the sensor, and the first frame with them */
++	uint32_t sentExposure_ = 0;
++	double sentGain_ = 0.0;
++	uint32_t sentFrame_ = 0;
++	bool sentChanged_ = false;
++
+ 	/* Where the previous streaming session ended */
+ 	utils::Duration lastExposureTime_;
+ 	double lastGain_ = 0.0;

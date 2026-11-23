@@ -1,0 +1,42 @@
+From 578298c0b16c07b56c2e4eb567b40ecd79c5ebdd Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] libcamera: camera_lens: log when the lens sub-device is
+ opened and released
+
+The lens actuator is powered exactly while the sub-device is open: from
+the first focus move of a stream until the pipeline handler releases it
+at stop. Log both transitions (Info) so that the power state can be
+matched against the stream on the device.
+---
+ src/libcamera/camera_lens.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/libcamera/camera_lens.cpp b/src/libcamera/camera_lens.cpp
+index ee5e94f..abfc6ab 100644
+--- a/src/libcamera/camera_lens.cpp
++++ b/src/libcamera/camera_lens.cpp
+@@ -95,7 +95,11 @@ int CameraLens::init()
+  */
+ void CameraLens::release()
+ {
++	if (!subdev_->isOpen())
++		return;
++
+ 	subdev_->close();
++	LOG(CameraLens, Info) << "Lens released, the driver may power it down";
+ }
+ 
+ /**
+@@ -112,6 +116,8 @@ int CameraLens::setFocusPosition(int32_t position)
+ 		int ret = subdev_->open();
+ 		if (ret < 0)
+ 			return ret;
++		/* Stays open (actuator powered) until release() at stop */
++		LOG(CameraLens, Info) << "Lens opened for focus control";
+ 	}
+ 
+ 	ControlList lensCtrls(subdev_->controls());
+-- 
+2.56.1
+

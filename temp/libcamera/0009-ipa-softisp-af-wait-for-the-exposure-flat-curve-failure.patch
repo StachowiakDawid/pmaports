@@ -1,0 +1,350 @@
+From f5dbe2dbba83d98f9d0d9139d33559ed57a8af6e Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: af: wait for the exposure, restart on exposure
+ changes, black-level corrected measure, flat curve = failure
+
+Hardware results on the Galaxy S10+ rear wide camera: a continuous-mode
+scan started while AE was still settling (exposure 2.7 ms -> 66 ms); the
+first, underexposed measurement (0.0233, 40x the rest) won and the lens
+went to 0. In a dark scene the curve was flat (0.00229..0.00239) and the
+lens was still sent to the "peak".
+
+- A scan waits until exposure x gain and the level have stayed within
+  10 % for two statistics in a row (at most 25 statistics, ~3.3 s), and
+  restarts (up to 3 times) when either moves by more than 20 % against
+  the scan start.
+- The measure is taken on the level above black in 8 bit units (the
+  statistics now say how to scale their luminance samples, afDiv), so
+  the black level no longer distorts the normalisation.
+- A scan whose highest/lowest measure ratio is below minPeakRatio (1.15)
+  fails (AfState Failed) and the lens goes back to where it was before
+  the scan, or to failPosition from the tuning file.
+---
+ .../internal/software_isp/swisp_stats.h       |   5 +
+ .../internal/software_isp/swstats_cpu.h       |   1 +
+ src/ipa/softisp/algorithms/af.cpp             | 125 +++++++++++++++---
+ src/ipa/softisp/algorithms/af.h               |  21 ++-
+ src/libcamera/software_isp/swstats_cpu.cpp    |   4 +
+ 5 files changed, 131 insertions(+), 25 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index 677230e..39f8b9f 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -75,6 +75,11 @@ struct SwIspStats {
+ 	 * \brief Number of luminance samples used for \a afContrast
+ 	 */
+ 	uint64_t afSamples;
++	/**
++	 * \brief Divisor that turns the \a afLuma samples into 8 bit values
++	 *        (4 for unpacked 10 bit input, 16 for 12 bit, 1 otherwise)
++	 */
++	uint32_t afDiv;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 6b2d1bd..0fc6d8d 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -128,6 +128,7 @@ private:
+ 	unsigned int afY1_ = 0;
+ 	unsigned int afX0_ = 0;
+ 	unsigned int afX1_ = 0;
++	unsigned int afDiv_ = 1;
+ 
+ 	Size patternSize_;
+ 
+diff --git a/src/ipa/softisp/algorithms/af.cpp b/src/ipa/softisp/algorithms/af.cpp
+index f345dbc..dbf5e8f 100644
+--- a/src/ipa/softisp/algorithms/af.cpp
++++ b/src/ipa/softisp/algorithms/af.cpp
+@@ -29,7 +29,13 @@
+  *       coarseSteps: 12      # steps over the whole lens range
+  *       fineSteps: 6         # steps over +-1 coarse step around the peak
+  *       coarseDrop: 0.6      # end the coarse scan below this fraction of the peak
+- *       minContrast: 0.05    # (peak - lowest) / peak below this: AfState Failed
++ *       minPeakRatio: 1.15   # highest / lowest measure below this: AfState Failed,
++ *                            # the lens goes back to where it was (or failPosition)
++ *       failPosition: -1     # lens position after a failed scan (-1: where it was)
++ *       settleChange: 0.1    # exposure x gain and level steady within this for two
++ *                            # statistics before a scan starts (at most maxWait: 25)
++ *       scanChange: 0.2      # exposure or level change that restarts a scan
++ *                            # (at most maxRestarts: 3 times)
+  *       rescanChange: 0.5    # Continuous: relative change that counts as a change
+  *       rescanCount: 3       # Continuous: changed statistics in a row to rescan
+  */
+@@ -58,7 +64,12 @@ int Af::init(IPAContext &context, const ValueNode &tuningData)
+ 	coarseSteps_ = std::max(2u, tuningData["coarseSteps"].get<uint32_t>(coarseSteps_));
+ 	fineSteps_ = std::max(2u, tuningData["fineSteps"].get<uint32_t>(fineSteps_));
+ 	coarseDrop_ = tuningData["coarseDrop"].get<double>(coarseDrop_);
+-	minContrast_ = tuningData["minContrast"].get<double>(minContrast_);
++	minPeakRatio_ = std::max(1.0, tuningData["minPeakRatio"].get<double>(minPeakRatio_));
++	failPosition_ = tuningData["failPosition"].get<int32_t>(failPosition_);
++	settleChange_ = tuningData["settleChange"].get<double>(settleChange_);
++	scanChange_ = tuningData["scanChange"].get<double>(scanChange_);
++	maxWait_ = tuningData["maxWait"].get<uint32_t>(maxWait_);
++	maxRestarts_ = tuningData["maxRestarts"].get<uint32_t>(maxRestarts_);
+ 	rescanChange_ = std::clamp(tuningData["rescanChange"].get<double>(rescanChange_), 0.05, 0.95);
+ 	rescanCount_ = std::max(1u, tuningData["rescanCount"].get<uint32_t>(rescanCount_));
+ 
+@@ -117,10 +128,17 @@ int Af::configure(IPAContext &context, const IPAConfigInfo &configInfo)
+ 	return 0;
+ }
+ 
+-void Af::startScan()
++void Af::startScan(bool restart)
+ {
+ 	int32_t range = lensMax_ - lensMin_;
+ 
++	if (!restart) {
++		restarts_ = 0;
++		scanOrigin_ = position_;
++	}
++	stableCount_ = 0;
++	waitCount_ = 0;
++
+ 	scanStart_ = lensMin_;
+ 	scanEnd_ = lensMax_;
+ 	scanStep_ = std::max<int32_t>(1, (range + coarseSteps_ - 1) / coarseSteps_);
+@@ -129,8 +147,8 @@ void Af::startScan()
+ 	bestPosition_ = lensMin_;
+ 	changeCount_ = 0;
+ 	fineSamples_.clear();
+-	phase_ = Phase::Coarse;
+-	/* The first process() call moves the lens to the start */
++	/* The scan starts once the exposure has settled (beginScan()) */
++	phase_ = Phase::Wait;
+ 	measurePending_ = false;
+ 	state_ = controls::AfStateScanning;
+ }
+@@ -200,15 +218,29 @@ void Af::finishScan(IPAContext &context)
+ 		}
+ 	}
+ 
+-	bool found = bestSharpness_ > 0.0 &&
+-		     (bestSharpness_ - worstSharpness_) / bestSharpness_ >= minContrast_;
++	double ratio = worstSharpness_ > 0.0 ? bestSharpness_ / worstSharpness_ : 0.0;
++	bool found = bestSharpness_ > 0.0 && ratio >= minPeakRatio_;
++
++	if (!found) {
++		/* A flat curve says nothing about the lens position */
++		int32_t park = failPosition_ >= 0 ? failPosition_ : scanOrigin_;
++
++		LOG(IPASoftIspAf, Info)
++			<< "No contrast peak (max/min " << ratio << " < " << minPeakRatio_
++			<< "), lens back to " << park;
++		result_ = controls::AfStateFailed;
++		bestPosition_ = std::clamp(park, lensMin_, lensMax_);
++		moveTo(context, bestPosition_);
++		phase_ = Phase::Settle;
++		return;
++	}
+ 
+ 	LOG(IPASoftIspAf, Info)
+-		<< (found ? "Focused" : "No contrast peak") << " at " << bestPosition_
+-		<< " (measure " << bestSharpness_ << ", lowest " << worstSharpness_ << ")";
++		<< "Focused at " << bestPosition_ << " (measure " << bestSharpness_
++		<< ", max/min " << ratio << ")";
+ 
+ 	/* Reported once the lens is at the result (Settle) */
+-	result_ = found ? controls::AfStateFocused : controls::AfStateFailed;
++	result_ = controls::AfStateFocused;
+ 
+ 	/* Approach the peak from below, the direction of the scan */
+ 	int32_t below = std::max(lensMin_, bestPosition_ - 2 * scanStep_);
+@@ -221,22 +253,59 @@ void Af::finishScan(IPAContext &context)
+ 	}
+ }
+ 
+-void Af::step(IPAContext &context, double sharpness, double luma)
++/*
++ * Wait until the exposure (exposure time x gain, and the brightness) has
++ * stayed within settleChange_ for two statistics in a row, at most maxWait_
++ * statistics, then move the lens to the scan start.
++ */
++bool Af::beginScan(IPAContext &context, double luma, double exposure)
++{
++	bool stable = lastExposure_ > 0.0 && lastLuma_ > 0.0 &&
++		      std::abs(exposure / lastExposure_ - 1.0) <= settleChange_ &&
++		      std::abs(luma / lastLuma_ - 1.0) <= settleChange_;
++
++	stableCount_ = stable ? stableCount_ + 1 : 0;
++	waitCount_++;
++	if (stableCount_ < 2 && waitCount_ < maxWait_)
++		return false;
++
++	LOG(IPASoftIspAf, Debug)
++		<< "Scan start after " << waitCount_ << " statistics"
++		<< (stableCount_ < 2 ? " (exposure not settled)" : "");
++	scanLuma_ = luma;
++	scanExposure_ = exposure;
++	phase_ = Phase::Coarse;
++	moveTo(context, scanStart_);
++	return true;
++}
++
++void Af::step(IPAContext &context, double sharpness, double luma, double exposure)
+ {
+ 	switch (phase_) {
+ 	case Phase::Idle:
+ 		return;
+ 
++	case Phase::Wait:
++		beginScan(context, luma, exposure);
++		return;
++
+ 	case Phase::Coarse:
+ 	case Phase::Fine:
+-		if (!measurePending_) {
+-			/* Scan start: move to the first position */
+-			moveTo(context, scanStart_);
++		LOG(IPASoftIspAf, Debug) << "Lens " << position_ << ": " << sharpness
++					 << " (level " << luma << ", exposure " << exposure << ")";
++
++		/* The exposure moved during the scan: the measures do not compare */
++		if (scanExposure_ > 0.0 && scanLuma_ > 0.0 &&
++		    (std::abs(exposure / scanExposure_ - 1.0) > scanChange_ ||
++		     std::abs(luma / scanLuma_ - 1.0) > scanChange_) &&
++		    restarts_ < maxRestarts_) {
++			restarts_++;
++			LOG(IPASoftIspAf, Debug)
++				<< "Exposure changed during the scan, restart " << restarts_;
++			startScan(true);
+ 			return;
+ 		}
+ 
+-		LOG(IPASoftIspAf, Debug) << "Lens " << position_ << ": " << sharpness;
+-
+ 		if (phase_ == Phase::Fine)
+ 			fineSamples_.emplace_back(position_, sharpness);
+ 
+@@ -306,7 +375,7 @@ void Af::step(IPAContext &context, double sharpness, double luma)
+ 
+ void Af::process(IPAContext &context,
+ 		 [[maybe_unused]] const uint32_t frame,
+-		 [[maybe_unused]] IPAFrameContext &frameContext,
++		 IPAFrameContext &frameContext,
+ 		 const SwIspStats *stats,
+ 		 ControlList &metadata)
+ {
+@@ -314,11 +383,23 @@ void Af::process(IPAContext &context,
+ 		return;
+ 
+ 	if (stats->valid && stats->afSamples) {
+-		double mean = static_cast<double>(stats->afLuma) / stats->afSamples;
+-		double contrast = static_cast<double>(stats->afContrast) / stats->afSamples;
+-		double sharpness = mean > 0.0 ? contrast / (mean * mean) : 0.0;
+-
+-		step(context, sharpness, mean);
++		/*
++		 * Level above black in 8 bit units, and the mean squared
++		 * difference in the same units. The measure is divided by the
++		 * squared level so it does not depend on the exposure.
++		 */
++		double div = stats->afDiv ? stats->afDiv : 1.0;
++		double mean = static_cast<double>(stats->afLuma) / stats->afSamples / div;
++		double level = std::max(mean - context.activeState.blc.level, 1.0);
++		double contrast = static_cast<double>(stats->afContrast) /
++				  stats->afSamples / (div * div);
++		double sharpness = contrast / (level * level);
++		double exposure = static_cast<double>(frameContext.sensor.exposure) *
++				  frameContext.sensor.gain;
++
++		step(context, sharpness, level, exposure);
++		lastLuma_ = level;
++		lastExposure_ = exposure;
+ 	}
+ 
+ 	metadata.set(controls::AfState, state_);
+diff --git a/src/ipa/softisp/algorithms/af.h b/src/ipa/softisp/algorithms/af.h
+index 92f7583..ada329e 100644
+--- a/src/ipa/softisp/algorithms/af.h
++++ b/src/ipa/softisp/algorithms/af.h
+@@ -37,6 +37,7 @@ public:
+ private:
+ 	enum class Phase {
+ 		Idle,		/* not scanning, lens where it is */
++		Wait,		/* scan requested, waiting for the exposure to settle */
+ 		Coarse,		/* stepping through the whole range */
+ 		Fine,		/* stepping around the coarse peak */
+ 		Approach,	/* below the peak, the next move goes to it */
+@@ -44,17 +45,23 @@ private:
+ 		Focused,	/* scan done; Continuous mode watches for changes */
+ 	};
+ 
+-	void startScan();
++	void startScan(bool restart = false);
+ 	void stopScan();
+ 	void moveTo(IPAContext &context, int32_t position);
+ 	void finishScan(IPAContext &context);
+-	void step(IPAContext &context, double sharpness, double luma);
++	void step(IPAContext &context, double sharpness, double luma, double exposure);
++	bool beginScan(IPAContext &context, double luma, double exposure);
+ 
+ 	/* Tuning */
+ 	unsigned int coarseSteps_ = 12;
+ 	unsigned int fineSteps_ = 6;
+ 	double coarseDrop_ = 0.6;
+-	double minContrast_ = 0.05;
++	double minPeakRatio_ = 1.15;
++	int32_t failPosition_ = -1;
++	double settleChange_ = 0.1;
++	double scanChange_ = 0.2;
++	unsigned int maxWait_ = 25;
++	unsigned int maxRestarts_ = 3;
+ 	double rescanChange_ = 0.5;
+ 	unsigned int rescanCount_ = 3;
+ 	controls::AfModeEnum defaultMode_ = controls::AfModeManual;
+@@ -82,6 +89,14 @@ private:
+ 	double refSharpness_ = 0.0;
+ 	double refLuma_ = 0.0;
+ 	unsigned int changeCount_ = 0;
++	int32_t scanOrigin_ = 0;
++	double scanLuma_ = 0.0;
++	double scanExposure_ = 0.0;
++	double lastLuma_ = 0.0;
++	double lastExposure_ = 0.0;
++	unsigned int stableCount_ = 0;
++	unsigned int waitCount_ = 0;
++	unsigned int restarts_ = 0;
+ 	/* Fine scan measurements, for the interpolation of the peak */
+ 	std::vector<std::pair<int32_t, double>> fineSamples_;
+ };
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 11ebb39..2e36cb0 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -504,6 +504,7 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 		}
+ 
+ 		sharedStats_->sum_ >>= sumShift_;
++		sharedStats_->afDiv = afDiv_;
+ 		sharedStats_->frame = frame;
+ 		sharedStats_->valid = true;
+ 	}
+@@ -558,6 +559,7 @@ int SwStatsCpu::configure(const StreamConfiguration &inputCfg, unsigned int stat
+ {
+ 	stride_ = inputCfg.stride;
+ 	stats_.resize(statsBufferCount);
++	afDiv_ = 1;
+ 
+ 	BayerFormat bayerFormat =
+ 		BayerFormat::fromPixelFormat(inputCfg.pixelFormat);
+@@ -585,10 +587,12 @@ int SwStatsCpu::configure(const StreamConfiguration &inputCfg, unsigned int stat
+ 		case 10:
+ 			stats0_ = &SwStatsCpu::statsBGGR10Line0;
+ 			sumShift_ = 2;
++			afDiv_ = 4;
+ 			return 0;
+ 		case 12:
+ 			stats0_ = &SwStatsCpu::statsBGGR12Line0;
+ 			sumShift_ = 4;
++			afDiv_ = 16;
+ 			return 0;
+ 		}
+ 	}
+-- 
+2.56.1
+

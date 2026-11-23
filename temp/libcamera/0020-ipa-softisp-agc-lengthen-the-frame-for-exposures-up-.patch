@@ -1,0 +1,306 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: agc: lengthen the frame for exposures up to
+ 1/30 s
+
+The software ISP never touched the vertical blanking, so the longest
+exposure was the one of the frame length the sensor mode starts with.
+The binned mode of the S5K3P9 runs at 60 frames per second: in a dim
+room the AGC sat at 16.6 ms with the gain at its maximum of 16 and the
+picture stayed dark and noisy, with half of the light a 30 frames per
+second stream collects left unused.
+
+Let the exposure lengthen the frame up to maxFrameDuration (tuning,
+microseconds, default 33334; 0 keeps the frame length of the mode):
+- the Agc algorithm raises the exposure limit to that frame duration
+  minus the margin the sensor keeps between frame length and exposure
+  (taken from the limits of the mode);
+- the IPA module sends V4L2_CID_VBLANK with the exposure and the gain,
+  the shortest frame FrameDurationLimits allow or the one the exposure
+  needs, and reports the resulting FrameDuration;
+- the pipeline handler passes V4L2_CID_VBLANK through the delayed
+  controls as a priority write, and writes it before the exposure when
+  it applies controls directly, because the sensor clamps the exposure
+  to the limit of the blanking in force.
+
+The frame goes back to its shortest length as soon as the exposure fits,
+bright scenes keep the full frame rate.
+---
+ src/ipa/softisp/algorithms/agc.cpp       | 53 ++++++++++++++++++++++++
+ src/ipa/softisp/algorithms/agc.h         |  3 ++
+ src/ipa/softisp/ipa_context.h            |  9 ++++
+ src/ipa/softisp/softisp.cpp              | 40 +++++++++++++++++-
+ src/libcamera/pipeline/simple/simple.cpp | 31 +++++++++++---
+ 5 files changed, 130 insertions(+), 6 deletions(-)
+
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index 5164833..e4e4da6 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -10,9 +10,13 @@
+ #include <algorithm>
+ #include <chrono>
+ 
++#include <linux/v4l2-controls.h>
++
+ #include <libcamera/base/log.h>
+ #include <libcamera/base/utils.h>
+ 
++#include <libcamera/control_ids.h>
++
+ #include <libipa/histogram.h>
+ 
+ namespace libcamera {
+@@ -23,6 +27,9 @@ namespace ipa::softisp::algorithms {
+ 
+ namespace {
+ 
++/* Longest frame the exposure may ask for by default: 30 frames per second */
++constexpr uint32_t kMaxFrameDuration = 33334;
++
+ /* First session: 20 ms at four times the gain, a lit room */
+ constexpr utils::Duration kStartExposureTime = std::chrono::milliseconds(20);
+ constexpr double kStartGain = 4.0;
+@@ -57,6 +64,9 @@ private:
+ 
+ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ {
++	maxFrameDuration_ = std::chrono::microseconds(
++		tuningData["maxFrameDuration"].get<uint32_t>(kMaxFrameDuration));
++
+ 	return agc_.init(tuningData, context.camHelper.get(), {
+ 		.sensorInfo = context.sensorInfo,
+ 		.sensorControls = context.sensorControls,
+@@ -77,6 +87,49 @@ int Agc::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &co
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * The exposure limit of the sensor is the one of the frame length
++	 * its mode starts with, 1/60 s for some. Up to maxFrameDuration the
++	 * exposure may lengthen the frame (the IPA module sets the vertical
++	 * blanking the exposure needs): a lower frame rate in dim light, for
++	 * a lower gain. The frame length and the longest exposure of the
++	 * mode give the margin the sensor keeps between the two.
++	 */
++	const ControlInfo &vblank = context.sensorControls.find(V4L2_CID_VBLANK)->second;
++	const ControlInfo &exposure = context.sensorControls.find(V4L2_CID_EXPOSURE)->second;
++	const int64_t height = session.sensor.outputSize.height;
++	const int64_t frameLength = height + vblank.def().get<int32_t>();
++	const int64_t margin = frameLength - exposure.max().get<int32_t>();
++
++	if (context.camHelper && session.autoAllowed && maxFrameDuration_ &&
++	    margin >= 0 && session.lineDuration) {
++		int64_t maxLength = std::min<int64_t>(
++			maxFrameDuration_ / session.lineDuration,
++			height + vblank.max().get<int32_t>());
++
++		context.configuration.vblank = {
++			.control = true,
++			.margin = static_cast<uint32_t>(margin),
++			.min = vblank.min().get<int32_t>(),
++			.max = vblank.max().get<int32_t>(),
++		};
++
++		if (maxLength > frameLength) {
++			session.maxExposureTime = (maxLength - margin) * session.lineDuration;
++
++			const ControlInfo &info = context.ctrlMap[&controls::ExposureTime];
++			context.ctrlMap[&controls::ExposureTime] = ControlInfo{
++				info.min().get<int32_t>(),
++				static_cast<int32_t>(session.maxExposureTime.get<std::micro>()),
++				info.def().get<int32_t>(),
++			};
++		}
++
++		LOG(IPASoftIspExposure, Debug)
++			<< "Frame length " << frameLength << " lines, margin " << margin
++			<< ", longest exposure " << session.maxExposureTime;
++	}
++
+ 	/*
+ 	 * Start where the previous session ended, or with an indoor
+ 	 * exposure for the first one: the sensor default at the lowest gain
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index 2d3eb53..6811a0f 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -36,6 +36,9 @@ public:
+ private:
+ 	AgcAlgorithm agc_;
+ 
++	/* Tuning: longest frame the exposure may ask for, 0 = as configured */
++	utils::Duration maxFrameDuration_;
++
+ 	/* Where the previous streaming session ended */
+ 	utils::Duration lastExposureTime_;
+ 	double lastGain_ = 0.0;
+diff --git a/src/ipa/softisp/ipa_context.h b/src/ipa/softisp/ipa_context.h
+index ca821c6..9ea94ff 100644
+--- a/src/ipa/softisp/ipa_context.h
++++ b/src/ipa/softisp/ipa_context.h
+@@ -35,6 +35,15 @@ struct IPASessionConfiguration {
+ 	struct {
+ 		std::optional<uint8_t> level;
+ 	} black;
++	struct {
++		/* The Agc algorithm lets the exposure lengthen the frame */
++		bool control;
++		/* Frame length minus the longest exposure, in lines */
++		uint32_t margin;
++		/* V4L2_CID_VBLANK limits */
++		int32_t min;
++		int32_t max;
++	} vblank;
+ };
+ 
+ struct IPAActiveState {
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index 0940b74..1a8bd76 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -5,7 +5,9 @@
+  * Software ISP Image Processing Algorithm module
+  */
+ 
++#include <algorithm>
+ #include <chrono>
++#include <cmath>
+ #include <stdint.h>
+ #include <sys/mman.h>
+ 
+@@ -78,6 +80,7 @@ protected:
+ 
+ private:
+ 	void updateExposure(double exposureMSV);
++	uint32_t vblankFor(uint32_t exposure, utils::Duration minFrameDuration) const;
+ 
+ 	DebayerParams *params_;
+ 	SwIspStats *stats_;
+@@ -247,13 +250,33 @@ int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaCo
+ 	 */
+ 	*sensorControls = ControlList(context_.sensorControls);
+ 	const auto &agc = context_.activeState.agc;
+-	if (agc.autoExposureEnabled && agc.autoGainEnabled && agc.automatic.exposure)
++	if (agc.autoExposureEnabled && agc.autoGainEnabled && agc.automatic.exposure) {
+ 		agc::prepareControls(*sensorControls, context_.camHelper.get(),
+ 				     agc.automatic.exposure, agc.automatic.gain);
++		if (context_.configuration.vblank.control)
++			sensorControls->set(V4L2_CID_VBLANK, static_cast<int32_t>(
++				vblankFor(agc.automatic.exposure, agc.minFrameDuration)));
++	}
+ 
+ 	return 0;
+ }
+ 
++/*
++ * The vertical blanking for an exposure of the given number of lines: the
++ * shortest frame the frame duration limit allows, longer when the exposure
++ * does not fit.
++ */
++uint32_t IPASoftIsp::vblankFor(uint32_t exposure, utils::Duration minFrameDuration) const
++{
++	const auto &session = context_.configuration;
++	int64_t height = session.agc.sensor.outputSize.height;
++	int64_t lines = std::llround(minFrameDuration / session.agc.lineDuration);
++
++	lines = std::max<int64_t>(lines, static_cast<int64_t>(exposure) + session.vblank.margin);
++
++	return std::clamp<int64_t>(lines - height, session.vblank.min, session.vblank.max);
++}
++
+ int IPASoftIsp::start()
+ {
+ 	return 0;
+@@ -334,11 +357,26 @@ void IPASoftIsp::processStats(const uint32_t frame,
+ 	ControlList metadata(controls::controls);
+ 	for (const auto &algo : algorithms())
+ 		algo->process(context_, frame, frameContext, &stats, metadata);
++
++	const bool vblankControl = context_.configuration.vblank.control;
++	if (vblankControl) {
++		const agc::Session &session = context_.configuration.agc;
++
++		frameContext.agc.vblank = vblankFor(frameContext.agc.exposure,
++						    frameContext.agc.minFrameDuration);
++		frameContext.agc.frameDuration =
++			(session.sensor.outputSize.height + frameContext.agc.vblank) *
++			session.lineDuration;
++		metadata.set(controls::FrameDuration,
++			     frameContext.agc.frameDuration.get<std::micro>());
++	}
+ 	metadataReady.emit(frame, metadata);
+ 
+ 	ControlList ctrls(context_.sensorControls);
+ 	agc::prepareControls(ctrls, context_.camHelper.get(),
+ 			     frameContext.agc.exposure, frameContext.agc.gain);
++	if (vblankControl)
++		ctrls.set(V4L2_CID_VBLANK, static_cast<int32_t>(frameContext.agc.vblank));
+ 	setSensorControls.emit(ctrls);
+ 
+ 	if (context_.activeState.af.lensPosition) {
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 76ea88f..69d9320 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -379,6 +379,7 @@ private:
+ 	void ispStatsReady(uint32_t frame, uint32_t bufferId);
+ 	void metadataReady(uint32_t frame, const ControlList &metadata);
+ 	void setSensorControls(const ControlList &sensorControls);
++	void applySensorControls(const ControlList &sensorControls);
+ 	void setLensControls(const ControlList &lensControls);
+ };
+ 
+@@ -579,6 +580,9 @@ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+ 		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
+ 		{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
+ 	};
++	/* Written ahead of the exposure, whose limits it sets */
++	if (sensor_->controls().find(V4L2_CID_VBLANK) != sensor_->controls().end())
++		params[V4L2_CID_VBLANK] = { delays.vblankDelay, true };
+ 	delayedCtrls_ = std::make_unique<DelayedControls>(sensor_->device(), params);
+ 
+ 	LOG(SimplePipeline, Debug)
+@@ -1061,8 +1065,7 @@ void SimpleCameraData::setSensorControls(const ControlList &sensorControls)
+ 	 * what the sensor has.
+ 	 */
+ 	if (!streaming_) {
+-		ControlList ctrls(sensorControls);
+-		sensor_->setControls(&ctrls);
++		applySensorControls(sensorControls);
+ 		return;
+ 	}
+ 
+@@ -1075,10 +1078,28 @@ void SimpleCameraData::setSensorControls(const ControlList &sensorControls)
+ 	 * but it also bypasses delayedCtrls_, creating AGC regulation issues.
+ 	 * Both problems should be fixed.
+ 	 */
+-	if (!frameStartEmitter_) {
+-		ControlList ctrls(sensorControls);
+-		sensor_->setControls(&ctrls);
++	if (!frameStartEmitter_)
++		applySensorControls(sensorControls);
++}
++
++void SimpleCameraData::applySensorControls(const ControlList &sensorControls)
++{
++	/*
++	 * The vertical blanking sets the exposure limits of the sensor, it
++	 * has to be written before an exposure that needs the new limit.
++	 */
++	if (sensorControls.contains(V4L2_CID_VBLANK)) {
++		ControlList vblank(sensor_->controls());
++		vblank.set(V4L2_CID_VBLANK, sensorControls.get(V4L2_CID_VBLANK));
++		sensor_->setControls(&vblank);
++	}
++
++	ControlList ctrls(sensor_->controls());
++	for (const auto &[id, value] : sensorControls) {
++		if (id != V4L2_CID_VBLANK)
++			ctrls.set(id, value);
+ 	}
++	sensor_->setControls(&ctrls);
+ }
+ 
+ void SimpleCameraData::setLensControls(const ControlList &lensControls)

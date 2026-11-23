@@ -1,0 +1,153 @@
+From d874985c8edb28a4e5e40d4244f67d8357710a01 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: use new statistics within 4 frames,
+ AWB/statistics diagnostics
+
+On the phone (r13) the AWB never saw valid statistics in 90-frame runs:
+no "First AWB statistics" line and no ColourGains, on every camera. The
+IPA accepted the shared statistics only when their frame number equalled
+the frame being processed; when frames are handled in bursts the
+statistics of frame N+4 can already be in the buffer when the IPA gets to
+frame N, and every statistics was then rejected.
+
+Accept statistics that are new (not used before) and computed for this
+frame or one of the 3 before it; each set is used once, with the context
+of the frame being processed. Log at stop how many frames got statistics
+(Info) and about once per second the frame / buffer frame / counts
+(Debug). The Awb logs its first call with the validity of the
+statistics, its first valid statistics, and the first applied colour
+gains with their source (near-grey, grey world, fallback).
+---
+ src/ipa/softisp/algorithms/awb.cpp | 21 +++++++++++++++-
+ src/ipa/softisp/algorithms/awb.h   |  2 ++
+ src/ipa/softisp/softisp.cpp        | 40 +++++++++++++++++++++++++++++-
+ 3 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/src/ipa/softisp/algorithms/awb.cpp b/src/ipa/softisp/algorithms/awb.cpp
+index e4915a4..189063b 100644
+--- a/src/ipa/softisp/algorithms/awb.cpp
++++ b/src/ipa/softisp/algorithms/awb.cpp
+@@ -210,6 +210,8 @@ int Awb::configure(IPAContext &context,
+ 	neutralCalls_ = 0;
+ 	neutralEmptyLogged_ = false;
+ 	awbFirstLogged_ = false;
++	awbCalled_ = false;
++	gainsLogged_ = false;
+ 
+ 	return awbAlgo_.configure(context.activeState.awb);
+ }
+@@ -236,6 +238,16 @@ void Awb::prepare(IPAContext &context,
+ 	awbAlgo_.prepare(context.activeState.awb, frameContext.awb);
+ 
+ 	params->gains = frameContext.awb.gains;
++
++	const RGB<double> &g = frameContext.awb.gains;
++	if (!gainsLogged_ && (std::abs(g.r() - 1.0) > 0.01 || std::abs(g.b() - 1.0) > 0.01)) {
++		LOG(IPASoftIspAwb, Info)
++			<< "First AWB gains applied: R " << g.r() << " G " << g.g()
++			<< " B " << g.b() << " ("
++			<< (!neutral_ ? "grey world" : lastNeutral_ == 1 ? "near-grey" : "grey world fallback")
++			<< ")";
++		gainsLogged_ = true;
++	}
+ }
+ 
+ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+@@ -303,7 +315,14 @@ void Awb::process(IPAContext &context, const uint32_t frame,
+ {
+ 	SoftIspAwbStats awbStats = calculateRgbMeans(context, stats);
+ 
+-	if (neutral_ && stats->valid && !awbFirstLogged_) {
++	if (!awbCalled_) {
++		LOG(IPASoftIspAwb, Info)
++			<< "AWB running (frame " << frame << ", statistics "
++			<< (stats->valid ? "valid" : "not valid") << ")";
++		awbCalled_ = true;
++	}
++
++	if (stats->valid && !awbFirstLogged_) {
+ 		LOG(IPASoftIspAwb, Info)
+ 			<< "First AWB statistics: frame " << frame << ", "
+ 			<< stats->numPixels_ << " samples, means "
+diff --git a/src/ipa/softisp/algorithms/awb.h b/src/ipa/softisp/algorithms/awb.h
+index c54b840..cbea2ef 100644
+--- a/src/ipa/softisp/algorithms/awb.h
++++ b/src/ipa/softisp/algorithms/awb.h
+@@ -65,6 +65,8 @@ private:
+ 	unsigned int neutralCalls_ = 0;
+ 	bool neutralEmptyLogged_ = false;
+ 	bool awbFirstLogged_ = false;
++	bool awbCalled_ = false;
++	bool gainsLogged_ = false;
+ 	/* Optional start estimate (raw R/G, B/G above black), e.g. module data */
+ 	bool neutralStartSet_ = false;
+ 	double neutralStartRg_ = 0.0;
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index c607351..5741810 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -81,6 +81,13 @@ private:
+ 	DebayerParams *params_;
+ 	SwIspStats *stats_;
+ 
++	/* Statistics bookkeeping (see processStats()) */
++	bool statsSeen_ = false;
++	uint32_t lastStatsFrame_ = 0;
++	unsigned int statsCalls_ = 0;
++	unsigned int statsUsed_ = 0;
++	unsigned int statsStale_ = 0;
++
+ 	/* Local parameter storage */
+ 	struct IPAContext context_;
+ };
+@@ -235,6 +242,11 @@ int IPASoftIsp::start()
+ 
+ void IPASoftIsp::stop()
+ {
++	LOG(IPASoftIsp, Info)
++		<< "Statistics used for " << statsUsed_ << " of " << statsCalls_
++		<< " frames (stale " << statsStale_ << ")";
++	statsSeen_ = false;
++	statsCalls_ = statsUsed_ = statsStale_ = 0;
+ 	context_.frameContexts.clear();
+ }
+ 
+@@ -272,7 +284,33 @@ void IPASoftIsp::processStats(const uint32_t frame,
+ 	 * any; they belong to this frame only if the frame numbers match.
+ 	 */
+ 	SwIspStats stats = *stats_;
+-	stats.valid = stats.valid && stats.frame == frame;
++
++	/*
++	 * Use statistics that are new (not used before) and recent: computed
++	 * for this frame or for one of the kStatsWindow frames before it. The
++	 * frame-exact match alone lost them whenever the IPA thread handled
++	 * frame N after the statistics of frame N+4 had already been written
++	 * (frames processed in bursts). They are processed once, with this
++	 * frame's context.
++	 */
++	constexpr uint32_t kStatsWindow = 4;
++	bool fresh = stats.valid && (!statsSeen_ || stats.frame != lastStatsFrame_) &&
++		     frame - stats.frame < kStatsWindow;
++	statsCalls_++;
++	if (stats.valid && !fresh)
++		statsStale_++;
++	if (fresh) {
++		statsSeen_ = true;
++		lastStatsFrame_ = stats.frame;
++		statsUsed_++;
++	}
++	stats.valid = fresh;
++
++	if (statsCalls_ % 30 == 1)
++		LOG(IPASoftIsp, Debug)
++			<< "Statistics: frame " << frame << ", buffer frame " << stats.frame
++			<< ", used " << statsUsed_ << " of " << statsCalls_
++			<< " calls, stale " << statsStale_;
+ 
+ 	ControlList metadata(controls::controls);
+ 	for (const auto &algo : algorithms())
+-- 
+2.56.1
+

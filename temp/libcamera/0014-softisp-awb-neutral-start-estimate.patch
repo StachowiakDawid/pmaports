@@ -1,0 +1,87 @@
+From 7fbd66008a555c8bc0a4bda6a5b4c4a9fd02c223 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: awb: optional start estimate for the near-grey
+ AWB
+
+neutralStart: [R/G, B/G] (raw ratios above black) replaces plain grey
+world as the first estimate of the near-grey AWB, so that the first
+selection of near-grey bins does not start from a picture dominated by a
+coloured object. Intended for the per-module factory grey record of the
+camera module EEPROM; unset by default (no change).
+---
+ src/ipa/softisp/algorithms/awb.cpp | 21 ++++++++++++++++++---
+ src/ipa/softisp/algorithms/awb.h   |  4 ++++
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/src/ipa/softisp/algorithms/awb.cpp b/src/ipa/softisp/algorithms/awb.cpp
+index 4ff0e37..e5b0bd8 100644
+--- a/src/ipa/softisp/algorithms/awb.cpp
++++ b/src/ipa/softisp/algorithms/awb.cpp
+@@ -10,6 +10,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <stdint.h>
++#include <vector>
+ 
+ #include <libcamera/base/log.h>
+ 
+@@ -83,7 +84,8 @@ private:
+  * the current estimate, is within neutralChroma of grey in R/G and B/G; two
+  * passes, starting from the last result (or plain grey world). Fewer than
+  * neutralMinFraction of the binned samples qualifying (a scene with nothing
+- * near grey) falls back to plain grey world. The ratios are smoothed with
++ * near grey) falls back to plain grey world. neutralStart: [R/G, B/G]
++ * optionally replaces plain grey world as the first estimate. The ratios are smoothed with
+  * neutralSpeed before the common AWB smoothing of the gains.
+  */
+ int Awb::init(IPAContext &context, const ValueNode &tuningData)
+@@ -92,6 +94,12 @@ int Awb::init(IPAContext &context, const ValueNode &tuningData)
+ 	neutralChroma_ = std::clamp(tuningData["neutralChroma"].get<double>(neutralChroma_), 0.02, 1.0);
+ 	neutralMinFraction_ = std::clamp(tuningData["neutralMinFraction"].get<double>(neutralMinFraction_), 0.0, 1.0);
+ 	neutralSpeed_ = std::clamp(tuningData["neutralSpeed"].get<double>(neutralSpeed_), 0.01, 1.0);
++	auto start = tuningData["neutralStart"].get<std::vector<double>>();
++	if (start && start->size() == 2 && (*start)[0] > 0.0 && (*start)[1] > 0.0) {
++		neutralStartSet_ = true;
++		neutralStartRg_ = (*start)[0];
++		neutralStartBg_ = (*start)[1];
++	}
+ 	if (neutral_)
+ 		LOG(IPASoftIspAwb, Info)
+ 			<< "Near-grey AWB, chroma tolerance " << neutralChroma_
+@@ -105,8 +113,15 @@ bool Awb::neutralMeans(IPAContext &context, const SwIspStats *stats,
+ {
+ 	const double div = stats->afDiv ? stats->afDiv : 1.0;
+ 	const double black = context.activeState.blc.level;
+-	double rg = neutralValid_ ? neutralRg_ : greyWorld.r() / greyWorld.g();
+-	double bg = neutralValid_ ? neutralBg_ : greyWorld.b() / greyWorld.g();
++	/*
++	 * Start from the last result, else from the configured start point
++	 * (neutralStart: [R/G, B/G], raw ratios above black, e.g. from the
++	 * module's factory grey record), else from plain grey world.
++	 */
++	double rg = neutralValid_ ? neutralRg_
++		  : neutralStartSet_ ? neutralStartRg_ : greyWorld.r() / greyWorld.g();
++	double bg = neutralValid_ ? neutralBg_
++		  : neutralStartSet_ ? neutralStartBg_ : greyWorld.b() / greyWorld.g();
+ 	uint64_t total = 0;
+ 	double sr = 0, sg = 0, sb = 0;
+ 	uint64_t used = 0;
+diff --git a/src/ipa/softisp/algorithms/awb.h b/src/ipa/softisp/algorithms/awb.h
+index d1d3547..5f0f3b8 100644
+--- a/src/ipa/softisp/algorithms/awb.h
++++ b/src/ipa/softisp/algorithms/awb.h
+@@ -62,6 +62,10 @@ private:
+ 	double neutralRg_ = 0.0;
+ 	double neutralBg_ = 0.0;
+ 	bool lastNeutral_ = false;
++	/* Optional start estimate (raw R/G, B/G above black), e.g. module data */
++	bool neutralStartSet_ = false;
++	double neutralStartRg_ = 0.0;
++	double neutralStartBg_ = 0.0;
+ 
+ 	/*
+ 	 * There actually is no Q register format for SoftISP, but allow the
+-- 
+2.56.1
+

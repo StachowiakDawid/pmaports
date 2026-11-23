@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: af: restart a scan only when the scene changes
+
+A scan restarted whenever the exposure or the level of the focus window
+had moved by more than 20 % since its start. In a dim room that happens
+all the time without anything being wrong: the AGC keeps creeping while
+the lens moves (the rear wide camera went from 116000 to 136000 exposure
+x gain during one scan), and in front of a hand-held camera the level
+moves with the scene. The rear wide camera needed three restarts and
+about 200 frames to focus, the front camera once did not get to Focused
+within 150 frames. The measure is divided by the squared level, so it
+stays comparable through such changes; restarting only costs time.
+
+Compare the scene brightness instead (level per exposure x gain) and
+restart only when it has changed by more than a factor 1 + scanChange
+since the scan started, with a new scanChange default of 1.0 (a factor
+of two: another scene). Before the scan, wait for the exposure to hold
+still as before but no longer for the level; the changes of the measure
+that a moving level causes go into the noise estimate, which raises the
+peak the scan has to find accordingly.
+---
+ src/ipa/softisp/algorithms/af.cpp | 54 ++++++++++++++++++-------------
+ src/ipa/softisp/algorithms/af.h   |  6 ++--
+ 2 files changed, 33 insertions(+), 27 deletions(-)
+
+diff --git a/src/ipa/softisp/algorithms/af.cpp b/src/ipa/softisp/algorithms/af.cpp
+index 3f9b871..c234443 100644
+--- a/src/ipa/softisp/algorithms/af.cpp
++++ b/src/ipa/softisp/algorithms/af.cpp
+@@ -32,10 +32,11 @@
+  *       minPeakRatio: 1.15   # highest / lowest measure below this: AfState Failed,
+  *                            # the lens goes back to where it was (or failPosition)
+  *       failPosition: -1     # lens position after a failed scan (-1: where it was)
+- *       settleChange: 0.1    # exposure x gain and level steady within this for two
++ *       settleChange: 0.1    # exposure x gain steady within this for three
+  *                            # statistics before a scan starts (at most maxWait: 25)
+- *       scanChange: 0.2      # exposure or level change that restarts a scan
+- *                            # (at most maxRestarts: 3 times)
++ *       scanChange: 1.0      # change of the scene brightness (level / exposure)
++ *                            # by more than a factor 1 + scanChange restarts a
++ *                            # scan (at most maxRestarts: 3 times)
+  *       rescanChange: 0.3    # Continuous: relative change of the measure, level or
+  *                            # exposure that counts as a scene change (at least
+  *                            # 4x the measured noise)
+@@ -71,7 +72,7 @@ int Af::init(IPAContext &context, const ValueNode &tuningData)
+ 	minPeakRatio_ = std::max(1.0, tuningData["minPeakRatio"].get<double>(minPeakRatio_));
+ 	failPosition_ = tuningData["failPosition"].get<int32_t>(failPosition_);
+ 	settleChange_ = tuningData["settleChange"].get<double>(settleChange_);
+-	scanChange_ = tuningData["scanChange"].get<double>(scanChange_);
++	scanChange_ = std::max(0.05, tuningData["scanChange"].get<double>(scanChange_));
+ 	maxWait_ = tuningData["maxWait"].get<uint32_t>(maxWait_);
+ 	maxRestarts_ = tuningData["maxRestarts"].get<uint32_t>(maxRestarts_);
+ 	noiseFactor_ = tuningData["noiseFactor"].get<double>(noiseFactor_);
+@@ -272,15 +273,17 @@ void Af::finishScan(IPAContext &context)
+ }
+ 
+ /*
+- * Wait until the exposure (exposure time x gain, and the brightness) has
+- * stayed within settleChange_ for two statistics in a row, at most maxWait_
+- * statistics, then move the lens to the scan start.
++ * Wait until the exposure (exposure time x gain) has stayed within
++ * settleChange_ for three statistics in a row, at most maxWait_ statistics,
++ * then move the lens to the scan start. The level is not asked to hold
++ * still: it follows the scene (a hand-held camera, flickering light), the
++ * measure is divided by it, and what the changing level does to the measure
++ * goes into the noise estimate.
+  */
+ bool Af::beginScan(IPAContext &context, double sharpness, double luma, double exposure)
+ {
+-	bool stable = lastExposure_ > 0.0 && lastLuma_ > 0.0 &&
+-		      std::abs(exposure / lastExposure_ - 1.0) <= settleChange_ &&
+-		      std::abs(luma / lastLuma_ - 1.0) <= settleChange_;
++	bool stable = lastExposure_ > 0.0 &&
++		      std::abs(exposure / lastExposure_ - 1.0) <= settleChange_;
+ 
+ 	/* Lens and exposure still: the change of the measure is noise */
+ 	if (stable && lastSharpness_ > 0.0) {
+@@ -301,8 +304,7 @@ bool Af::beginScan(IPAContext &context, double sharpness, double luma, double ex
+ 		<< "Scan start after " << waitCount_ << " statistics"
+ 		<< (stableCount_ < 3 ? " (exposure not settled)" : "")
+ 		<< ", measure noise " << sigma_;
+-	scanLuma_ = luma;
+-	scanExposure_ = exposure;
++	scanBrightness_ = exposure > 0.0 ? luma / exposure : 0.0;
+ 	phase_ = Phase::Coarse;
+ 	moveTo(context, scanStart_);
+ 	return true;
+@@ -323,16 +325,23 @@ void Af::step(IPAContext &context, double sharpness, double luma, double exposur
+ 		LOG(IPASoftIspAf, Debug) << "Lens " << position_ << ": " << sharpness
+ 					 << " (level " << luma << ", exposure " << exposure << ")";
+ 
+-		/* The exposure moved during the scan: the measures do not compare */
+-		if (scanExposure_ > 0.0 && scanLuma_ > 0.0 &&
+-		    (std::abs(exposure / scanExposure_ - 1.0) > scanChange_ ||
+-		     std::abs(luma / scanLuma_ - 1.0) > scanChange_) &&
+-		    restarts_ < maxRestarts_) {
+-			restarts_++;
+-			LOG(IPASoftIspAf, Debug)
+-				<< "Exposure changed during the scan, restart " << restarts_;
+-			startScan(true);
+-			return;
++		/*
++		 * The measure is divided by the squared level: a change of
++		 * the exposure, or of the light, by some ten percent leaves
++		 * it comparable. Another scene does not: the scene brightness
++		 * (level per exposure) far from where the scan started.
++		 */
++		if (scanBrightness_ > 0.0 && exposure > 0.0 && restarts_ < maxRestarts_) {
++			double change = luma / exposure / scanBrightness_;
++
++			if (change > 1.0 + scanChange_ || change < 1.0 / (1.0 + scanChange_)) {
++				restarts_++;
++				LOG(IPASoftIspAf, Debug)
++					<< "Scene changed during the scan (brightness x"
++					<< change << "), restart " << restarts_;
++				startScan(true);
++				return;
++			}
+ 		}
+ 
+ 		if (phase_ == Phase::Fine)
+@@ -431,7 +440,6 @@ void Af::process(IPAContext &context,
+ 				  frameContext.sensor.gain;
+ 
+ 		step(context, sharpness, level, exposure);
+-		lastLuma_ = level;
+ 		lastExposure_ = exposure;
+ 	}
+ 
+diff --git a/src/ipa/softisp/algorithms/af.h b/src/ipa/softisp/algorithms/af.h
+index 74656fb..b28a6e4 100644
+--- a/src/ipa/softisp/algorithms/af.h
++++ b/src/ipa/softisp/algorithms/af.h
+@@ -59,7 +59,7 @@ private:
+ 	double minPeakRatio_ = 1.15;
+ 	int32_t failPosition_ = -1;
+ 	double settleChange_ = 0.1;
+-	double scanChange_ = 0.2;
++	double scanChange_ = 1.0;
+ 	unsigned int maxWait_ = 25;
+ 	unsigned int maxRestarts_ = 3;
+ 	double rescanChange_ = 0.3;
+@@ -91,9 +91,7 @@ private:
+ 	double refLuma_ = 0.0;
+ 	unsigned int changeCount_ = 0;
+ 	int32_t scanOrigin_ = 0;
+-	double scanLuma_ = 0.0;
+-	double scanExposure_ = 0.0;
+-	double lastLuma_ = 0.0;
++	double scanBrightness_ = 0.0;
+ 	double lastExposure_ = 0.0;
+ 	unsigned int stableCount_ = 0;
+ 	unsigned int waitCount_ = 0;

@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: agc: start with an indoor or the last exposure
+
+Streaming started with the sensor driver's default exposure at the
+lowest gain: the IPA only sends sensor controls with the first
+statistics, and its own starting point was that default too. With a
+default of about 1 ms (S5K2L4) the first frames of an indoor scene are
+black, and statistics of a black frame take the regulation several
+rounds to get out of.
+
+Start the AGC at 20 ms and four times the gain for the first session
+(a lit room; daylight is overexposed for the first frames instead, which
+the regulation leaves as fast) and where the previous session ended for
+the following ones (the camera application reconfigures when it switches
+modes), and have the pipeline
+handler write these values to the sensor before it streams: configure()
+of the IPA returns the sensor controls to start with, and
+SimpleCameraData applies controls directly while not streaming. The
+delayed controls are seeded from the sensor at start() as before.
+---
+ include/libcamera/ipa/softisp.mojom         |  3 +-
+ src/ipa/softisp/algorithms/agc.cpp          | 43 ++++++++++++++++++++-
+ src/ipa/softisp/algorithms/agc.h            |  4 ++
+ src/ipa/softisp/softisp.cpp                 | 17 +++++++-
+ src/libcamera/pipeline/simple/simple.cpp    | 14 +++++++
+ src/libcamera/software_isp/software_isp.cpp |  7 +++-
+ 6 files changed, 83 insertions(+), 5 deletions(-)
+
+diff --git a/include/libcamera/ipa/softisp.mojom b/include/libcamera/ipa/softisp.mojom
+index 65c32b1..bdf8255 100644
+--- a/include/libcamera/ipa/softisp.mojom
++++ b/include/libcamera/ipa/softisp.mojom
+@@ -27,7 +27,8 @@ interface IPASoftIspInterface {
+ 	start() => (int32 ret);
+ 	stop();
+ 	configure(IPAConfigInfo configInfo)
+-		=> (int32 ret, libcamera.ControlInfoMap ipaControls);
++		=> (int32 ret, libcamera.ControlInfoMap ipaControls,
++		    libcamera.ControlList sensorControls);
+ 
+ 	[async] queueRequest(uint32 frame, libcamera.ControlList sensorControls);
+ 	[async] computeParams(uint32 frame);
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index ea234bc..5164833 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -7,7 +7,11 @@
+ 
+ #include "agc.h"
+ 
++#include <algorithm>
++#include <chrono>
++
+ #include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
+ 
+ #include <libipa/histogram.h>
+ 
+@@ -19,6 +23,10 @@ namespace ipa::softisp::algorithms {
+ 
+ namespace {
+ 
++/* First session: 20 ms at four times the gain, a lit room */
++constexpr utils::Duration kStartExposureTime = std::chrono::milliseconds(20);
++constexpr double kStartGain = 4.0;
++
+ class AgcTraits : public AgcMeanLuminance::Traits
+ {
+ public:
+@@ -58,11 +66,37 @@ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ 
+ int Agc::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+-	return agc_.configure(context.configuration.agc, context.activeState.agc, {
++	agc::Session &session = context.configuration.agc;
++	agc::ActiveState &state = context.activeState.agc;
++
++	int ret = agc_.configure(session, state, {
+ 		.sensorInfo = context.sensorInfo,
+ 		.sensorControls = context.sensorControls,
+ 		.ctrlMap = context.ctrlMap,
+ 	});
++	if (ret)
++		return ret;
++
++	/*
++	 * Start where the previous session ended, or with an indoor
++	 * exposure for the first one: the sensor default at the lowest gain
++	 * leaves the first frames of an indoor scene black, and the
++	 * regulation needs several statistics to get out of there. Gains
++	 * are sensor codes without a sensor helper, leave those alone.
++	 */
++	if (context.camHelper && session.autoAllowed) {
++		utils::Duration exposureTime = lastGain_ ? lastExposureTime_
++							 : kStartExposureTime;
++		double gain = lastGain_ ? lastGain_ : kStartGain;
++
++		exposureTime = std::clamp(exposureTime, session.minExposureTime,
++					  session.maxExposureTime);
++		state.automatic.exposure = exposureTime / session.lineDuration;
++		state.automatic.gain = std::clamp(gain, session.minAnalogueGain,
++						  session.maxAnalogueGain);
++	}
++
++	return 0;
+ }
+ 
+ void Agc::queueRequest(IPAContext &context, [[maybe_unused]] const uint32_t frame,
+@@ -103,6 +137,13 @@ void Agc::process(IPAContext &context,
+ 	} else {
+ 		agc_.process(context.configuration.agc, context.activeState.agc, frameContext.agc, {}, metadata);
+ 	}
++
++	const agc::ActiveState &state = context.activeState.agc;
++	if (stats->valid && state.autoExposureEnabled && state.autoGainEnabled) {
++		lastExposureTime_ = state.automatic.exposure *
++				    context.configuration.agc.lineDuration;
++		lastGain_ = state.automatic.gain;
++	}
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index 10484cb..2d3eb53 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -35,6 +35,10 @@ public:
+ 
+ private:
+ 	AgcAlgorithm agc_;
++
++	/* Where the previous streaming session ended */
++	utils::Duration lastExposureTime_;
++	double lastGain_ = 0.0;
+ };
+ 
+ } /* namespace ipa::softisp::algorithms */
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index f5d2a0c..0940b74 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -62,7 +62,8 @@ public:
+ 		 bool *lscEnabled,
+ 		 SizeRange *sizeLimits) override;
+ 	int configure(const IPAConfigInfo &configInfo,
+-		      ControlInfoMap *ipaControls) override;
++		      ControlInfoMap *ipaControls,
++		      ControlList *sensorControls) override;
+ 
+ 	int start() override;
+ 	void stop() override;
+@@ -214,7 +215,8 @@ int IPASoftIsp::init(const IPASettings &settings,
+ 	return 0;
+ }
+ 
+-int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaControls)
++int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaControls,
++			  ControlList *sensorControls)
+ {
+ 	/*
+ 	 * init() got the sensor information of the mode that was active
+@@ -238,6 +240,17 @@ int IPASoftIsp::configure(const IPAConfigInfo &configInfo, ControlInfoMap *ipaCo
+ 
+ 	*ipaControls = { ControlInfoMap::Map(context_.ctrlMap), controls::controls };
+ 
++	/*
++	 * The exposure and gain the AGC starts with go to the sensor before
++	 * it streams, the first frames would use the driver defaults
++	 * otherwise.
++	 */
++	*sensorControls = ControlList(context_.sensorControls);
++	const auto &agc = context_.activeState.agc;
++	if (agc.autoExposureEnabled && agc.autoGainEnabled && agc.automatic.exposure)
++		agc::prepareControls(*sensorControls, context_.camHelper.get(),
++				     agc.automatic.exposure, agc.automatic.gain);
++
+ 	return 0;
+ }
+ 
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index cb59337..76ea88f 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -347,6 +347,7 @@ public:
+ 	std::unique_ptr<CameraSensor> sensor_;
+ 	V4L2VideoDevice *video_;
+ 	V4L2Subdevice *frameStartEmitter_;
++	bool streaming_ = false;
+ 
+ 	std::vector<Configuration> configs_;
+ 	std::map<PixelFormat, std::vector<const Configuration *>> formats_;
+@@ -1054,6 +1055,17 @@ void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata
+ 
+ void SimpleCameraData::setSensorControls(const ControlList &sensorControls)
+ {
++	/*
++	 * Not streaming yet: these are the settings to start with. The
++	 * sensor gets them now, and start() seeds the delayed controls with
++	 * what the sensor has.
++	 */
++	if (!streaming_) {
++		ControlList ctrls(sensorControls);
++		sensor_->setControls(&ctrls);
++		return;
++	}
++
+ 	delayedCtrls_->push(sensorControls);
+ 	/*
+ 	 * Directly apply controls now if there is no frameStart signal.
+@@ -1788,6 +1800,7 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
+ 		stop(camera);
+ 		return ret;
+ 	}
++	data->streaming_ = true;
+ 
+ 	if (data->useConversion_) {
+ 		if (data->converter_)
+@@ -1830,6 +1843,7 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
+ 			data->swIsp_->stop();
+ 	}
+ 
++	data->streaming_ = false;
+ 	video->streamOff();
+ 	video->releaseBuffers();
+ 
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index 2c58e1c..795f461 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -311,10 +311,15 @@ int SoftwareIsp::configure(const StreamConfiguration &inputCfg,
+ {
+ 	ASSERT(ipa_ && debayer_);
+ 
+-	int ret = ipa_->configure(configInfo, ipaControls);
++	ControlList sensorControls;
++	int ret = ipa_->configure(configInfo, ipaControls, &sensorControls);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* The sensor settings the IPA wants the stream to start with */
++	if (!sensorControls.empty())
++		setSensorControls.emit(sensorControls);
++
+ 	ret = debayer_->configure(inputCfg, outputCfgs, ccmEnabled_, lscEnabled_);
+ 	if (ret < 0)
+ 		return ret;

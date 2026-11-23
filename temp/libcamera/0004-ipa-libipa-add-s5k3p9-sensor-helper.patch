@@ -1,0 +1,49 @@
+From: beyond2lte camera enablement <noreply@localhost>
+Date: 2026-11-23
+Subject: [PATCH] ipa: libipa: add a CameraSensorHelper for the Samsung S5K3P9
+
+The software ISP AGC needs a CameraSensorHelper to convert between analogue
+gain and the sensor's gain register code. Without one, the softisp IPA only
+logs "Failed to create camera sensor helper" and AGC drives gain as a raw
+code, so exposure control is wrong.
+
+The S5K3P9 (beyond2lte rear ultra-wide) analogue gain register (0x0204) is
+linear: code = 32 * gain, i.e. code 32 = 1.0x, 512 = 16.0x. In the
+CameraSensorHelper linear model gain = (m0*x + c0)/(m1*x + c1) with x the
+register code, that is { m0=1, c0=0, m1=0, c1=32 }.
+
+Black level is 64 at 10 bits = 4096 on libcamera's 16-bit scale (64 << 6),
+the same value the datasheet-derived imx219 helper uses.
+
+Without this patch the camera still enumerates and previews; gain tracking is
+just coarse. It is therefore optional for the first milestone but recommended.
+
+Signed-off-by: beyond2lte camera enablement <noreply@localhost>
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -552,6 +552,18 @@
+ 	}
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx219", CameraSensorHelperImx219)
++
++class CameraSensorHelperS5k3p9 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k3p9()
++	{
++		/* Black level 64 at 10 bits; analogue gain code = 32 * gain. */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k3p9", CameraSensorHelperS5k3p9)
+ 
+ class CameraSensorHelperImx258 : public CameraSensorHelper
+ {
+-- 
+2.43.0

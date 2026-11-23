@@ -1,0 +1,60 @@
+From 6075fdebe15069a899ff2001b431f8dae067c43c Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] software_isp: debayer_egl: sync the output buffer for the CPU
+
+The GPU debayer finished with glFinish() only. A CPU reader of the output
+dma-buf then saw stale cache lines: on the Galaxy S10+ (Mali-G76 via
+panfrost, udmabuf output buffers, XRGB8888) cam's file sink wrote frames
+with hundreds of black dashes of exactly 16 pixels (one 64-byte line,
+always 16-pixel aligned), at different places in every run.
+
+After the GPU is done, run a DMA_BUF_SYNC read cycle on the output so the
+CPU view is invalidated, and on the first use of an output buffer a write
+cycle so dirty lines from its allocation are written back before the GPU
+renders into it. The CPU debayer already syncs its outputs.
+---
+ src/libcamera/software_isp/debayer_egl.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index df0d9c9..60b0df2 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -589,6 +589,15 @@ eGLImage *DebayerEGL::getCachedOutputFrameBuffer(FrameBuffer *output)
+ 	}
+ 
+ 	if (cache_miss) {
++		/*
++		 * First GPU use of this buffer: write back dirty CPU cache lines
++		 * (e.g. from zeroing at allocation) so they cannot be evicted
++		 * over the GPU's output later.
++		 */
++		{
++			DmaSyncer clean(fd, DmaSyncer::SyncType::Write);
++		}
++
+ 		if (eglImageOutCache_.size() >= outputBufferCount_) {
+ 			eglImageOutCache_.pop_front();
+ 			LOG(Debayer, Debug) << "Output cache " << outputBufferCount_ << " exceeded evicted entry";
+@@ -679,6 +688,17 @@ void DebayerEGL::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	inDmaSyncer.reset();
+ 
+ 	egl_.syncOutput();
++
++	/*
++	 * The GPU wrote the output behind the CPU caches. Without a sync a
++	 * CPU reader (cam's file sink, a CPU copy in a consumer) sees stale
++	 * cache lines: on the Exynos 9820 (Mali via panfrost, udmabuf
++	 * outputs) whole 64-byte lines, 16 black pixels in a row, all over the
++	 * picture. Invalidate the CPU view now that the GPU is done.
++	 */
++	{
++		DmaSyncer outSync(output->planes()[0].fd, DmaSyncer::SyncType::Read);
++	}
+ 	bench_.finishFrame();
+ 
+ 	outputBufferReady.emit(output);
+-- 
+2.56.1
+

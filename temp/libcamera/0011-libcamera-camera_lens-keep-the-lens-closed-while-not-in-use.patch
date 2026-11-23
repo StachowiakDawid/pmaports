@@ -1,0 +1,104 @@
+From 9684d839af0efbc93e720b04ca5f68c3c34c9cee Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH 2/2] libcamera: camera_lens: keep the lens sub-device closed
+ while not in use
+
+Lens drivers power the actuator while their sub-device node is open: the
+ak7375 driver takes a runtime PM reference in open() and drops it in
+close(). CameraLens opened the node in init() and kept it open for the
+lifetime of the camera manager, so with PipeWire running the actuator
+supplies of every camera with a lens stayed on although no camera was in
+use.
+
+Close the node at the end of init() (the control information stays
+cached), open it again in setFocusPosition() when needed, and add
+release(), which the simple pipeline handler calls when the camera
+stops. The driver then moves the lens back to rest and switches its
+supplies off; at the next open it restores the last position.
+---
+ include/libcamera/internal/camera_lens.h |  1 +
+ src/libcamera/camera_lens.cpp            | 28 ++++++++++++++++++++++++
+ src/libcamera/pipeline/simple/simple.cpp |  5 +++++
+ 3 files changed, 34 insertions(+)
+
+diff --git a/include/libcamera/internal/camera_lens.h b/include/libcamera/internal/camera_lens.h
+index f347c5e..28e0480 100644
+--- a/include/libcamera/internal/camera_lens.h
++++ b/include/libcamera/internal/camera_lens.h
+@@ -28,6 +28,7 @@ public:
+ 
+ 	int init();
+ 	int setFocusPosition(int32_t position);
++	void release();
+ 
+ 	const std::string &model() const { return model_; }
+ 
+diff --git a/src/libcamera/camera_lens.cpp b/src/libcamera/camera_lens.cpp
+index ccc2a6a..ee5e94f 100644
+--- a/src/libcamera/camera_lens.cpp
++++ b/src/libcamera/camera_lens.cpp
+@@ -73,9 +73,31 @@ int CameraLens::init()
+ 		return ret;
+ 
+ 	model_ = subdev_->model();
++
++	/*
++	 * Lens drivers power the actuator while their sub-device is open
++	 * (ak7375 and others take a runtime PM reference in open()). A camera
++	 * manager lives as long as e.g. PipeWire, so keeping the node open
++	 * kept the actuator supplies on with no camera in use. The controls
++	 * stay cached; setFocusPosition() opens the node again and
++	 * release() closes it.
++	 */
++	subdev_->close();
++
+ 	return 0;
+ }
+ 
++/**
++ * \brief Close the lens sub-device so that its driver can power it down
++ *
++ * The next setFocusPosition() call opens it again. Pipeline handlers call
++ * this when the camera stops streaming.
++ */
++void CameraLens::release()
++{
++	subdev_->close();
++}
++
+ /**
+  * \brief This function sets the focal point of the lens to a specific position.
+  * \param[in] position The focal point of the lens
+@@ -86,6 +108,12 @@ int CameraLens::init()
+  */
+ int CameraLens::setFocusPosition(int32_t position)
+ {
++	if (!subdev_->isOpen()) {
++		int ret = subdev_->open();
++		if (ret < 0)
++			return ret;
++	}
++
+ 	ControlList lensCtrls(subdev_->controls());
+ 	lensCtrls.set(V4L2_CID_FOCUS_ABSOLUTE, static_cast<int32_t>(position));
+ 
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 4df2bc0..de43c97 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1837,6 +1837,11 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
+ 	data->clearIncompleteRequests();
+ 	data->conversionBuffers_.clear();
+ 
++	/* Let the lens driver power the actuator down until the next move */
++	CameraLens *lens = data->sensor_->focusLens();
++	if (lens)
++		lens->release();
++
+ 	releasePipeline(data);
+ }
+ 
+-- 
+2.56.1
+

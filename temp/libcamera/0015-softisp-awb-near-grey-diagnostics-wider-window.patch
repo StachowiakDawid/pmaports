@@ -1,0 +1,184 @@
+From 7008db0d16517cb05b774b47b472fe67684f1864 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: awb: near-grey AWB diagnostics, wider
+ brightness window
+
+On the phone the near-grey AWB never reported a result and never logged
+why. Log the first AWB statistics (Info: samples, means, validity), the
+first state of the near-grey AWB (Info, active or inactive; the state
+used to start as "inactive" and was therefore never printed), a one-time
+Info when the neutral bins are empty, and about once per second (every
+8th statistics) at Debug the binned/used sample counts with the start
+estimate, black level and scale, or the result.
+
+The green window of the binned samples was 48..200 of 255 including the
+black level (16). The AGC keeps the mean linear level low (the gamma is
+applied later), so in a normal room most samples are darker than 48;
+use 24..230 (8 above black up to below the saturation threshold).
+---
+ .../internal/software_isp/swisp_stats.h       |  2 +-
+ src/ipa/softisp/algorithms/awb.cpp            | 53 ++++++++++++++++---
+ src/ipa/softisp/algorithms/awb.h              |  5 +-
+ src/libcamera/software_isp/swstats_cpu.cpp    |  2 +-
+ 4 files changed, 51 insertions(+), 11 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index f926c11..d895b1d 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -95,7 +95,7 @@ struct SwIspStats {
+ 		uint32_t n;
+ 	};
+ 	/**
+-	 * \brief Unsaturated mid-brightness samples (green 48..200 in 8 bit
++	 * \brief Unsaturated mid-brightness samples (green 24..230 in 8 bit
+ 	 *        units, black level included) binned by R/G and B/G, each in
+ 	 *        [0, 2) in 1/16 steps, index = bg * kNeutralBins + rg; for an AWB
+ 	 *        that only uses the near-grey part of the picture
+diff --git a/src/ipa/softisp/algorithms/awb.cpp b/src/ipa/softisp/algorithms/awb.cpp
+index e5b0bd8..e4915a4 100644
+--- a/src/ipa/softisp/algorithms/awb.cpp
++++ b/src/ipa/softisp/algorithms/awb.cpp
+@@ -128,8 +128,21 @@ bool Awb::neutralMeans(IPAContext &context, const SwIspStats *stats,
+ 
+ 	for (const auto &bin : stats->neutral)
+ 		total += bin.n;
+-	if (!total)
++
++	/* Diagnostics: about once per second at 30 fps (every 8th statistics) */
++	bool report = (neutralCalls_++ % 8) == 0;
++
++	if (!total) {
++		if (!neutralEmptyLogged_) {
++			LOG(IPASoftIspAwb, Info)
++				<< "Near-grey AWB: neutral bins empty (no unsaturated"
++				<< " mid-brightness samples), plain grey world";
++			neutralEmptyLogged_ = true;
++		} else if (report) {
++			LOG(IPASoftIspAwb, Debug) << "Near-grey AWB: bins empty";
++		}
+ 		return false;
++	}
+ 
+ 	for (unsigned int pass = 0; pass < 2; pass++) {
+ 		sr = sg = sb = 0;
+@@ -151,8 +164,16 @@ bool Awb::neutralMeans(IPAContext &context, const SwIspStats *stats,
+ 			sb += b * bin.n;
+ 			used += bin.n;
+ 		}
+-		if (!used || used < neutralMinFraction_ * total)
++		if (!used || used < neutralMinFraction_ * total) {
++			if (report)
++				LOG(IPASoftIspAwb, Debug)
++					<< "Near-grey AWB: pass " << pass << " used " << used
++					<< " of " << total << " binned samples (< "
++					<< neutralMinFraction_ << "), start R/G " << rg
++					<< " B/G " << bg << ", black " << black
++					<< ", div " << div;
+ 			return false;
++		}
+ 		rg = sr / sg;
+ 		bg = sb / sg;
+ 	}
+@@ -169,7 +190,8 @@ bool Awb::neutralMeans(IPAContext &context, const SwIspStats *stats,
+ 	double gMean = sg / used;
+ 	means = RGB<double>({ rg * gMean, gMean, bg * gMean });
+ 
+-	LOG(IPASoftIspAwb, Debug)
++	if (report)
++		LOG(IPASoftIspAwb, Debug)
+ 		<< "Near-grey AWB: " << used << " of " << total
+ 		<< " samples, R/G " << rg << ", B/G " << bg
+ 		<< " (grey world " << greyWorld.r() / greyWorld.g()
+@@ -184,7 +206,10 @@ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+ 	neutralValid_ = false;
+-	lastNeutral_ = false;
++	lastNeutral_ = -1;
++	neutralCalls_ = 0;
++	neutralEmptyLogged_ = false;
++	awbFirstLogged_ = false;
+ 
+ 	return awbAlgo_.configure(context.activeState.awb);
+ }
+@@ -219,6 +244,10 @@ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+ 	if (!stats->valid)
+ 		return {};
+ 
++	if (neutral_ && neutralCalls_ == 0)
++		LOG(IPASoftIspAwb, Debug)
++			<< "AWB statistics: " << stats->numPixels_ << " unsaturated samples";
++
+ 	const uint8_t blackLevel = context.activeState.blc.level;
+ 
+ 	const uint64_t nPixels = stats->numPixels_;
+@@ -253,10 +282,10 @@ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+ 		RGB<double> means;
+ 		bool ok = neutralMeans(context, stats, rgbMeans, means);
+ 
+-		if (ok != lastNeutral_)
+-			LOG(IPASoftIspAwb, Debug)
++		if (static_cast<int>(ok) != lastNeutral_)
++			LOG(IPASoftIspAwb, Info)
+ 				<< (ok ? "Near-grey AWB active"
+-				       : "Too few near-grey samples, plain grey world");
++				       : "Near-grey AWB inactive (too few near-grey samples), plain grey world");
+ 		lastNeutral_ = ok;
+ 		if (ok)
+ 			return SoftIspAwbStats(means);
+@@ -268,12 +297,20 @@ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+ /**
+  * \copydoc libcamera::ipa::Algorithm::process
+  */
+-void Awb::process(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++void Awb::process(IPAContext &context, const uint32_t frame,
+ 		  IPAFrameContext &frameContext, const SwIspStats *stats,
+ 		  ControlList &metadata)
+ {
+ 	SoftIspAwbStats awbStats = calculateRgbMeans(context, stats);
+ 
++	if (neutral_ && stats->valid && !awbFirstLogged_) {
++		LOG(IPASoftIspAwb, Info)
++			<< "First AWB statistics: frame " << frame << ", "
++			<< stats->numPixels_ << " samples, means "
++			<< awbStats.rgbMeans() << (awbStats.valid() ? "" : " (invalid)");
++		awbFirstLogged_ = true;
++	}
++
+ 	awbAlgo_.process(context.activeState.awb, frameContext.awb, awbStats,
+ 			 kDefaultLux, metadata);
+ }
+diff --git a/src/ipa/softisp/algorithms/awb.h b/src/ipa/softisp/algorithms/awb.h
+index 5f0f3b8..c54b840 100644
+--- a/src/ipa/softisp/algorithms/awb.h
++++ b/src/ipa/softisp/algorithms/awb.h
+@@ -61,7 +61,10 @@ private:
+ 	bool neutralValid_ = false;
+ 	double neutralRg_ = 0.0;
+ 	double neutralBg_ = 0.0;
+-	bool lastNeutral_ = false;
++	int lastNeutral_ = -1;		/* -1: no state logged yet */
++	unsigned int neutralCalls_ = 0;
++	bool neutralEmptyLogged_ = false;
++	bool awbFirstLogged_ = false;
+ 	/* Optional start estimate (raw R/G, B/G above black), e.g. module data */
+ 	bool neutralStartSet_ = false;
+ 	double neutralStartRg_ = 0.0;
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 3c76ea9..5620960 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -204,7 +204,7 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 		sumG += g;                      \
+ 		sumB += b;                      \
+ 		nSamples++;                     \
+-		if (g >= 48 * (div) && g <= 200 * (div)) { \
++		if (g >= 24 * (div) && g <= 230 * (div)) { \
+ 			unsigned int nx = std::min<unsigned int>( \
+ 				SwIspStats::kNeutralBins - 1, r * 16 / g); \
+ 			unsigned int ny = std::min<unsigned int>( \
+-- 
+2.56.1
+

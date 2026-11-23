@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ipa: softisp: agc: avoid mains flicker bands
+
+Under lamps that flicker with the mains (LED and fluorescent lamps, 100
+Hz on a 50 Hz grid) the rolling shutter shows faint horizontal bands
+whenever the exposure time is not a whole number of flicker periods; the
+AGC used whatever exposure time the brightness asked for, e.g. 16.6 ms.
+
+Add a flickerPeriod tuning parameter to the Agc algorithm (microseconds,
+default 10000 for 50 Hz mains; 8333 for 60 Hz, 0 turns it off). An
+exposure of at least one period is shortened to whole periods and the
+analogue gain makes up for the difference, so the product and with it
+the regulation stay the same. When the sensor has no gain left for that,
+the picture may get up to a quarter darker (33.3 ms at the highest gain
+becomes 30 ms); a scene that would lose more keeps its exposure and may
+show bands. Exposures below one period (bright scenes) are not changed
+either. A small hysteresis keeps the exposure from alternating between
+n and n + 1 periods.
+---
+ src/ipa/softisp/algorithms/agc.cpp | 66 ++++++++++++++++++++++++++++++
+ src/ipa/softisp/algorithms/agc.h   |  7 ++++
+ 2 files changed, 73 insertions(+)
+
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index e4e4da6..e1322bc 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cmath>
+ 
+ #include <linux/v4l2-controls.h>
+ 
+@@ -27,6 +28,12 @@ namespace ipa::softisp::algorithms {
+ 
+ namespace {
+ 
++/* Light flicker period by default: 50 Hz mains, 100 Hz flicker */
++constexpr uint32_t kFlickerPeriod = 10000;
++
++/* Exposure that flicker avoidance may give up when the gain is at its limit */
++constexpr double kFlickerMaxLoss = 1.25;
++
+ /* Longest frame the exposure may ask for by default: 30 frames per second */
+ constexpr uint32_t kMaxFrameDuration = 33334;
+ 
+@@ -64,6 +71,8 @@ private:
+ 
+ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ {
++	flickerPeriod_ = std::chrono::microseconds(
++		tuningData["flickerPeriod"].get<uint32_t>(kFlickerPeriod));
+ 	maxFrameDuration_ = std::chrono::microseconds(
+ 		tuningData["maxFrameDuration"].get<uint32_t>(kMaxFrameDuration));
+ 
+@@ -87,6 +96,8 @@ int Agc::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &co
+ 	if (ret)
+ 		return ret;
+ 
++	flickerPeriods_ = 0;
++
+ 	/*
+ 	 * The exposure limit of the sensor is the one of the frame length
+ 	 * its mode starts with, 1/60 s for some. Up to maxFrameDuration the
+@@ -192,6 +203,10 @@ void Agc::process(IPAContext &context,
+ 	}
+ 
+ 	const agc::ActiveState &state = context.activeState.agc;
++	if (stats->valid && frameContext.agc.autoExposureEnabled &&
++	    frameContext.agc.autoGainEnabled)
++		avoidFlicker(context);
++
+ 	if (stats->valid && state.autoExposureEnabled && state.autoGainEnabled) {
+ 		lastExposureTime_ = state.automatic.exposure *
+ 				    context.configuration.agc.lineDuration;
+@@ -199,6 +214,57 @@ void Agc::process(IPAContext &context,
+ 	}
+ }
+ 
++/*
++ * Lamps on the mains flicker at twice the mains frequency, and the rolling
++ * shutter turns that into horizontal bands unless every line integrates
++ * whole flicker periods. The AGC fills the exposure time before it raises the
++ * gain; an exposure of at least one period is shortened to whole periods
++ * here and the gain makes up for it. When the sensor has no gain left for
++ * that, the picture gets darker by up to kFlickerMaxLoss (the last third of a
++ * stop is worth less than a picture without bands); beyond that the exposure
++ * stays as it is, like the exposures below one period of bright scenes.
++ */
++void Agc::avoidFlicker(IPAContext &context)
++{
++	const agc::Session &session = context.configuration.agc;
++	auto &automatic = context.activeState.agc.automatic;
++
++	if (!flickerPeriod_ || !context.camHelper) {
++		flickerPeriods_ = 0;
++		return;
++	}
++
++	const utils::Duration exposureTime = automatic.exposure * session.lineDuration;
++	const double total = automatic.exposure * automatic.gain;
++	auto lines = [&](unsigned int periods) {
++		return static_cast<uint32_t>(
++			std::lround(periods * flickerPeriod_ / session.lineDuration));
++	};
++
++	unsigned int periods = exposureTime / flickerPeriod_;
++
++	/*
++	 * Do not go back and forth between n and n + 1 periods when the
++	 * exposure hovers around the step: one more only when clearly needed.
++	 */
++	if (flickerPeriods_ && periods == flickerPeriods_ + 1 &&
++	    exposureTime < 1.05 * periods * flickerPeriod_ &&
++	    total / lines(flickerPeriods_) <= session.maxAnalogueGain)
++		periods = flickerPeriods_;
++
++	if (!periods ||
++	    total / lines(periods) > kFlickerMaxLoss * session.maxAnalogueGain) {
++		/* Too bright for a whole period, or too dark to give up exposure */
++		flickerPeriods_ = 0;
++		return;
++	}
++
++	flickerPeriods_ = periods;
++	automatic.exposure = lines(periods);
++	automatic.gain = std::clamp(total / automatic.exposure,
++				    session.minAnalogueGain, session.maxAnalogueGain);
++}
++
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+ 
+ } /* namespace ipa::softisp::algorithms */
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index 6811a0f..b5d6196 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -34,8 +34,15 @@ public:
+ 		     ControlList &metadata) override;
+ 
+ private:
++	void avoidFlicker(IPAContext &context);
++
+ 	AgcAlgorithm agc_;
+ 
++	/* Tuning: period of the light flicker, 0 = no flicker avoidance */
++	utils::Duration flickerPeriod_;
++	/* Flicker periods in the current exposure */
++	unsigned int flickerPeriods_ = 0;
++
+ 	/* Tuning: longest frame the exposure may ask for, 0 = as configured */
+ 	utils::Duration maxFrameDuration_;
+ 

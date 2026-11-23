@@ -1,0 +1,175 @@
+From 5db61fc3431df9c72a48a412f83f3b15ca558d17 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] software_isp, pipeline: simple: keep statistics until the IPA
+ has read them, fewer capture buffers when memory is short, binned default for
+ viewfinder
+
+Three fixes found on the Galaxy S10+ (Exynos 9820, simple pipeline +
+software ISP with the GPU debayer):
+
+- SwStatsCpu::finishFrame() cleared the valid flag of the shared
+  statistics for every frame without statistics. The IPA handles
+  statsReady asynchronously, so when it ran late (full-resolution
+  frames, statistics computed on the CPU after the GPU debayer) it found
+  the statistics already invalidated: at 3648x2736 only 2 of ~30
+  statistics reached the IPA in 120 frames, AGC converged slowly and the
+  autofocus scan stalled. The buffer now carries the frame number and is
+  only written for frames with statistics; the IPA takes a copy and uses
+  it when the frame numbers match.
+- The capture device allocates its internal buffers from CMA. A
+  full-resolution mode (4032x3024 RAW10 in 16-bit words = 24 MB per
+  buffer) did not fit four times into 128 MB and the camera failed to
+  start ("Wanted 4, got 3"). Retry with fewer buffers, down to two.
+- Viewfinder and video recording defaulted to the full sensor
+  resolution. Default them to the largest output of a sensor mode of at
+  most 6 Mpixel (the binned modes); still capture and raw keep the
+  largest size.
+---
+ .../internal/software_isp/swisp_stats.h       |  5 +++
+ src/ipa/softisp/softisp.cpp                   |  9 +++-
+ src/libcamera/pipeline/simple/simple.cpp      | 42 ++++++++++++++++++-
+ src/libcamera/software_isp/swstats_cpu.cpp    | 12 +++++-
+ 4 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index ae182f7..677230e 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -36,6 +36,11 @@ struct SwIspStats {
+ 	 *        no statistics were generated for this frame
+ 	 */
+ 	bool valid;
++	/**
++	 * \brief Frame number the statistics were computed for, valid only
++	 *        when \a valid is true
++	 */
++	uint32_t frame;
+ 	/**
+ 	 * \brief Sums of colour channels of all the unsaturated pixels
+ 	 */
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index 97416fe..c607351 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -267,9 +267,16 @@ void IPASoftIsp::processStats(const uint32_t frame,
+ 	std::tie(frameContext.sensor.exposure, frameContext.sensor.gain) =
+ 		agc::extractControls(sensorControls, context_.camHelper.get());
+ 
++	/*
++	 * The shared buffer holds the statistics of the last frame that had
++	 * any; they belong to this frame only if the frame numbers match.
++	 */
++	SwIspStats stats = *stats_;
++	stats.valid = stats.valid && stats.frame == frame;
++
+ 	ControlList metadata(controls::controls);
+ 	for (const auto &algo : algorithms())
+-		algo->process(context_, frame, frameContext, stats_, metadata);
++		algo->process(context_, frame, frameContext, &stats, metadata);
+ 	metadataReady.emit(frame, metadata);
+ 
+ 	ControlList ctrls(context_.sensorControls);
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index d0342c7..4df2bc0 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -441,6 +441,7 @@ protected:
+ private:
+ 	static constexpr unsigned int kMaxQueuedRequestsDevice = 4;
+ 	static constexpr unsigned int kNumInternalBuffers = 4;
++	static constexpr unsigned int kMaxDefaultSensorPixels = 6000000;
+ 
+ 	struct EntityData {
+ 		std::unique_ptr<V4L2VideoDevice> video;
+@@ -1546,6 +1547,29 @@ SimplePipelineHandler::generateConfiguration(Camera *camera, std::span<const Str
+ 		cfg.pixelFormat = formats.begin()->first;
+ 		cfg.size = formats.begin()->second[0].max;
+ 
++		/*
++		 * Viewfinder and video default to the largest output of a
++		 * sensor mode of at most kMaxDefaultSensorPixels (the binned
++		 * modes), not to the full sensor resolution: that costs four
++		 * times the memory and ISP time for a preview. Still capture
++		 * and raw keep the largest size.
++		 */
++		if (role == StreamRole::Viewfinder || role == StreamRole::VideoRecording) {
++			Size best;
++			for (const SimpleCameraData::Configuration &c : data->configs_) {
++				if (c.captureSize.width * c.captureSize.height > kMaxDefaultSensorPixels)
++					continue;
++				if (std::find(c.outputFormats.begin(), c.outputFormats.end(),
++					      cfg.pixelFormat) == c.outputFormats.end())
++					continue;
++				const Size &max = c.outputSizes.max;
++				if (max.width * max.height > best.width * best.height)
++					best = max;
++			}
++			if (!best.isNull())
++				cfg.size = best;
++		}
++
+ 		config->addConfiguration(cfg);
+ 	}
+ 
+@@ -1715,8 +1739,22 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
+ 		 * When using the converter allocate a fixed number of internal
+ 		 * buffers.
+ 		 */
+-		ret = video->allocateBuffers(kNumInternalBuffers,
+-					     &data->conversionBuffers_);
++		unsigned int count = kNumInternalBuffers;
++
++		/*
++		 * Full-resolution frames may not fit kNumInternalBuffers
++		 * times into the contiguous memory the capture device
++		 * allocates from: run with fewer, down to two.
++		 */
++		while (true) {
++			ret = video->allocateBuffers(count, &data->conversionBuffers_);
++			if (ret != -ENOMEM || count <= 2)
++				break;
++			count--;
++			LOG(SimplePipeline, Warning)
++				<< "Not enough memory for the capture buffers, trying "
++				<< count;
++		}
+ 	} else {
+ 		/*
+ 		 * Otherwise, prepare for using buffers from either the raw stream, if
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 5d1d125..11ebb39 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -477,7 +477,16 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ {
+ 	bool valid = frame % kStatPerNumFrames == 0;
+ 
++	/*
++	 * Only the frames that have statistics touch the shared buffer. The
++	 * IPA handles statsReady asynchronously: when the frames without
++	 * statistics cleared the valid flag, an IPA that ran late (a large
++	 * frame, the statistics computed on the CPU after a GPU debayer) found
++	 * the statistics of the frame before already invalidated, and most
++	 * statistics were lost. The IPA checks the frame number instead.
++	 */
+ 	if (valid) {
++		sharedStats_->valid = false;
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		sharedStats_->numPixels_ = 0;
+ 		sharedStats_->yHistogram.fill(0);
+@@ -495,9 +504,10 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 		}
+ 
+ 		sharedStats_->sum_ >>= sumShift_;
++		sharedStats_->frame = frame;
++		sharedStats_->valid = true;
+ 	}
+ 
+-	sharedStats_->valid = valid;
+ 	statsReady.emit(frame, bufferId);
+ }
+ 
+-- 
+2.56.1
+
