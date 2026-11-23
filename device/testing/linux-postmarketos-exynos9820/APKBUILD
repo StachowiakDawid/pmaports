@@ -5,7 +5,7 @@
 maintainer="chiffa <chiffathefoxx@gmail.com>"
 pkgname=linux-postmarketos-exynos9820
 pkgver=7.4_rc3
-pkgrel=17
+pkgrel=18
 pkgdesc="Close-to-mainline kernel for Samsung Exynos 9820 devices"
 url="https://kernel.org"
 arch="aarch64"
@@ -14,6 +14,7 @@ _flavor="${pkgname#linux-}"
 license="GPL-2.0-only"
 makedepends="
 	bc
+	rust-bindgen
 	bison
 	clang
 	elfutils-dev
@@ -27,6 +28,8 @@ makedepends="
 	perl
 	postmarketos-installkernel
 	python3
+	rust
+	rust-src
 	zstd
 "
 _config="config-$_flavor.$arch"
@@ -159,7 +162,7 @@ package() {
 
 sha512sums="
 12551f560ed8dbc530126399717238f070175e5dbab356e8b68cf9379493a284c843192b3fc9d96decbc7bf411ee027aae2b30851605507655517c04bb97403f  linux-7.4-rc3.tar.gz
-52cca839dbf5d60a194f8ebf45e0188d418d9cf6d8c970db4432b790f379a915a00b56af2aef04d5eecacf51cc358b93b6042179d99900bdc160d21708f42364  config-postmarketos-exynos9820.aarch64
+475c12208f4288ba6a7f27788013c84a504dbfe87834a3c3867a412ca7491573535eb5e6d3ccf5d2110ae89cdf2626b7da5cd2c8fe0da3c5511c6373b2238df8  config-postmarketos-exynos9820.aarch64
 348c6e3f311096299cfbc36074fd278b3a54cff350c873c4887e8d6dd6d468ae24feb58429c7e789b730738065efe91c61256d1f1a8a9591bac512f06076aff2  0000-fork-001-clk-samsung-exynos-add-pll_1018x-and-pll_0817x.patch
 a12db57da94d6b32ba4d8681f6af74ee807f16a63bd95f442e6189ec4e4fc4097f35083a885dd2911e65bc61317958840d4bfe174ea437e246359cbec872316f  0000-fork-002-clk-add-exynos9820-clock-driver.patch
 3d0e765fe65b1e63a45cd107b56df2ea0bdc6903061d89f275d180c7d3d57380c7a2e72ae94d207bfbc952a656f201b3a41add43e056cc57120434f413201ef5  0000-fork-003-ufs-exynos-exynos9820-phy-and-ufs-driver.patch
