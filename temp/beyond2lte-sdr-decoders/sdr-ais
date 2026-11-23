@@ -1,0 +1,39 @@
+#!/bin/sh
+# sdr-ais.service: AIS-catcher (both AIS channels) with its built-in web UI.
+AIS_DEVICE=0 AIS_GAIN=auto AIS_PPM=0 AIS_WEB_PORT=8100 AIS_STATION=beyond2lte
+AIS_LAT= AIS_LON= AIS_UDP= AIS_TCP_PORT= AIS_INPUT_ARGS= AIS_EXTRA_ARGS=
+[ -r /etc/default/sdr-ais ] && . /etc/default/sdr-ais
+STATE=${STATE_DIRECTORY:-/var/lib/sdr-decoders/ais}
+
+if [ -n "$AIS_INPUT_ARGS" ]; then
+	# shellcheck disable=SC2086
+	set -- $AIS_INPUT_ARGS
+else
+	case "$AIS_DEVICE" in
+	[0-9]|[0-9][0-9]) set -- -d:"$AIS_DEVICE" ;;
+	*) set -- -d "$AIS_DEVICE" ;;
+	esac
+	set -- "$@" -gr TUNER "${AIS_GAIN:-auto}" RTLAGC on
+	[ "${AIS_PPM:-0}" != 0 ] && set -- "$@" -p "$AIS_PPM"
+fi
+# no NMEA on stdout; statistics line every 10 minutes in the journal
+set -- "$@" -q -v 600
+if [ -n "$AIS_WEB_PORT" ]; then
+	set -- "$@" -N "$AIS_WEB_PORT" STATION "${AIS_STATION:-beyond2lte}" \
+		FILE "$STATE/stat.bin" BACKUP 10
+	[ -n "$AIS_LAT" ] && [ -n "$AIS_LON" ] && \
+		set -- "$@" LAT "$AIS_LAT" LON "$AIS_LON" SHARE_LOC on
+fi
+if [ -n "$AIS_UDP" ]; then
+	oldifs=$IFS; IFS=';'
+	for hp in $AIS_UDP; do
+		IFS=$oldifs
+		# shellcheck disable=SC2086
+		set -- "$@" -u $hp
+		IFS=';'
+	done
+	IFS=$oldifs
+fi
+[ -n "$AIS_TCP_PORT" ] && set -- "$@" -S "$AIS_TCP_PORT"
+# shellcheck disable=SC2086
+exec /usr/bin/AIS-catcher "$@" $AIS_EXTRA_ARGS

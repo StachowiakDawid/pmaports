@@ -1,0 +1,50 @@
+[Unit]
+Description=SDR server health/status page (HTTP)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=sdrstatus
+Group=sdrstatus
+# read the journal (recent errors)
+SupplementaryGroups=systemd-journal
+EnvironmentFile=-/etc/default/sdr-status
+ExecStart=/usr/libexec/sdr-status/sdr-status-server
+Restart=on-failure
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=5min
+CPUAffinity=0-3
+Nice=10
+MemoryMax=96M
+
+# Hardening: read-only view of the system, no devices, no privileges
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# device nodes stay visible (sdr-mode status resolves /dev/sdr/*) but cannot be opened
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+# AF_NETLINK: iw (nl80211) and ip; AF_UNIX: systemctl/journal
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

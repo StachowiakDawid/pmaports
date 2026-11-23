@@ -1,0 +1,17 @@
+# /etc/default/sdr-headless - settings for the sdr-headless switch.
+
+# Value written to /sys/class/backlight/*/bl_power for "panel off".
+# 1 = display off, panel stays awake (same as the device package's
+#     beyond2lte-blank; tested, instant on)
+# 4 = FB_BLANK_POWERDOWN (with panel blank_mode=1 the driver still only sends
+#     display-off; kept configurable for later driver versions)
+SDR_HEADLESS_BL_POWER=1
+
+# Additionally blank the kernel console framebuffer (fbcon on the DECON KMS
+# device): DPMS off -> CRTC/DSI stop, saves a little more. Untested: try it
+# by hand first (`echo 4 > /sys/class/graphics/fb0/blank`, undo with 0).
+SDR_HEADLESS_FB_BLANK=no
+
+# After `sdr-headless on` a guard watches the default gateway for this many
+# seconds and switches back to graphical mode if it stays unreachable.
+SDR_HEADLESS_GUARD_SECS=90

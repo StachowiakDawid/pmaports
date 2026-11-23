@@ -1,0 +1,4 @@
+#!/bin/sh
+addgroup -S sdrstatus 2>/dev/null
+adduser -S -D -H -h /var/empty -s /sbin/nologin -G sdrstatus -g "SDR status page" sdrstatus 2>/dev/null
+exit 0

@@ -1,0 +1,23 @@
+#!/usr/sbin/nft -f
+# beyond2lte-sdr-extras: health page (sdr-status.service, TCP 8080) for
+# private (LAN) source addresses only.
+# Prometheus node_exporter (optional, see NOTES): add 9100 to both port sets, e.g.
+#   ip saddr @sdrx_lan4 tcp dport { 8080, 9100 } counter accept ...
+
+table inet filter {
+	set sdrx_lan4 {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }
+	}
+	set sdrx_lan6 {
+		type ipv6_addr
+		flags interval
+		elements = { fc00::/7, fe80::/10 }
+	}
+
+	chain input {
+		ip saddr @sdrx_lan4 tcp dport 8080 counter accept comment "sdr-status health page"
+		ip6 saddr @sdrx_lan6 tcp dport 8080 counter accept comment "sdr-status health page (v6)"
+	}
+}

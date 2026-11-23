@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily sdr-record rotation (age limit)
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=yes
+
+[Install]
+WantedBy=timers.target

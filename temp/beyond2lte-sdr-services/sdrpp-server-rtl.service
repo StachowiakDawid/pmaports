@@ -1,0 +1,60 @@
+[Unit]
+Description=SDR++ server for the RTL-SDR dongle (TCP 5260)
+Documentation=https://www.sdrpp.org/
+# Only runs while the device is plugged in (see 61-beyond2lte-sdr-mode.rules);
+# enabled/disabled by sdr-mode(8), do not enable by hand.
+BindsTo=dev-sdr-rtl.device
+After=dev-sdr-rtl.device network.target
+Conflicts=rtl-tcp.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=sdr
+Group=sdr
+Environment=HOME=/var/lib/sdrpp-server/rtl
+EnvironmentFile=-/etc/default/sdrpp-server
+# (re)build the per-device SoapySDR module directories in /run/sdr-mode (root)
+ExecStartPre=+/usr/bin/sdr-mode soapy-roots
+ExecStart=/usr/libexec/sdr-mode/sdrpp-server rtl
+TimeoutStopSec=10
+Restart=always
+RestartSec=3
+
+# DSP (decimation, optional zstd compression) on the big cores
+CPUAffinity=4 5 6 7
+Nice=-5
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+# Hardening
+StateDirectory=sdrpp-server/rtl
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=dev-sdr-rtl.device

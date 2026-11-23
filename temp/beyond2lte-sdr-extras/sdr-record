@@ -1,0 +1,567 @@
+#!/usr/bin/python3
+"""sdr-record - IQ (SoapySDR -> SigMF) and audio (rtl_fm -> FLAC) recorder
+with size/age rotation, for the beyond2lte SDR server.
+
+  sdr-record iq    --freq 433.92M --rate 1.024M --duration 10m [--device driver=rtlsdr]
+                   [--gain auto|dB] [--format auto|cs8|cs16|cf32] [--name NAME]
+  sdr-record audio --freq 98.0M --mode wbfm --duration 10m [--device 0] [--gain dB]
+  sdr-record run PROFILE      record what /etc/sdr-record/PROFILE.conf describes
+                              (sdr-record@PROFILE.service / .timer)
+  sdr-record list | status | rotate
+
+Global settings: /etc/default/sdr-record. Standard library only; the IQ mode
+needs py3-soapy-sdr, the audio mode rtl-sdr (rtl_fm) and flac.
+"""
+import argparse
+import array
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+EX_BUSY = 75  # EX_TEMPFAIL: SDR owned by another service / not enough room -> "skipped"
+
+DEFAULTS = {
+    "RECORD_DIR": "/var/lib/sdr-record",
+    "MAX_TOTAL_MB": "20000",
+    "MAX_AGE_DAYS": "30",
+    "MIN_FREE_MB": "5000",
+    "BUSY_POLICY": "skip",
+    "RECORD_RTLSDR_UNITS": "rtl-tcp sdrpp-server-rtl sdr-adsb sdr-rtl433 sdr-aprs sdr-pocsag sdr-ais",
+    "RECORD_LIMESDR_UNITS": "sdrpp-server-lime",
+    "RECORD_SHARED_UNITS": "beyond2lte-sdr-server openwebrx",
+    "PROFILE_DIR": "/etc/sdr-record",
+    "RUN_DIR": "/run/sdr-record",
+}
+REC_SUFFIXES = (".sigmf-data", ".sigmf-meta", ".flac", ".json", ".recording")
+FORMATS = {  # name: (SoapySDR format, SigMF datatype, bytes per complex sample, array typecode)
+    "cs8": ("CS8", "ci8", 2, "b"),
+    "cs16": ("CS16", "ci16_le", 4, "h"),
+    "cf32": ("CF32", "cf32_le", 8, "f"),
+}
+stop = False
+
+
+def log(msg):
+    print("sdr-record: " + msg, flush=True)
+
+
+def parse_conf(path):
+    """KEY=VALUE files (shell style: comments, optional quotes)."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+                if not m:
+                    continue
+                v = m.group(2).strip()
+                if v[:1] in "\"'" and v.count(v[0]) >= 2:
+                    v = v[1:v.index(v[0], 1)]
+                else:
+                    v = re.sub(r"\s+#.*$", "", v)
+                out[m.group(1)] = v
+    except OSError:
+        pass
+    return out
+
+
+def settings():
+    s = dict(DEFAULTS)
+    s.update(parse_conf("/etc/default/sdr-record"))
+    for k in DEFAULTS:
+        if k in os.environ:
+            s[k] = os.environ[k]
+    return s
+
+
+def num(text):
+    """'433.92M', '1.024e6', '250k', '1090000000' -> float"""
+    m = re.fullmatch(r"\s*([0-9.]+(?:[eE][+-]?[0-9]+)?)\s*([kKmMgG]?)(?:[hH][zZ])?\s*", str(text))
+    if not m:
+        raise ValueError("not a number: %r" % text)
+    return float(m.group(1)) * {"": 1, "k": 1e3, "m": 1e6, "g": 1e9}[m.group(2).lower()]
+
+
+def dur(text):
+    """'600', '90s', '10m', '1h' -> seconds"""
+    m = re.fullmatch(r"\s*([0-9.]+)\s*([smhSMH]?)\s*", str(text))
+    if not m:
+        raise ValueError("not a duration: %r" % text)
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2).lower()]
+
+
+# ---------------------------------------------------------------- storage
+
+def groups(recdir):
+    """recordings in recdir: {stem: {"files": [...], "size": n, "mtime": t, "busy": bool}}"""
+    g = {}
+    try:
+        names = os.listdir(recdir)
+    except OSError:
+        return g
+    for n in names:
+        suf = next((x for x in REC_SUFFIXES if n.endswith(x)), None)
+        if not suf:
+            continue
+        p = os.path.join(recdir, n)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if not os.path.isfile(p):
+            continue
+        d = g.setdefault(n[:-len(suf)], {"files": [], "size": 0, "mtime": 0, "busy": False})
+        d["files"].append(p)
+        d["size"] += st.st_size
+        d["mtime"] = max(d["mtime"], st.st_mtime)
+        if suf == ".recording" and time.time() - st.st_mtime < 86400:
+            d["busy"] = True
+    return g
+
+
+def free_bytes(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+def rotate(s, need=0, quiet=False):
+    """Delete the oldest recordings until age, total size (+need) and free space
+    limits hold. Returns the number of bytes that may be written now."""
+    recdir = s["RECORD_DIR"]
+    max_total = int(float(s["MAX_TOTAL_MB"]) * 1e6)
+    min_free = int(float(s["MIN_FREE_MB"]) * 1e6)
+    max_age = float(s["MAX_AGE_DAYS"]) * 86400
+    g = groups(recdir)
+    order = sorted((k for k in g if not g[k]["busy"]), key=lambda k: g[k]["mtime"])
+    total = sum(d["size"] for d in g.values())
+    now = time.time()
+
+    def drop(k, why):
+        nonlocal total
+        for p in g[k]["files"]:
+            try:
+                os.unlink(p)
+            except OSError as e:
+                log("cannot delete %s: %s" % (p, e))
+        total -= g[k]["size"]
+        log("rotate: removed %s (%.1f MB, %s)" % (k, g[k]["size"] / 1e6, why))
+
+    for k in list(order):
+        if max_age > 0 and now - g[k]["mtime"] > max_age:
+            drop(k, "older than %s days" % s["MAX_AGE_DAYS"])
+            order.remove(k)
+    while order and (total + need > max_total or free_bytes(recdir) - need < min_free):
+        k = order.pop(0)
+        drop(k, "size limit %s MB" % s["MAX_TOTAL_MB"] if total + need > max_total
+             else "free space below %s MB" % s["MIN_FREE_MB"])
+    allowed = min(max_total - total, free_bytes(recdir) - min_free)
+    if not quiet:
+        log("storage: %.1f MB used of %s MB, %.1f GB free on disk, %d recording(s)" % (
+            total / 1e6, s["MAX_TOTAL_MB"], free_bytes(recdir) / 1e9,
+            len([k for k in groups(recdir)])))
+    return max(allowed, 0)
+
+
+def stem(s, name, freq, rate):
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "rec"
+    return os.path.join(s["RECORD_DIR"], "%s_%s_%dHz_%dsps" % (safe, ts, round(freq), round(rate)))
+
+
+# ---------------------------------------------------------------- ownership
+
+def device_kind(o):
+    if o["TYPE"] == "audio":
+        return "rtlsdr"
+    d = o.get("DEVICE", "").lower()
+    if "lime" in d:
+        return "limesdr"
+    if "rtl" in d:
+        return "rtlsdr"
+    return "other"
+
+
+def owner_units(s, kind):
+    """Units that hold the device while they run: the dedicated services of the
+    sdr-mode contract. The owner sdr-mode reports is added (covers decoders it
+    was given by unit name); shared servers (SoapySDRServer, OpenWebRX) only
+    open a device while a client uses it, so they are not stopped/skipped for:
+    if they are streaming, opening the device fails and the run ends as busy."""
+    key = {"rtlsdr": "RECORD_RTLSDR_UNITS", "limesdr": "RECORD_LIMESDR_UNITS"}.get(kind)
+    units = s.get(key, "").split() if key else []
+    units = [u if "." in u else u + ".service" for u in units]
+    shared = [u if "." in u else u + ".service" for u in s.get("RECORD_SHARED_UNITS", "").split()]
+    dev = {"rtlsdr": "rtl", "limesdr": "lime"}.get(kind)
+    if dev and shutil.which("sdr-mode"):
+        try:
+            r = subprocess.run(["sdr-mode", "owner", dev], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True, timeout=10)
+            owner = r.stdout.strip()
+            if owner and owner not in shared and owner not in units:
+                units.append(owner)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return units
+
+
+def active_units(units):
+    act = []
+    for u in units:
+        try:
+            r = subprocess.run(["systemctl", "is-active", u], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.stdout.strip() in ("active", "activating", "reloading"):
+            act.append(u)
+    return act
+
+
+def busy_check(s, o):
+    """Respect the current SDR owner (what sdr-mode / the admin started)."""
+    act = active_units(owner_units(s, device_kind(o)))
+    if act:
+        log("the %s belongs to %s (sdr-mode) - recording skipped (BUSY_POLICY=skip; "
+            "BUSY_POLICY=preempt borrows the device)" % (device_kind(o), ", ".join(act)))
+        return False
+    return True
+
+
+def preempt_file(s, profile):
+    return os.path.join(s["RUN_DIR"], re.sub(r"[^A-Za-z0-9._-]", "_", profile) + ".preempted")
+
+
+def cmd_claim(s, profile):
+    """root helper (ExecStartPre=+): with BUSY_POLICY=preempt stop the owners."""
+    o = load_profile(s, profile)
+    policy = o.get("BUSY_POLICY", s["BUSY_POLICY"])
+    if policy != "preempt":
+        return 0
+    act = active_units(owner_units(s, device_kind(o)))
+    if not act:
+        return 0
+    os.makedirs(s["RUN_DIR"], exist_ok=True)
+    with open(preempt_file(s, profile), "w") as f:
+        f.write("\n".join(act) + "\n")
+    log("preempt: stopping %s for the recording" % ", ".join(act))
+    subprocess.run(["systemctl", "stop"] + act, timeout=60)
+    time.sleep(1)
+    return 0
+
+
+def cmd_release(s, profile):
+    """root helper (ExecStopPost=+): restart what claim stopped."""
+    p = preempt_file(s, profile)
+    try:
+        with open(p) as f:
+            units = f.read().split()
+        os.unlink(p)
+    except OSError:
+        return 0
+    if units:
+        log("preempt: restarting %s" % ", ".join(units))
+        subprocess.run(["systemctl", "start", "--no-block"] + units, timeout=60)
+    return 0
+
+
+# ---------------------------------------------------------------- recorders
+
+def on_signal(signum, frame):
+    global stop
+    stop = True
+
+
+def record_iq(s, o):
+    try:
+        import SoapySDR
+        from SoapySDR import SOAPY_SDR_RX
+    except ImportError:
+        log("IQ recording needs the SoapySDR python module (apk add py3-soapy-sdr)")
+        return 1
+    freq, rate, seconds = num(o["FREQ"]), num(o["RATE"]), dur(o["DURATION"])
+    ch = int(o.get("CHANNEL", "0"))
+    devargs = o.get("DEVICE", "driver=rtlsdr")
+    try:
+        dev = SoapySDR.Device(devargs)
+    except Exception as e:
+        log("cannot open '%s': %s (busy or not plugged in?)" % (devargs, e))
+        return EX_BUSY
+    try:
+        fmtname = o.get("FORMAT", "auto").lower()
+        if fmtname == "auto":
+            # 8-bit devices (RTL-SDR, HackRF) offer CS8: record their native width
+            have = [str(f).upper() for f in dev.getStreamFormats(SOAPY_SDR_RX, ch)]
+            fmtname = "cs8" if "CS8" in have else "cs16" if "CS16" in have or not have else "cf32"
+        if fmtname not in FORMATS:
+            log("unknown FORMAT %r (auto, cs8, cs16, cf32)" % fmtname)
+            return 2
+        sfmt, sigmf_type, bps, tc = FORMATS[fmtname]
+        dev.setSampleRate(SOAPY_SDR_RX, ch, rate)
+        rate = dev.getSampleRate(SOAPY_SDR_RX, ch) or rate
+        if o.get("BANDWIDTH"):
+            dev.setBandwidth(SOAPY_SDR_RX, ch, num(o["BANDWIDTH"]))
+        if o.get("ANTENNA"):
+            dev.setAntenna(SOAPY_SDR_RX, ch, o["ANTENNA"])
+        dev.setFrequency(SOAPY_SDR_RX, ch, freq)
+        gain = str(o.get("GAIN", "auto")).lower()
+        if gain in ("", "auto"):
+            if dev.hasGainMode(SOAPY_SDR_RX, ch):
+                dev.setGainMode(SOAPY_SDR_RX, ch, True)
+        else:
+            if dev.hasGainMode(SOAPY_SDR_RX, ch):
+                dev.setGainMode(SOAPY_SDR_RX, ch, False)
+            dev.setGain(SOAPY_SDR_RX, ch, float(gain))
+        if o.get("PPM") and float(o["PPM"]) != 0:
+            dev.setFrequencyCorrection(SOAPY_SDR_RX, ch, float(o["PPM"]))
+
+        want = int(rate * seconds)
+        allowed = rotate(s, need=want * bps, quiet=True)
+        if allowed < min(want * bps, int(rate) * bps):  # not even one second fits
+            log("no room: %d MB allowed by MAX_TOTAL_MB/MIN_FREE_MB" % (allowed // 1000000))
+            return EX_BUSY
+        if allowed < want * bps:
+            want = allowed // bps
+            log("shortened to %.0f s to stay within the storage limits" % (want / rate))
+
+        base = stem(s, o.get("NAME", "iq"), freq, rate)
+        marker = base + ".recording"
+        open(marker, "w").close()
+        chunk = 1 << 16
+        buf = array.array(tc, bytes(chunk * bps))
+        mv = memoryview(buf).cast("B")
+        st = dev.setupStream(SOAPY_SDR_RX, sfmt, [ch])
+        dev.activateStream(st)
+        t0 = time.time()
+        start_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t0)) + ".%03dZ" % ((t0 % 1) * 1000)
+        total = overflows = timeouts = 0
+        err = None
+        deadline = time.monotonic() + seconds * 1.5 + 30
+        log("IQ %s: %.6f MHz, %.0f S/s, %s, %.0f s -> %s.sigmf-data" % (
+            devargs, freq / 1e6, rate, fmtname, want / rate, base))
+        with open(base + ".sigmf-data", "wb", buffering=1 << 20) as f:
+            while total < want and not stop:
+                r = dev.readStream(st, [buf], min(chunk, want - total), timeoutUs=1000000)
+                if r.ret > 0:
+                    f.write(mv[:r.ret * bps])
+                    total += r.ret
+                    timeouts = 0
+                elif r.ret == -4:    # SOAPY_SDR_OVERFLOW
+                    overflows += 1
+                elif r.ret == -1:    # SOAPY_SDR_TIMEOUT
+                    timeouts += 1
+                    if timeouts >= 10:
+                        err = "no samples for 10 s (device gone?)"
+                        break
+                else:
+                    err = "readStream error %d" % r.ret
+                    break
+                if time.monotonic() > deadline:
+                    err = "wall-clock limit hit (device delivers too slowly)"
+                    break
+        dev.deactivateStream(st)
+        dev.closeStream(st)
+        meta = {
+            "global": {
+                "core:datatype": sigmf_type, "core:sample_rate": rate, "core:version": "1.0.0",
+                "core:recorder": "sdr-record (beyond2lte)", "core:hw": devargs,
+                "core:description": "%s, gain %s, %d overflow(s)%s" % (
+                    o.get("NAME", "iq"), gain or "auto", overflows, ", ERROR: " + err if err else ""),
+            },
+            "captures": [{"core:sample_start": 0, "core:frequency": freq, "core:datetime": start_iso}],
+            "annotations": [],
+        }
+        with open(base + ".sigmf-meta", "w") as f:
+            json.dump(meta, f, indent=1)
+        os.unlink(marker)
+        log("done: %d samples (%.1f s, %.1f MB), %d overflow(s)%s" % (
+            total, total / rate, total * bps / 1e6, overflows, " - " + err if err else ""))
+        return 1 if err else 0
+    except Exception as e:  # SoapySDR raises plain RuntimeError for driver problems
+        log("IQ recording failed: %s: %s" % (type(e).__name__, e))
+        for m in [x for x in os.listdir(s["RECORD_DIR"]) if x.endswith(".recording")]:
+            if o.get("NAME", "iq") in m:
+                try:
+                    os.unlink(os.path.join(s["RECORD_DIR"], m))
+                except OSError:
+                    pass
+        return 1
+    finally:
+        dev = None
+
+
+def record_audio(s, o):
+    for tool in ("rtl_fm", "flac"):
+        if not shutil.which(tool):
+            log("audio recording needs %s (apk add rtl-sdr flac)" % tool)
+            return 1
+    freq, seconds = num(o["FREQ"]), dur(o["DURATION"])
+    mode = o.get("MODE", "fm").lower()
+    arate = int(num(o.get("AUDIO_RATE", "32k" if mode == "wbfm" else "24k")))
+    need = int(arate * 2 * seconds)  # upper bound: raw mono s16 (FLAC of noise does not shrink)
+    if rotate(s, need=need, quiet=True) < need:
+        log("no room for %.0f s of audio within MAX_TOTAL_MB/MIN_FREE_MB" % seconds)
+        return EX_BUSY
+    base = stem(s, o.get("NAME", "audio"), freq, arate)
+    marker = base + ".recording"
+    open(marker, "w").close()
+    cmd = ["rtl_fm", "-d", str(o.get("DEVICE", "0")), "-f", str(int(freq)), "-M", mode]
+    if mode != "wbfm":
+        cmd += ["-s", str(arate)]
+    elif "AUDIO_RATE" in o:
+        cmd += ["-r", str(arate)]
+    gain = str(o.get("GAIN", "auto")).lower()
+    if gain not in ("", "auto"):
+        cmd += ["-g", gain]
+    if o.get("PPM") and float(o["PPM"]) != 0:
+        cmd += ["-p", str(int(float(o["PPM"])))]
+    if o.get("SQUELCH"):
+        cmd += ["-l", str(o["SQUELCH"])]
+    cmd += o.get("RTL_FM_ARGS", "").split() + ["-"]
+    enc = ["flac", "--silent", "--force-raw-format", "--endian=little", "--sign=signed",
+           "--channels=1", "--bps=16", "--sample-rate=%d" % arate, "-5", "-f",
+           "-o", base + ".flac", "-"]
+    log("audio: %s | flac, %.0f s -> %s.flac" % (" ".join(cmd), seconds, base))
+    t0 = time.time()
+    src = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    dst = subprocess.Popen(enc, stdin=src.stdout)
+    src.stdout.close()
+    end = time.monotonic() + seconds
+    early = None
+    while time.monotonic() < end and not stop:
+        if src.poll() is not None:
+            early = "rtl_fm exited (%s): %s" % (
+                src.returncode, src.stderr.read().decode(errors="replace").strip()[-300:])
+            break
+        time.sleep(0.2)
+    if src.poll() is None:
+        src.terminate()
+        try:
+            src.wait(10)
+        except subprocess.TimeoutExpired:
+            src.kill()
+    try:
+        dst.wait(30)
+    except subprocess.TimeoutExpired:
+        dst.kill()
+    size = os.path.getsize(base + ".flac") if os.path.exists(base + ".flac") else 0
+    with open(base + ".json", "w") as f:
+        json.dump({"type": "audio", "name": o.get("NAME", "audio"), "frequency": freq, "mode": mode,
+                   "sample_rate": arate, "start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0)),
+                   "seconds": round(time.time() - t0, 1), "command": cmd, "error": early}, f, indent=1)
+    os.unlink(marker)
+    if early and "usb_claim_interface" in early or early and "Failed to open" in early:
+        log("device busy: " + early)
+        return EX_BUSY
+    log("done: %.1f s, %.1f MB%s" % (time.time() - t0, size / 1e6, " - " + early if early else ""))
+    return 1 if early else 0
+
+
+def load_profile(s, name):
+    path = name if "/" in name else os.path.join(s["PROFILE_DIR"], name + ".conf")
+    o = parse_conf(path)
+    if not o:
+        log("profile %s not found or empty" % path)
+        sys.exit(2)
+    o.setdefault("TYPE", "iq")
+    o.setdefault("NAME", os.path.basename(path).rsplit(".conf", 1)[0])
+    return o
+
+
+def record(s, o, check_busy=True):
+    for k in ("FREQ", "DURATION") + (("RATE",) if o["TYPE"] == "iq" else ()):
+        if not o.get(k):
+            log("missing %s" % k)
+            return 2
+    os.makedirs(s["RECORD_DIR"], exist_ok=True)
+    policy = o.get("BUSY_POLICY", s["BUSY_POLICY"])
+    if check_busy and policy != "ignore" and not busy_check(s, o):
+        return EX_BUSY
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    return record_iq(s, o) if o["TYPE"] == "iq" else record_audio(s, o)
+
+
+def cmd_list(s):
+    g = groups(s["RECORD_DIR"])
+    for k in sorted(g, key=lambda k: g[k]["mtime"]):
+        d = g[k]
+        print("%s  %9.1f MB  %s%s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(d["mtime"])),
+                                     d["size"] / 1e6, os.path.basename(k),
+                                     "  (recording)" if d["busy"] else ""))
+    print("%d recording(s), %.1f MB of %s MB; %.1f GB free; keep %s days" % (
+        len(g), sum(d["size"] for d in g.values()) / 1e6, s["MAX_TOTAL_MB"],
+        free_bytes(s["RECORD_DIR"]) / 1e9 if os.path.isdir(s["RECORD_DIR"]) else 0, s["MAX_AGE_DAYS"]))
+    return 0
+
+
+def main():
+    s = settings()
+    ap = argparse.ArgumentParser(prog="sdr-record", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("iq", help="record IQ samples through SoapySDR (SigMF)")
+    p.add_argument("--device", default="driver=rtlsdr", help="SoapySDR device args")
+    p.add_argument("--freq", required=True)
+    p.add_argument("--rate", required=True)
+    p.add_argument("--duration", required=True)
+    p.add_argument("--gain", default="auto")
+    p.add_argument("--format", default="auto", choices=["auto", "cs8", "cs16", "cf32"])
+    p.add_argument("--bandwidth")
+    p.add_argument("--antenna")
+    p.add_argument("--channel", default="0")
+    p.add_argument("--ppm")
+    p.add_argument("--name", default="iq")
+    p.add_argument("--force", action="store_true", help="do not check which service owns the SDR")
+    p = sub.add_parser("audio", help="record demodulated audio (rtl_fm -> FLAC)")
+    p.add_argument("--device", default="0", help="RTL-SDR index or serial")
+    p.add_argument("--freq", required=True)
+    p.add_argument("--mode", default="fm", choices=["fm", "wbfm", "am", "usb", "lsb"])
+    p.add_argument("--duration", required=True)
+    p.add_argument("--gain", default="auto")
+    p.add_argument("--ppm")
+    p.add_argument("--squelch")
+    p.add_argument("--name", default="audio")
+    p.add_argument("--force", action="store_true")
+    for name, hlp in (("run", "record a profile from /etc/sdr-record"),
+                      ("claim", argparse.SUPPRESS), ("release", argparse.SUPPRESS)):
+        p = sub.add_parser(name, help=hlp)
+        p.add_argument("profile")
+    sub.add_parser("list", help="list recordings")
+    sub.add_parser("status", help="same as list")
+    sub.add_parser("rotate", help="apply the size/age limits now")
+    a = ap.parse_args()
+
+    if a.cmd in ("list", "status"):
+        return cmd_list(s)
+    if a.cmd == "rotate":
+        if os.path.isdir(s["RECORD_DIR"]):
+            rotate(s)
+        return 0
+    if a.cmd == "claim":
+        return cmd_claim(s, a.profile)
+    if a.cmd == "release":
+        return cmd_release(s, a.profile)
+    if a.cmd == "run":
+        o = load_profile(s, a.profile)
+        # after a preempt the owners are stopped by "claim": nothing left to check
+        return record(s, o, check_busy=not os.path.exists(preempt_file(s, a.profile)))
+    o = {"TYPE": a.cmd}
+    for k in ("device", "freq", "rate", "duration", "gain", "format", "bandwidth", "antenna",
+              "channel", "ppm", "name", "mode", "squelch"):
+        v = getattr(a, k, None)
+        if v is not None:
+            o[k.upper()] = v
+    return record(s, o, check_busy=not a.force)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except ValueError as e:
+        log(str(e))
+        sys.exit(2)

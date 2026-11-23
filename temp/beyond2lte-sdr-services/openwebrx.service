@@ -1,0 +1,62 @@
+[Unit]
+Description=OpenWebRX+ web SDR receiver (HTTP 8073)
+Documentation=https://fms.komkon.org/OWRX/ https://github.com/luarvique/openwebrx
+# Enabled/disabled by sdr-mode(8) ("sdr-mode lime openwebrx" / "sdr-mode rtl
+# openwebrx"), which also switches the per-device "enabled" flags in
+# /var/lib/openwebrx/settings.json. Do not enable by hand.
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=openwebrx
+Group=openwebrx
+SupplementaryGroups=sdr
+Environment=HOME=/var/lib/openwebrx
+# LimeSuiteNG: 8 x 4 KiB packets per USB transfer (same as beyond2lte-sdr-server)
+Environment=LIMESUITENG_PACKETS_IN_BATCH=8
+EnvironmentFile=-/etc/default/openwebrx
+ExecStartPre=/usr/libexec/sdr-mode/openwebrx-prepare
+ExecStart=/usr/bin/openwebrx
+# python parent + connector/nmux/decoder children
+KillMode=control-group
+TimeoutStopSec=15
+Restart=always
+RestartSec=5
+
+# DSP runs in python threads + helper processes: A75 + M4 cores
+CPUAffinity=4 5 6 7
+
+# Hardening. No MemoryDenyWriteExecute (python/ctypes), temp files in a
+# private /tmp, state only in /var/lib/openwebrx.
+StateDirectory=openwebrx
+StateDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

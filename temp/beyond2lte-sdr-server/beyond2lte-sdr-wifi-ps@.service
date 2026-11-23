@@ -1,0 +1,11 @@
+[Unit]
+Description=Wi-Fi power save off while the %i SDR radio is plugged in
+BindsTo=dev-sdr-%i.device
+After=dev-sdr-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/sbin/iw dev wlan0 set power_save off
+# back on only when no other SDR radio is still plugged in
+ExecStop=/bin/sh -c 'ls /dev/sdr/ 2>/dev/null | grep -q . || /usr/sbin/iw dev wlan0 set power_save on || :'

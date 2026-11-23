@@ -1,0 +1,26 @@
+# /etc/default/sdr-pocsag - pager decoder (rtl_fm | multimon-ng), read by
+# sdr-pocsag.service. Apply with: systemctl restart sdr-pocsag
+
+# RTL-SDR to use: index (0) or serial.
+POCSAG_DEVICE=0
+# Frequency. There is no universal pager frequency - set your local one.
+# Default: 439.9875M = DAPNET (amateur radio paging network, Europe, POCSAG 1200).
+# Others: 466.075M (e*Message DE/FR), 153.350M (UK), 169.650M ...
+POCSAG_FREQ=439.9875M
+# Tuner gain in dB; empty = auto.
+POCSAG_GAIN=
+POCSAG_PPM=0
+# multimon-ng demodulators (space separated). FLEX / FLEX_NEXT also work at 22050 Hz.
+POCSAG_MODES="POCSAG512 POCSAG1200 POCSAG2400"
+# Decode as: alpha, numeric, skyper or auto.
+POCSAG_FORMAT=alpha
+# Text charset for alpha messages (multimon-ng -C): US, DE, FR, SE, SI.
+POCSAG_CHARSET=
+# Output: decoded messages go to the journal (journalctl -u sdr-pocsag -o cat)
+# and, with POCSAG_LOG=yes, are appended to /var/lib/sdr-decoders/pocsag/pocsag.log
+# (rotated at POCSAG_LOG_MAX_KB, one old copy kept).
+POCSAG_LOG=yes
+POCSAG_LOG_MAX_KB=10240
+# Extra multimon-ng arguments, e.g. "--json" (one JSON object per message),
+# "-u" (heuristically prune unlikely decodes - also drops some valid ones), "-p".
+POCSAG_EXTRA_ARGS=

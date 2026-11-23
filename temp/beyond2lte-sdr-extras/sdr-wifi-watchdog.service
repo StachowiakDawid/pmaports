@@ -1,0 +1,41 @@
+[Unit]
+Description=Wi-Fi watchdog (reconnect / restart NetworkManager when the gateway is unreachable)
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/sdr-selfheal/sdr-wifi-watchdog
+Restart=always
+RestartSec=10
+StateDirectory=sdr-selfheal
+SyslogIdentifier=sdr-wifi-watchdog
+# "<4>..." prefixes in the script set the journal priority
+SyslogLevelPrefix=yes
+CPUAffinity=0-3
+Nice=10
+
+# Runs as root (nmcli / systemctl), but boxed in
+NoNewPrivileges=yes
+# ping/arping only; nmcli and systemctl are D-Bus calls authorised by uid 0
+CapabilityBoundingSet=CAP_NET_RAW
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+
+[Install]
+WantedBy=multi-user.target

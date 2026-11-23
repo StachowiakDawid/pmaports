@@ -1,0 +1,15 @@
+# beyond2lte-sdr-extras-selfheal: when an SDR (re)appears on USB, start
+# sdr-replug@<kind>.service (restarts the shared server that owns it; see
+# /etc/default/sdr-selfheal). Runs after 60-beyond2lte-{limesdr,rtlsdr}.rules
+# (permissions). Like 61-beyond2lte-sdr-mode.rules the systemd tag is set on
+# every non-remove event (systemd treats a device whose latest event lacks the
+# tag as unplugged); SYSTEMD_WANTS only fires when the device unit appears.
+ACTION=="remove", GOTO="sdr_selfheal_end"
+SUBSYSTEM!="usb", GOTO="sdr_selfheal_end"
+ENV{DEVTYPE}!="usb_device", GOTO="sdr_selfheal_end"
+
+ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838|2832", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sdr-replug@rtlsdr.service"
+ATTR{idVendor}=="0403", ATTR{idProduct}=="601f", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sdr-replug@limesdr.service"
+ATTR{idVendor}=="1d50", ATTR{idProduct}=="6108", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sdr-replug@limesdr.service"
+
+LABEL="sdr_selfheal_end"

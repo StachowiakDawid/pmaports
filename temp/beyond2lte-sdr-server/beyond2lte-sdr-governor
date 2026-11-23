@@ -1,0 +1,28 @@
+#!/bin/sh
+# Set (or restore) the cpufreq governor of the policies that contain
+# $SDR_GOVERNOR_CPUS. Usage: beyond2lte-sdr-governor set|restore
+set -u
+CPUS=${SDR_GOVERNOR_CPUS:-6 7}
+GOV=${SDR_GOVERNOR:-performance}
+STATE=/run/beyond2lte-sdr-governor
+mkdir -p "$STATE"
+
+for cpu in $CPUS; do
+	pol=$(readlink -f "/sys/devices/system/cpu/cpu$cpu/cpufreq" 2>/dev/null) || continue
+	[ -w "$pol/scaling_governor" ] || { echo "cpu$cpu: no cpufreq policy" >&2; continue; }
+	name=${pol##*/}
+	case "${1:-set}" in
+	set)
+		[ -e "$STATE/$name" ] || cat "$pol/scaling_governor" > "$STATE/$name"
+		if grep -qw "$GOV" "$pol/scaling_available_governors"; then
+			echo "$GOV" > "$pol/scaling_governor" && echo "$name (cpu$cpu): $GOV"
+		else
+			echo "$name: governor $GOV not available ($(cat "$pol/scaling_available_governors"))" >&2
+		fi
+		;;
+	restore)
+		[ -e "$STATE/$name" ] && cat "$STATE/$name" > "$pol/scaling_governor" && rm -f "$STATE/$name"
+		;;
+	esac
+done
+exit 0

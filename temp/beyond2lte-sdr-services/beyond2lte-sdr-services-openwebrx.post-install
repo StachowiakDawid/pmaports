@@ -1,0 +1,9 @@
+#!/bin/sh
+cat <<MSG
+OpenWebRX+ service installed (not started). Select it with sdr-mode, e.g.
+  sudo sdr-mode rtl openwebrx      # and/or: sudo sdr-mode lime openwebrx
+then open http://<phone-ip>:8073/. There is no admin user by default; to use
+the settings pages create one (you are asked for a password):
+  sudo -u openwebrx openwebrx admin adduser admin
+MSG
+exit 0

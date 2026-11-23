@@ -1,0 +1,10 @@
+#!/bin/sh
+# Hand both SDRs back to SoapySDRServer (the state before this package) and
+# stop our own units; the drop-in sdr-mode wrote for it goes away with that.
+if [ -x /usr/bin/sdr-mode ] && [ -d /run/systemd/system ]; then
+	mkdir -p /var/lib/sdr-mode
+	echo soapy-remote > /var/lib/sdr-mode/lime
+	echo soapy-remote > /var/lib/sdr-mode/rtl
+	/usr/bin/sdr-mode -q apply 2>/dev/null
+fi
+exit 0

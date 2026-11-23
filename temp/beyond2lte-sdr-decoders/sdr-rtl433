@@ -1,0 +1,20 @@
+#!/bin/sh
+# sdr-rtl433.service: rtl_433 with HTTP/JSON (and optional MQTT) output.
+RTL433_DEVICE=0 RTL433_FREQ=433.92M RTL433_HOP= RTL433_RATE= RTL433_GAIN= RTL433_PPM=0
+RTL433_HTTP=0.0.0.0:8433 RTL433_MQTT= RTL433_JOURNAL_JSON=yes RTL433_EXTRA_ARGS=
+[ -r /etc/default/sdr-rtl433 ] && . /etc/default/sdr-rtl433
+[ -n "$MQTT_USERNAME" ] && export MQTT_USERNAME MQTT_PASSWORD
+
+set -- -d "$RTL433_DEVICE" -M time:iso:utc -M level -M protocol
+for f in ${RTL433_FREQ:-433.92M}; do set -- "$@" -f "$f"; done
+[ -n "$RTL433_HOP" ] && set -- "$@" -H "$RTL433_HOP"
+[ -n "$RTL433_RATE" ] && set -- "$@" -s "$RTL433_RATE"
+[ -n "$RTL433_GAIN" ] && set -- "$@" -g "$RTL433_GAIN"
+[ "${RTL433_PPM:-0}" != 0 ] && set -- "$@" -p "$RTL433_PPM"
+[ -n "$RTL433_HTTP" ] && set -- "$@" -F "http:$RTL433_HTTP"
+[ -n "$RTL433_MQTT" ] && set -- "$@" -F "$RTL433_MQTT"
+# -F log: rtl_433's own messages/warnings; -F json: decoded events, one JSON object per line
+set -- "$@" -F log
+[ "$RTL433_JOURNAL_JSON" = yes ] && set -- "$@" -F json
+# shellcheck disable=SC2086
+exec /usr/bin/rtl_433 "$@" $RTL433_EXTRA_ARGS

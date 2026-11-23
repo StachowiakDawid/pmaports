@@ -1,0 +1,59 @@
+[Unit]
+Description=rtl_tcp I/Q server for the RTL-SDR dongle
+Documentation=https://osmocom.org/projects/rtl-sdr/wiki
+# Only runs while the dongle is plugged in (see 61-beyond2lte-sdr-mode.rules);
+# enabled/disabled by sdr-mode(8), do not enable by hand.
+BindsTo=dev-sdr-rtl.device
+After=dev-sdr-rtl.device network.target
+# one owner per dongle
+Conflicts=sdrpp-server-rtl.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=sdr
+Group=sdr
+Environment=RTL_TCP_ADDRESS=0.0.0.0
+Environment=RTL_TCP_PORT=1234
+Environment=RTL_TCP_OPTS=
+EnvironmentFile=-/etc/default/rtl-tcp
+ExecStart=/usr/bin/rtl_tcp -a ${RTL_TCP_ADDRESS} -p ${RTL_TCP_PORT} $RTL_TCP_OPTS
+TimeoutStopSec=5
+Restart=always
+RestartSec=3
+
+# 2.4 MS/s of 8-bit I/Q is light work: keep it off the M4 cores (cpu6-7) that
+# the LimeSDR services use.
+CPUAffinity=4 5
+Nice=-5
+
+# Hardening (same set as beyond2lte-sdr-server)
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=dev-sdr-rtl.device

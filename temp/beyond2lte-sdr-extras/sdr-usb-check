@@ -1,0 +1,37 @@
+#!/bin/sh
+# Check that the LimeSDR still enumerates at USB3 SuperSpeed; log a warning
+# when it fell back to USB2 (or vanished). Run by sdr-usb-check.timer and
+# after every LimeSDR hotplug (sdr-replug@limesdr).
+USB_CHECK_LIME_SPEED=5000 USB_CHECK_REPEAT_MIN=360 USB_CHECK_EXPECT_LIME=yes
+[ -r /etc/default/sdr-selfheal ] && . /etc/default/sdr-selfheal
+RUN=${RUNTIME_DIRECTORY:-/run/sdr-usb-check}
+mkdir -p "$RUN"
+ST=$RUN/state
+
+cur=absent msg=
+for d in /sys/bus/usb/devices/*; do
+	[ -r "$d/idVendor" ] || continue
+	id="$(cat "$d/idVendor"):$(cat "$d/idProduct")"
+	case "$id" in
+	0403:601f|1d50:6108)
+		sp=$(cat "$d/speed" 2>/dev/null)
+		cur="$id@${d##*/}=$sp"
+		if [ "${sp:-0}" -lt "$USB_CHECK_LIME_SPEED" ]; then
+			msg="LimeSDR ($id at ${d##*/}) enumerated at ${sp} Mbit/s, expected ${USB_CHECK_LIME_SPEED}: USB2 fallback - sample rates above ~10 MS/s will not work. Replug the cable / check the hub."
+		fi
+		;;
+	esac
+done
+[ "$cur" = absent ] && [ "$USB_CHECK_EXPECT_LIME" = yes ] && msg="no LimeSDR on the USB bus"
+
+now=$(cut -d. -f1 /proc/uptime)
+prev= prev_t=0
+[ -r "$ST" ] && { read -r prev prev_t < "$ST"; }
+if [ "$cur" != "$prev" ]; then
+	echo "$cur $now" > "$ST"
+	if [ -n "$msg" ]; then echo "<4>WARNING: $msg"; else echo "<6>LimeSDR OK: $cur Mbit/s"; fi
+elif [ -n "$msg" ] && [ $(( now - ${prev_t:-0} )) -ge $(( USB_CHECK_REPEAT_MIN * 60 )) ]; then
+	echo "$cur $now" > "$ST"
+	echo "<4>WARNING (still): $msg"
+fi
+exit 0

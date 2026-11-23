@@ -1,0 +1,2 @@
+# beyond2lte-sdr-services: sdr-mode state (selected mode per device)
+d /var/lib/sdr-mode 0755 root root -

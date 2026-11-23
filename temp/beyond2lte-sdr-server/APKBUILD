@@ -1,0 +1,80 @@
+# Maintainer: beyond2lte port <beyond2lte@example.org>
+# 24/7 headless SoapySDR network server (SoapyRemote) for a LimeSDR Mini 2.0
+# on the Galaxy S10+ (beyond2lte).
+pkgname=beyond2lte-sdr-server
+pkgver=1
+pkgrel=2
+pkgdesc="SoapySDRServer service, udev, firewall and sysctl setup for a LimeSDR on beyond2lte"
+url="https://postmarketos.org"
+arch="noarch"
+license="MIT"
+depends="
+	soapy-sdr
+	soapy-sdr-remote
+	soapy-sdr-remote-server
+	soapy-sdr-module-limesuiteng
+	limesuiteng-tools
+	iw
+	"
+install="$pkgname.pre-install $pkgname.post-install"
+subpackages="$pkgname-nftables:nftrules:noarch"
+source="
+	60-beyond2lte-limesdr.rules
+	50_soapyremote.nft
+	beyond2lte-sdr-server.service
+	beyond2lte-sdr-server.conf
+	beyond2lte-sdr-server.sysctl
+	beyond2lte-sdr-server.tmpfiles
+	beyond2lte-sdr-governor.service
+	beyond2lte-sdr-governor
+	63-beyond2lte-sdr-wifi-ps.rules
+	beyond2lte-sdr-wifi-ps@.service
+	beyond2lte-sdr-wifi-ps.dispatcher
+	"
+options="!check" # no tests
+
+package() {
+	install -Dm644 "$srcdir"/60-beyond2lte-limesdr.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/60-beyond2lte-limesdr.rules
+	install -Dm644 "$srcdir"/beyond2lte-sdr-server.service \
+		"$pkgdir"/usr/lib/systemd/system/beyond2lte-sdr-server.service
+	install -Dm644 "$srcdir"/beyond2lte-sdr-governor.service \
+		"$pkgdir"/usr/lib/systemd/system/beyond2lte-sdr-governor.service
+	install -Dm755 "$srcdir"/beyond2lte-sdr-governor \
+		"$pkgdir"/usr/libexec/beyond2lte-sdr-governor
+	install -Dm644 "$srcdir"/beyond2lte-sdr-server.conf \
+		"$pkgdir"/etc/default/beyond2lte-sdr-server
+	# 70- so it is applied after upstream SoapyRemote's 10-SoapySDRServer.conf
+	install -Dm644 "$srcdir"/beyond2lte-sdr-server.sysctl \
+		"$pkgdir"/usr/lib/sysctl.d/70-beyond2lte-sdr-server.conf
+	install -Dm644 "$srcdir"/beyond2lte-sdr-server.tmpfiles \
+		"$pkgdir"/usr/lib/tmpfiles.d/beyond2lte-sdr-server.conf
+	# r2: Wi-Fi power save off only while an SDR radio is plugged in
+	install -Dm644 "$srcdir"/63-beyond2lte-sdr-wifi-ps.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/63-beyond2lte-sdr-wifi-ps.rules
+	install -Dm644 "$srcdir"/beyond2lte-sdr-wifi-ps@.service \
+		"$pkgdir"/usr/lib/systemd/system/beyond2lte-sdr-wifi-ps@.service
+	install -Dm755 "$srcdir"/beyond2lte-sdr-wifi-ps.dispatcher \
+		"$pkgdir"/usr/lib/NetworkManager/dispatcher.d/60-beyond2lte-sdr-wifi-ps
+}
+
+nftrules() {
+	pkgdesc="nftables rules opening SoapyRemote ports (TCP 55132, SSDP, LAN stream ports)"
+	depends=""
+	install_if="$pkgname=$pkgver-r$pkgrel nftables"
+	install -Dm644 "$srcdir"/50_soapyremote.nft \
+		"$subpkgdir"/etc/nftables.d/50_soapyremote.nft
+}
+sha512sums="
+5ec02e4d16fb1ff72b79d5138f049c4c0bfb815e01057d9e47545ee53ac22e4ce7e10cd53574223c3459166f6ad48beca6346df5bee2ae0582d9730697be913c  60-beyond2lte-limesdr.rules
+d8a96782a263e60f86b48156fef2817d3e389c820bccfbc80aacbbbc66af1f93188e011b19d1977781c0193b324af5e6d9d63788c766cecec0374b10612e6575  50_soapyremote.nft
+34a801b09b57bb490745d25dfe6297104727a648edd701a354b266c38e10e4eed5b0522b769c8f470f73741839206cf32049bb8aadc0fc5524d3fbb418222b4e  beyond2lte-sdr-server.service
+a3d33e68234cedcd8560c3b72272265479644229c8aca09ae4783f810409ecaa7eab2614ec5678bbee7353136344b7ac07262bd8a52e039f5470cdad62ba771a  beyond2lte-sdr-server.conf
+787fd0fa27d7e22ec8f5de5e1c9a34947fb2e6460c5e2b55732e564a56360c6778d2dc5070d9a2976528131562ec0119850041bc16f7bc2bf3d3f27b6fb90377  beyond2lte-sdr-server.sysctl
+fe6899b34b319e290b5516c38a288b8a96409daab3357367d58fa0ac30aec8034c11e0e49799457c63569208f704d7c026a1fef70d03d06f9d94ffe1cdaec424  beyond2lte-sdr-server.tmpfiles
+bc3c2c149632309e3ac13aa3ef2ed235e160d7722e88846061ffcb084367f3052bfdb498a982f1295f951e1703e1da4c118b28388f6f54762526bde1ea59259a  beyond2lte-sdr-governor.service
+83ff9ec29136f5b7305c6306643e7f24587b5335a578f2944c62f20c2fa63d2bd64b280a9536b15281dc1ec912d3399d09de8724239adf7a3747b23f31da1338  beyond2lte-sdr-governor
+d2d29feeea373511cc972ab367b83e821139f74b02d7a50720c839bac8a9e2edd466a815c58eee39ae1fbbcdf36c3d931317aefba21b333aacd575fe3915597f  63-beyond2lte-sdr-wifi-ps.rules
+b3d373a4a6597bb7eb63a89f94abb63a8e699615fb0df4bd1b2d9c203ad438af0ddc57dad53ac7f29bce30913193b643f8a8c64ff4be7543eb62afbf7a0dea88  beyond2lte-sdr-wifi-ps@.service
+4d6e8e8cbf1ba061000a9e6437209439de3def4a51b4d228632c2016a14da5e642a55ea063c8e070a614dd706d9581031168ddef6c434dda0c3869aa888cd90d  beyond2lte-sdr-wifi-ps.dispatcher
+"

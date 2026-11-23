@@ -1,0 +1,519 @@
+#!/usr/bin/python3
+"""sdr-status: tiny health page for the beyond2lte SDR server.
+
+Standard library only. Serves
+  /             HTML (server-side rendered, meta refresh, no JavaScript)
+  /status.json  the same data as JSON
+  /metrics      a few Prometheus gauges (temps, battery, memory, load, USB speed)
+Configuration: environment (see /etc/default/sdr-status).
+"""
+import glob
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BIND = os.environ.get("SDR_STATUS_BIND", "0.0.0.0")
+PORT = int(os.environ.get("SDR_STATUS_PORT", "8080"))
+REFRESH = int(os.environ.get("SDR_STATUS_REFRESH", "15"))
+JOURNAL_LINES = int(os.environ.get("SDR_STATUS_JOURNAL_LINES", "20"))
+CACHE_SECS = float(os.environ.get("SDR_STATUS_CACHE", "5"))
+DISK_PATHS = os.environ.get("SDR_STATUS_DISKS", "/ /var/lib/sdr-record").split()
+DEFAULT_UNITS = (
+    "beyond2lte-sdr-server sdrpp-server-lime sdrpp-server-rtl rtl-tcp openwebrx "
+    "sdr-adsb tar1090 tar1090-web sdr-rtl433 sdr-aprs sdr-pocsag sdr-ais "
+    "sdr-wifi-watchdog sdr-usb-check.timer sdr-record-rotate.timer "
+    "beyond2lte-charge greetd NetworkManager sshd nftables prometheus-node-exporter"
+)
+UNITS = (os.environ.get("SDR_STATUS_UNITS") or DEFAULT_UNITS).split() + \
+    os.environ.get("SDR_STATUS_EXTRA_UNITS", "").split()
+
+SDR_IDS = {
+    "0403:601f": ("LimeSDR Mini (FT601)", 5000),
+    "1d50:6108": ("LimeSDR-USB (FX3)", 5000),
+    "0bda:2838": ("RTL-SDR (RTL2838)", 480),
+    "0bda:2832": ("RTL-SDR (RTL2832U)", 480),
+    "1d50:604b": ("HackRF One", 480),
+    "1d50:60a1": ("Airspy", 480),
+}
+
+
+def rd(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def rdint(path, default=None):
+    try:
+        return int(rd(path))
+    except (TypeError, ValueError):
+        return default
+
+
+def run(cmd, timeout=6):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout, text=True, errors="replace")
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+def get_thermal():
+    out = []
+    for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*"),
+                    key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0)):
+        t = rdint(z + "/temp")
+        if t is None:
+            continue
+        out.append({"zone": os.path.basename(z), "type": rd(z + "/type", "?"),
+                    "temp_c": round(t / 1000.0, 1)})
+    return out
+
+
+def get_cpufreq():
+    out = []
+    for p in sorted(glob.glob("/sys/devices/system/cpu/cpufreq/policy*")):
+        out.append({"policy": os.path.basename(p), "cpus": rd(p + "/affected_cpus", ""),
+                    "governor": rd(p + "/scaling_governor", "?"),
+                    "cur_mhz": (rdint(p + "/scaling_cur_freq", 0) or 0) // 1000,
+                    "max_mhz": (rdint(p + "/scaling_max_freq", 0) or 0) // 1000})
+    return out
+
+
+PS_ATTRS = ("type", "status", "capacity", "online", "health", "voltage_now", "current_now",
+            "current_avg", "temp", "charge_behaviour", "constant_charge_current",
+            "constant_charge_voltage", "input_current_limit", "charge_type")
+
+
+def get_power():
+    supplies = []
+    for s in sorted(glob.glob("/sys/class/power_supply/*")):
+        d = {"name": os.path.basename(s)}
+        for a in PS_ATTRS:
+            v = rd(s + "/" + a)
+            if v is not None:
+                d[a] = v
+        supplies.append(d)
+    policy = {}
+    txt = rd("/etc/default/beyond2lte-charge", "")
+    for k in ("CHARGE_START_THRESHOLD", "CHARGE_END_THRESHOLD", "FLOAT_VOLTAGE_UV",
+              "CHARGE_CURRENT_UA", "INPUT_CURRENT_UA"):
+        m = re.search(r"^\s*%s=\"?([^\"\s#]+)" % k, txt, re.M)
+        if m:
+            policy[k] = m.group(1)
+    return {"supplies": supplies, "charge_policy": policy}
+
+
+def get_system():
+    up = float((rd("/proc/uptime", "0") or "0").split()[0])
+    load = (rd("/proc/loadavg", "") or "").split()[:3]
+    mem = {}
+    for line in (rd("/proc/meminfo", "") or "").splitlines():
+        k, _, v = line.partition(":")
+        if k in ("MemTotal", "MemAvailable", "MemFree", "SwapTotal", "SwapFree", "Cached"):
+            mem[k] = int(v.split()[0]) // 1024  # MiB
+    disks = []
+    seen = set()
+    for p in DISK_PATHS:
+        try:
+            st = os.statvfs(p)
+            dev = os.stat(p).st_dev
+        except OSError:
+            continue
+        if dev in seen:
+            continue
+        seen.add(dev)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        disks.append({"path": p, "total_gb": round(total / 1e9, 1), "free_gb": round(free / 1e9, 1),
+                      "used_pct": round(100.0 * (1 - free / total), 1) if total else 0})
+    rec = None
+    for p in DISK_PATHS:
+        if p.endswith("sdr-record") and os.path.isdir(p):
+            rc, o = run(["du", "-sm", p], 10)
+            if rc == 0:
+                rec = int(o.split()[0])
+    return {"hostname": os.uname().nodename, "kernel": os.uname().release,
+            "uptime_s": int(up), "load": load, "ncpu": os.cpu_count(), "mem_mib": mem,
+            "disks": disks, "recordings_mib": rec,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S %Z")}
+
+
+def get_wifi():
+    out = []
+    for w in sorted(glob.glob("/sys/class/net/*/wireless")) or \
+            sorted(glob.glob("/sys/class/net/*/phy80211")):
+        ifc = w.split("/")[4]
+        if any(x["iface"] == ifc for x in out):
+            continue
+        d = {"iface": ifc, "operstate": rd("/sys/class/net/%s/operstate" % ifc, "?")}
+        if shutil.which("iw"):
+            rc, o = run(["iw", "dev", ifc, "link"])
+            if rc == 0:
+                for key, rx in (("ssid", r"SSID: (.*)"), ("freq_mhz", r"freq: ([\d.]+)"),
+                                ("signal_dbm", r"signal: (-?\d+)"),
+                                ("rx_bitrate", r"rx bitrate: (.*)"),
+                                ("tx_bitrate", r"tx bitrate: (.*)"),
+                                ("bssid", r"Connected to ([0-9a-f:]+)")):
+                    m = re.search(rx, o)
+                    if m:
+                        d[key] = m.group(1).strip()
+                if "Not connected" in o:
+                    d["connected"] = False
+            rc, o = run(["iw", "dev", ifc, "get", "power_save"])
+            m = re.search(r"Power save: (\w+)", o)
+            if m:
+                d["power_save"] = m.group(1)
+        if "signal_dbm" not in d:
+            for line in (rd("/proc/net/wireless", "") or "").splitlines():
+                if line.strip().startswith(ifc + ":"):
+                    f = line.split()
+                    d["signal_dbm"] = f[3].rstrip(".")
+        out.append(d)
+    rc, o = run(["ip", "-o", "-4", "addr", "show", "scope", "global"])
+    addrs = re.findall(r"^\d+:\s+(\S+)\s+inet\s+(\S+)", o, re.M) if rc == 0 else []
+    rc, o = run(["ip", "-4", "route", "show", "default"])
+    gw = re.findall(r"default via (\S+) dev (\S+)", o) if rc == 0 else []
+    return {"wifi": out, "addrs": [{"iface": a, "addr": b} for a, b in addrs],
+            "default_routes": [{"gw": a, "iface": b} for a, b in gw]}
+
+
+def get_usb():
+    out = []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        vid = rd(d + "/idVendor")
+        if vid is None:
+            continue
+        pid = rd(d + "/idProduct", "")
+        key = "%s:%s" % (vid, pid)
+        speed = rdint(d + "/speed", 0)
+        dev = {"port": os.path.basename(d), "id": key, "speed_mbps": speed,
+               "manufacturer": rd(d + "/manufacturer", ""), "product": rd(d + "/product", ""),
+               "serial": rd(d + "/serial", ""), "class": rd(d + "/bDeviceClass", ""),
+               "power_control": rd(d + "/power/control", "")}
+        if key in SDR_IDS:
+            name, want = SDR_IDS[key]
+            dev["sdr"] = name
+            if speed and speed < want:
+                dev["warning"] = "enumerated at %d Mbit/s, expected %d (USB2 fallback)" % (speed, want)
+        out.append(dev)
+    return out
+
+
+def get_units():
+    rc, o = run(["systemctl", "show", "--no-pager",
+                 "-p", "Id,LoadState,ActiveState,SubState,UnitFileState,NRestarts,"
+                       "MemoryCurrent,ActiveEnterTimestamp,Result"] +
+                [u if "." in u else u + ".service" for u in UNITS], 8)
+    units = []
+    if rc != 0:
+        return units
+    for block in o.strip().split("\n\n"):
+        d = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+        if not d or d.get("LoadState") == "not-found":
+            continue
+        mem = d.get("MemoryCurrent", "")
+        units.append({"unit": d.get("Id", "?"), "active": d.get("ActiveState", "?"),
+                      "sub": d.get("SubState", "?"), "enabled": d.get("UnitFileState", ""),
+                      "load": d.get("LoadState", ""),
+                      "restarts": d.get("NRestarts", ""), "result": d.get("Result", ""),
+                      "mem_mib": int(mem) // 1048576 if mem.isdigit() else None,
+                      "since": d.get("ActiveEnterTimestamp", "")})
+    return units
+
+
+def get_sdr_mode():
+    exe = shutil.which("sdr-mode")
+    if not exe:
+        return None
+    rc, o = run([exe, "status"], 8)
+    return {"rc": rc, "output": o.strip()[:4000]}
+
+
+def get_headless():
+    bl = {os.path.basename(os.path.dirname(p)): rd(p, "?")
+          for p in glob.glob("/sys/class/backlight/*/bl_power")}
+    return {"enabled": os.path.exists("/etc/sdr-headless/enabled"), "bl_power": bl}
+
+
+def get_journal():
+    if JOURNAL_LINES <= 0:
+        return []
+    rc, o = run(["journalctl", "-b", "-p", "3", "-n", str(JOURNAL_LINES), "--no-pager",
+                 "-o", "short-iso", "-q"], 10)
+    if rc != 0:
+        return ["(journalctl failed: %s)" % o.strip()[:200]]
+    return o.strip().splitlines()
+
+
+_cache = {"t": 0.0, "data": None}
+_lock = threading.Lock()
+
+
+def collect():
+    with _lock:
+        now = time.monotonic()
+        if _cache["data"] is not None and now - _cache["t"] < CACHE_SECS:
+            return _cache["data"]
+        data = {}
+        for key, fn in (("system", get_system), ("thermal", get_thermal),
+                        ("cpufreq", get_cpufreq), ("power", get_power), ("net", get_wifi),
+                        ("usb", get_usb), ("units", get_units), ("sdr_mode", get_sdr_mode),
+                        ("headless", get_headless), ("errors", get_journal)):
+            try:
+                data[key] = fn()
+            except Exception as e:  # one broken probe must not take the page down
+                data[key] = {"error": "%s: %s" % (type(e).__name__, e)}
+        _cache.update(t=time.monotonic(), data=data)
+        return data
+
+
+def e(x):
+    return html.escape(str(x if x is not None else ""))
+
+
+def table(head, rows):
+    s = ["<table><tr>"] + ["<th>%s</th>" % e(h) for h in head] + ["</tr>"]
+    for r in rows:
+        s.append("<tr>" + "".join("<td%s>%s</td>" % (
+            (' class="%s"' % c[1], c[0]) if isinstance(c, tuple) else ("", e(c))) for c in r) + "</tr>")
+    s.append("</table>")
+    return "".join(s)
+
+
+def cls(val, warn, bad):
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "ok"
+    return "bad" if v >= bad else "warn" if v >= warn else "ok"
+
+
+def fmt_up(s):
+    d, r = divmod(int(s), 86400)
+    h, r = divmod(r, 3600)
+    return "%dd %02dh %02dm" % (d, h, r // 60)
+
+
+CSS = """body{font:14px/1.4 system-ui,sans-serif;margin:1em auto;max-width:1000px;padding:0 .7em;
+background:#111;color:#ddd}h1{font-size:1.3em}h2{font-size:1.05em;margin:1.2em 0 .3em;
+border-bottom:1px solid #444}table{border-collapse:collapse;width:100%}td,th{text-align:left;
+padding:2px 8px 2px 0;vertical-align:top}th{color:#999;font-weight:normal}.ok{color:#7c7}
+.warn{color:#fc5}.bad{color:#f66;font-weight:bold}.dim{color:#888}pre{white-space:pre-wrap;
+word-break:break-all;background:#1a1a1a;padding:.5em;font-size:12px}a{color:#8bf}"""
+
+
+def render(d):
+    sysd = d["system"]
+    p = ["<!doctype html><html><head><meta charset=utf-8>",
+         '<meta name=viewport content="width=device-width,initial-scale=1">',
+         '<meta http-equiv=refresh content="%d">' % REFRESH if REFRESH > 0 else "",
+         "<title>%s - SDR status</title><style>%s</style></head><body>" % (e(sysd.get("hostname")), CSS),
+         "<h1>%s <span class=dim>SDR server status - %s</span></h1>" % (
+             e(sysd.get("hostname")), e(sysd.get("time")))]
+    # --- system
+    mem = sysd.get("mem_mib", {})
+    load = sysd.get("load", [])
+    used = mem.get("MemTotal", 0) - mem.get("MemAvailable", 0)
+    rows = [["uptime", fmt_up(sysd.get("uptime_s", 0))],
+            ["load (1/5/15 min, %s CPUs)" % sysd.get("ncpu"),
+             (e(" ".join(load)), cls(load[0] if load else 0, sysd.get("ncpu") or 8, 2 * (sysd.get("ncpu") or 8)))],
+            ["RAM", (e("%d / %d MiB used, %d MiB available" % (used, mem.get("MemTotal", 0), mem.get("MemAvailable", 0))),
+                     cls(100.0 * used / max(mem.get("MemTotal", 1), 1), 80, 92))],
+            ["kernel", sysd.get("kernel")]]
+    for dk in sysd.get("disks", []):
+        rows.append(["disk " + dk["path"], (e("%.1f GB free of %.1f GB (%.0f %% used)" % (
+            dk["free_gb"], dk["total_gb"], dk["used_pct"])), cls(dk["used_pct"], 85, 95))])
+    if sysd.get("recordings_mib") is not None:
+        rows.append(["recordings", "%d MiB in /var/lib/sdr-record" % sysd["recordings_mib"]])
+    hl = d.get("headless") or {}
+    rows.append(["headless", "%s (bl_power: %s)" % (
+        "ON" if hl.get("enabled") else "off",
+        ", ".join("%s=%s" % kv for kv in (hl.get("bl_power") or {}).items()) or "n/a")])
+    p.append("<h2>System</h2>" + table(["", ""], rows))
+    # --- temps
+    th = d.get("thermal") or []
+    if isinstance(th, list) and th:
+        p.append("<h2>Temperatures</h2>" + table(
+            [t["type"] for t in th],
+            [[(e("%.1f &deg;C" % t["temp_c"]).replace("&amp;", "&"), cls(t["temp_c"], 70, 85)) for t in th]]))
+    cf = d.get("cpufreq") or []
+    if isinstance(cf, list) and cf:
+        p.append(table(["cpufreq", "cpus", "governor", "now", "max"],
+                       [[c["policy"], c["cpus"], c["governor"], "%d MHz" % c["cur_mhz"],
+                         "%d MHz" % c["max_mhz"]] for c in cf]))
+    # --- power
+    pw = d.get("power") or {}
+    rows = []
+    for s in pw.get("supplies", []):
+        bits = []
+        if "capacity" in s:
+            bits.append("%s %%" % s["capacity"])
+        if "status" in s:
+            bits.append(s["status"])
+        if "online" in s:
+            bits.append("online=%s" % s["online"])
+        for a, unit, div in (("voltage_now", "V", 1e6), ("current_now", "mA", 1e3),
+                             ("temp", "°C", 10), ("input_current_limit", "mA in-limit", 1e3),
+                             ("constant_charge_current", "mA cc", 1e3)):
+            if a in s:
+                try:
+                    bits.append(("%.2f %s" if div == 1e6 else "%.0f %s") % (float(s[a]) / div, unit))
+                except ValueError:
+                    pass
+        if "charge_behaviour" in s:
+            bits.append("behaviour: " + s["charge_behaviour"])
+        if "health" in s:
+            bits.append("health: " + s["health"])
+        rows.append([s["name"], s.get("type", ""), ", ".join(bits)])
+    pol = pw.get("charge_policy") or {}
+    if pol:
+        rows.append(["charge limit", "policy", "stop at %s %%, resume below %s %% %s" % (
+            pol.get("CHARGE_END_THRESHOLD", "?"), pol.get("CHARGE_START_THRESHOLD", "?"),
+            " ".join("%s=%s" % (k, v) for k, v in pol.items() if "THRESHOLD" not in k))])
+    p.append("<h2>Battery / charger</h2>" + table(["supply", "type", "state"], rows))
+    # --- network
+    net = d.get("net") or {}
+    rows = []
+    for w in net.get("wifi", []):
+        sig = w.get("signal_dbm")
+        c = "ok"
+        try:
+            c = "bad" if int(sig) < -80 else "warn" if int(sig) < -70 else "ok"
+        except (TypeError, ValueError):
+            pass
+        rows.append([w["iface"], w.get("ssid", "(not connected)"),
+                     ("%s dBm" % e(sig) if sig else "-", c),
+                     "%s MHz" % w.get("freq_mhz", "?"),
+                     "rx %s / tx %s" % (w.get("rx_bitrate", "?"), w.get("tx_bitrate", "?")),
+                     "PS " + w.get("power_save", "?")])
+    p.append("<h2>Network</h2>" + table(["iface", "SSID", "signal", "freq", "bitrate", "power save"], rows))
+    p.append("<p class=dim>addresses: %s &nbsp; default route: %s</p>" % (
+        e(", ".join("%s %s" % (a["iface"], a["addr"]) for a in net.get("addrs", [])) or "none"),
+        e(", ".join("%s via %s" % (r["iface"], r["gw"]) for r in net.get("default_routes", [])) or "NONE")))
+    # --- usb
+    rows = []
+    for u in d.get("usb") or []:
+        if u.get("class") == "09" and not u.get("sdr") and u["port"].startswith("usb"):
+            label = "root hub"
+        else:
+            label = u.get("sdr") or ("hub" if u.get("class") == "09" else "")
+        rows.append([u["port"], u["id"], (e(label), "ok" if u.get("sdr") else "dim"),
+                     "%s %s" % (u.get("manufacturer", ""), u.get("product", "")),
+                     (e("%s Mbit/s" % u["speed_mbps"]) + (" - " + e(u["warning"]) if u.get("warning") else ""),
+                      "bad" if u.get("warning") else "ok"),
+                     u.get("serial", "")])
+    if not any(u.get("sdr") for u in d.get("usb") or []):
+        p.append("<h2>USB</h2><p class=warn>No SDR on the bus.</p>" + table(
+            ["port", "id", "", "device", "speed", "serial"], rows))
+    else:
+        p.append("<h2>USB</h2>" + table(["port", "id", "", "device", "speed", "serial"], rows))
+    # --- services
+    sm = d.get("sdr_mode")
+    p.append("<h2>SDR mode / services</h2>")
+    if sm:
+        p.append("<pre>%s</pre>" % e(sm.get("output")))
+    rows = []
+    for u in d.get("units") or []:
+        a = u["active"]
+        c = "ok" if a == "active" else "bad" if a == "failed" else "warn" if a == "activating" else "dim"
+        rows.append([u["unit"], ("%s (%s)" % (e(a), e(u["sub"])), c), u.get("enabled", ""),
+                     u["restarts"] if u["restarts"] not in ("", "0") else "",
+                     "%d MiB" % u["mem_mib"] if u.get("mem_mib") is not None and a == "active" else "",
+                     u.get("since", "") if a == "active" else ""])
+    p.append(table(["unit", "state", "enabled", "restarts", "memory", "since"], rows))
+    # --- errors
+    errs = d.get("errors") or []
+    p.append("<h2>Recent errors (journal, priority &le; err, this boot)</h2>")
+    p.append("<pre>%s</pre>" % (e("\n".join(errs)) if errs else "none"))
+    p.append('<p class=dim><a href="/status.json">status.json</a> &middot; '
+             '<a href="/metrics">metrics</a> &middot; refresh %d s</p></body></html>' % REFRESH)
+    return "".join(p)
+
+
+def metrics(d):
+    o = []
+
+    def g(name, val, labels=""):
+        try:
+            o.append("sdr_%s%s %s" % (name, "{%s}" % labels if labels else "", float(val)))
+        except (TypeError, ValueError):
+            pass
+    sysd = d.get("system") or {}
+    g("uptime_seconds", sysd.get("uptime_s"))
+    if sysd.get("load"):
+        g("load1", sysd["load"][0])
+    for k, v in (sysd.get("mem_mib") or {}).items():
+        g("memory_mib", v, 'field="%s"' % k)
+    for dk in sysd.get("disks") or []:
+        g("disk_free_gb", dk["free_gb"], 'path="%s"' % dk["path"])
+    for t in d.get("thermal") or []:
+        g("temp_celsius", t["temp_c"], 'zone="%s",type="%s"' % (t["zone"], t["type"]))
+    for s in (d.get("power") or {}).get("supplies", []):
+        for a in ("capacity", "voltage_now", "current_now", "temp", "online"):
+            if a in s:
+                g("power_supply_" + a, s[a], 'supply="%s"' % s["name"])
+    for w in (d.get("net") or {}).get("wifi", []):
+        g("wifi_signal_dbm", w.get("signal_dbm"), 'iface="%s"' % w["iface"])
+    for u in d.get("usb") or []:
+        if u.get("sdr"):
+            g("usb_sdr_speed_mbps", u["speed_mbps"], 'id="%s",name="%s"' % (u["id"], u["sdr"]))
+    for u in d.get("units") or []:
+        g("unit_active", 1 if u["active"] == "active" else 0, 'unit="%s"' % u["unit"])
+    return "\n".join(o) + "\n"
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "sdr-status/1"
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        try:
+            if path in ("/", "/index.html"):
+                body, ctype = render(collect()), "text/html; charset=utf-8"
+            elif path == "/status.json":
+                body, ctype = json.dumps(collect(), indent=1), "application/json"
+            elif path == "/metrics":
+                body, ctype = metrics(collect()), "text/plain; version=0.0.4"
+            else:
+                self.send_error(404)
+                return
+        except Exception as ex:
+            self.send_error(500, "%s: %s" % (type(ex).__name__, ex))
+            return
+        data = body.encode("utf-8", "replace")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_HEAD = do_GET
+
+    def log_message(self, fmt, *args):  # keep the journal quiet
+        pass
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--once":
+        print(json.dumps(collect(), indent=1))
+        return
+    srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    srv.daemon_threads = True
+    print("sdr-status listening on %s:%d" % (BIND, PORT), flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

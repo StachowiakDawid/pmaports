@@ -1,0 +1,39 @@
+#!/bin/sh
+# sdr-pocsag.service: rtl_fm (narrow FM, 22050 Hz) piped into multimon-ng.
+set -o pipefail
+POCSAG_DEVICE=0 POCSAG_FREQ=439.9875M POCSAG_GAIN= POCSAG_PPM=0
+POCSAG_MODES="POCSAG512 POCSAG1200 POCSAG2400" POCSAG_FORMAT=alpha POCSAG_CHARSET=
+POCSAG_LOG=yes POCSAG_LOG_MAX_KB=10240 POCSAG_EXTRA_ARGS=
+[ -r /etc/default/sdr-pocsag ] && . /etc/default/sdr-pocsag
+RUN=${RUNTIME_DIRECTORY:-/run/sdr-pocsag}
+STATE=${STATE_DIRECTORY:-/var/lib/sdr-decoders/pocsag}
+LOG=$STATE/pocsag.log
+
+set -- -q -t raw -e --timestamp -f "${POCSAG_FORMAT:-alpha}"
+for m in $POCSAG_MODES; do set -- "$@" -a "$m"; done
+[ -n "$POCSAG_CHARSET" ] && set -- "$@" -C "$POCSAG_CHARSET"
+
+sink() {
+	if [ "$POCSAG_LOG" != yes ]; then cat; return; fi
+	# tee into a size-limited log (checked every 200 messages)
+	n=0
+	while IFS= read -r line; do
+		printf '%s\n' "$line"
+		printf '%s\n' "$line" >> "$LOG"
+		n=$((n + 1))
+		if [ $n -ge 200 ]; then
+			n=0
+			kb=$(du -k "$LOG" 2>/dev/null | cut -f1)
+			[ "${kb:-0}" -gt "${POCSAG_LOG_MAX_KB:-10240}" ] && mv -f "$LOG" "$LOG.1"
+		fi
+	done
+}
+
+# shellcheck disable=SC2086
+rtl_fm -d "$POCSAG_DEVICE" -f "${POCSAG_FREQ:-439.9875M}" -M fm -s 22050 \
+	${POCSAG_GAIN:+-g "$POCSAG_GAIN"} -p "${POCSAG_PPM:-0}" -l 0 -E dc - 2>"$RUN/rtl_fm.log" |
+	multimon-ng "$@" $POCSAG_EXTRA_ARGS /dev/stdin | sink
+rc=$?
+tail -n 5 "$RUN/rtl_fm.log" >&2
+[ "$rc" = 0 ] && rc=1
+exit $rc

@@ -1,0 +1,15 @@
+[Unit]
+Description=Headless mode: switch the OLED panel off
+ConditionPathExists=/etc/sdr-headless/enabled
+# after everything that turns the panel on during boot
+After=touch-wake.service touch-rebind.service beyond2lte-display-takeover.service systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/sdr-headless panel-off
+ExecStop=/usr/bin/sdr-headless panel-on
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

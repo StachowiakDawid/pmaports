@@ -1,0 +1,72 @@
+[Unit]
+Description=ADS-B decoder (dump1090-fa, RTL-SDR 1090 MHz) + tar1090 map
+Documentation=https://github.com/flightaware/dump1090 https://github.com/wiedehopf/tar1090
+After=network.target
+# the web map follows the decoder (PartOf= in the tar1090 units)
+Wants=tar1090.service tar1090-web.service
+Before=tar1090.service tar1090-web.service
+# sdr-mode contract (beyond2lte-sdr-services): a dedicated RTL-SDR service is
+# bound to the dongle's device unit (stopped on unplug, started on plug when
+# enabled) and excludes the other dedicated RTL-SDR services. Select it with
+#   sdr-mode rtl adsb
+# - do not enable/start by hand, sdr-mode also hands the dongle over from the
+# shared servers (SoapySDRServer, OpenWebRX).
+BindsTo=dev-sdr-rtl.device
+After=dev-sdr-rtl.device
+Conflicts=rtl-tcp.service sdrpp-server-rtl.service
+Conflicts=sdr-rtl433.service sdr-aprs.service sdr-pocsag.service sdr-ais.service
+# retry forever, with backoff (5 s -> 5 min)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=sdrdec
+Group=sdr
+ExecStart=/usr/libexec/sdr-decoders/sdr-adsb
+# Restart=always, not on-failure: rtl_* tools exit 0 when the dongle vanishes.
+# An explicit stop (systemctl stop, Conflicts=, unplug, sdr-mode) is never restarted.
+Restart=always
+RestartSec=5
+RestartSteps=6
+RestartMaxDelaySec=5min
+TimeoutStopSec=10
+SyslogIdentifier=sdr-adsb
+RuntimeDirectory=dump1090-fa
+RuntimeDirectoryMode=0755
+MemoryMax=256M
+# little cores are plenty; keeps the big cluster cool/free for the SDR server
+CPUAffinity=0-5
+Nice=5
+
+# Hardening
+UMask=0027
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# USB device nodes only (/dev/bus/usb/*, major 189)
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+# AF_NETLINK: libusb hotplug (udev monitor)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=dev-sdr-rtl.device

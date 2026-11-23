@@ -1,0 +1,39 @@
+# EXAMPLE - not installed as a unit, nothing is fed anywhere by default.
+# Push the Beast stream of sdr-adsb (dump1090-fa, TCP 30005) to an aggregator
+# that accepts raw Beast input ("beast_reduce_plus_out"-style feeds), e.g.
+#   adsb.lol        feed.adsb.lol:30004
+#   adsb.fi         feed.adsb.fi:30004
+#   airplanes.live  feed.airplanes.live:30004
+#   ADSBexchange    feed1.adsbexchange.com:30004
+# Read the aggregator's terms first; set ADSB_LAT/ADSB_LON in /etc/default/sdr-adsb.
+#
+#   apk add socat
+#   cp /usr/share/beyond2lte-sdr-decoders/sdr-adsb-feed.service.example \
+#      /etc/systemd/system/sdr-adsb-feed@.service
+#   systemctl daemon-reload
+#   systemctl enable --now 'sdr-adsb-feed@feed.adsb.lol:30004.service'
+#
+# FlightAware (piaware), Flightradar24 (fr24feed) and RadarBox need their own
+# clients; run those on another LAN machine and point them at
+# <phone-ip>:30005 (Beast) - the nftables rules allow LAN sources.
+# MLAT needs an exact position and a client per aggregator - out of scope here.
+[Unit]
+Description=ADS-B Beast feed to %i
+After=sdr-adsb.service network-online.target
+Wants=network-online.target
+PartOf=sdr-adsb.service
+StartLimitIntervalSec=0
+
+[Service]
+DynamicUser=yes
+ExecStart=/usr/bin/socat -d -u TCP:127.0.0.1:30005,keepalive TCP:%i,keepalive
+Restart=always
+RestartSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=sdr-adsb.service

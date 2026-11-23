@@ -1,0 +1,23 @@
+# /etc/default/sdr-adsb - ADS-B decoder (dump1090-fa on an RTL-SDR, 1090 MHz)
+# read by sdr-adsb.service. Apply with: systemctl restart sdr-adsb
+
+# RTL-SDR to use: index (0) or serial number (set one with `rtl_eeprom -s 1090`).
+ADSB_DEVICE=0
+# Tuner gain in dB; empty = dump1090-fa default (maximum). With ADSB_ADAPTIVE=yes
+# dump1090-fa lowers the gain by itself when strong aircraft overload the tuner.
+ADSB_GAIN=
+ADSB_ADAPTIVE=no
+# Frequency correction in ppm (0 for TCXO dongles such as RTL-SDR Blog v3/v4).
+ADSB_PPM=0
+# Receiver position (decimal degrees). Needed for surface positions, range
+# rings and distances on the map. Empty = unknown.
+ADSB_LAT=
+ADSB_LON=
+# Maximum plausible range in NM (positions beyond are discarded).
+ADSB_MAX_RANGE=360
+# Network outputs for other programs on the LAN (feeders, Virtual Radar, ...):
+# raw AVR 30002, BaseStation/SBS 30003, Beast 30005. "127.0.0.1" keeps them
+# local to the phone. The nftables rules only allow private (LAN) sources.
+ADSB_NET_BIND=0.0.0.0
+# Anything else for dump1090 (see `dump1090 --help`), e.g. "--modeac --fix-2bit"
+ADSB_EXTRA_ARGS=

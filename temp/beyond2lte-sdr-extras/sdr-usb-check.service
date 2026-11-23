@@ -1,0 +1,20 @@
+[Unit]
+Description=Check the LimeSDR USB link speed (USB3 vs USB2 fallback)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/sdr-selfheal/sdr-usb-check
+RuntimeDirectory=sdr-usb-check
+RuntimeDirectoryPreserve=yes
+SyslogIdentifier=sdr-usb-check
+SyslogLevelPrefix=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateNetwork=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=yes

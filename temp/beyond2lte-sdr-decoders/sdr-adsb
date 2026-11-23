@@ -1,0 +1,18 @@
+#!/bin/sh
+# sdr-adsb.service: dump1090-fa on an RTL-SDR, JSON for tar1090 in /run/dump1090-fa.
+ADSB_DEVICE=0 ADSB_GAIN= ADSB_ADAPTIVE=no ADSB_PPM=0 ADSB_LAT= ADSB_LON=
+ADSB_MAX_RANGE=360 ADSB_NET_BIND=0.0.0.0 ADSB_EXTRA_ARGS=
+[ -r /etc/default/sdr-adsb ] && . /etc/default/sdr-adsb
+
+set -- --device-type rtlsdr --device "$ADSB_DEVICE" --ppm "${ADSB_PPM:-0}" \
+	--fix --max-range "${ADSB_MAX_RANGE:-360}" \
+	--net --net-bind-address "${ADSB_NET_BIND:-0.0.0.0}" \
+	--net-ri-port 0 --net-bi-port 0 \
+	--net-ro-port 30002 --net-sbs-port 30003 --net-bo-port 30005 \
+	--write-json "${RUNTIME_DIRECTORY:-/run/dump1090-fa}" --write-json-every 1 \
+	--json-location-accuracy 1 --stats-every 3600 --quiet
+[ -n "$ADSB_GAIN" ] && set -- "$@" --gain "$ADSB_GAIN"
+[ "$ADSB_ADAPTIVE" = yes ] && set -- "$@" --adaptive-range --adaptive-burst
+[ -n "$ADSB_LAT" ] && [ -n "$ADSB_LON" ] && set -- "$@" --lat "$ADSB_LAT" --lon "$ADSB_LON"
+# shellcheck disable=SC2086
+exec /usr/bin/dump1090 "$@" $ADSB_EXTRA_ARGS

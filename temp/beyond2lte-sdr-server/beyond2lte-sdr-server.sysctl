@@ -1,0 +1,9 @@
+# beyond2lte-sdr-server: large socket buffers for SoapyRemote streaming.
+# SoapyRemote requests a 42 MiB socket window per stream on Linux
+# (SOAPY_REMOTE_DEFAULT_ENDPOINT_WINDOW); the kernel caps it at *mem_max.
+net.core.rmem_max = 104857600
+net.core.wmem_max = 104857600
+net.core.rmem_default = 4194304
+net.core.wmem_default = 4194304
+# Bursty 1500 B datagrams at ~100 kpps: give the NIC/Wi-Fi backlog headroom.
+net.core.netdev_max_backlog = 5000

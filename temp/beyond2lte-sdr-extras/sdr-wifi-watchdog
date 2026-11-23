@@ -1,0 +1,85 @@
+#!/bin/sh
+# Wi-Fi watchdog: if the default gateway stays unreachable, reconnect the
+# interface, then restart NetworkManager. Never reboots unless
+# WIFI_WATCHDOG_REBOOT=yes (see /etc/default/sdr-selfheal).
+WIFI_WATCHDOG_IFACE= WIFI_WATCHDOG_INTERVAL=30 WIFI_WATCHDOG_FAIL_MIN=3
+WIFI_WATCHDOG_RETRY_MIN=10 WIFI_WATCHDOG_REBOOT=no WIFI_WATCHDOG_REBOOT_AFTER_MIN=30
+WIFI_WATCHDOG_REBOOT_MAX=2
+[ -r /etc/default/sdr-selfheal ] && . /etc/default/sdr-selfheal
+STATE=${STATE_DIRECTORY:-/var/lib/sdr-selfheal}
+COUNT=$STATE/wifi-reboots
+
+log() { echo "$*"; }
+now() { cut -d. -f1 /proc/uptime; }
+
+find_iface() {
+	if [ -n "$WIFI_WATCHDOG_IFACE" ]; then echo "$WIFI_WATCHDOG_IFACE"; return; fi
+	for w in /sys/class/net/*/wireless /sys/class/net/*/phy80211; do
+		[ -e "$w" ] || continue
+		i=${w%/*}; echo "${i##*/}"; return
+	done
+}
+
+probe() { # iface -> 0 ok
+	gw=$(ip -4 route show default dev "$1" 2>/dev/null | awk '/default via/ {print $3; exit}')
+	[ -n "$gw" ] || { why="no default route on $1"; return 1; }
+	ping -c 1 -W 3 -I "$1" "$gw" >/dev/null 2>&1 && return 0
+	sleep 1
+	ping -c 1 -W 3 -I "$1" "$gw" >/dev/null 2>&1 && return 0
+	# some routers drop ICMP: ARP is enough to prove the link works
+	arping -q -c 2 -w 3 -I "$1" "$gw" >/dev/null 2>&1 && return 0
+	why="gateway $gw unreachable on $1"
+	return 1
+}
+
+fail_since=0 step=1 next_action=0 gaveup=
+log "watching the default gateway (every ${WIFI_WATCHDOG_INTERVAL}s, act after ${WIFI_WATCHDOG_FAIL_MIN} min, reboot=${WIFI_WATCHDOG_REBOOT})"
+while :; do
+	ifc=$(find_iface)
+	if [ -z "$ifc" ]; then
+		why="no Wi-Fi interface"; ok=1
+	else
+		probe "$ifc"; ok=$?
+	fi
+	t=$(now)
+	if [ $ok = 0 ]; then
+		[ $fail_since != 0 ] && log "network back after $(( (t - fail_since) / 60 )) min"
+		fail_since=0; step=1; gaveup=
+		[ -e "$COUNT" ] && rm -f "$COUNT"
+	else
+		if [ $fail_since = 0 ]; then
+			fail_since=$t; step=1
+			next_action=$(( t + WIFI_WATCHDOG_FAIL_MIN * 60 ))
+			log "problem: $why"
+		fi
+		down=$(( (t - fail_since) / 60 ))
+		if [ "$t" -ge "$next_action" ]; then
+			if [ $step = 1 ]; then
+				log "<4>$why for $down min - reconnecting ${ifc:-Wi-Fi}"
+				if [ -n "$ifc" ] && command -v nmcli >/dev/null 2>&1; then
+					nmcli radio wifi on >/dev/null 2>&1
+					timeout 60 nmcli device connect "$ifc" 2>&1 | tail -n 1
+				fi
+				step=2; next_action=$(( $(now) + WIFI_WATCHDOG_FAIL_MIN * 60 ))
+			else
+				log "<4>$why for $down min - restarting NetworkManager"
+				systemctl restart NetworkManager.service 2>&1 | tail -n 1
+				step=1; next_action=$(( $(now) + WIFI_WATCHDOG_RETRY_MIN * 60 ))
+			fi
+		fi
+		if [ "$WIFI_WATCHDOG_REBOOT" = yes ] && [ -z "$gaveup" ] && \
+		   [ "$down" -ge "$WIFI_WATCHDOG_REBOOT_AFTER_MIN" ]; then
+			n=$(cat "$COUNT" 2>/dev/null || echo 0)
+			if [ "$n" -lt "$WIFI_WATCHDOG_REBOOT_MAX" ]; then
+				echo $(( n + 1 )) > "$COUNT"; sync
+				log "<3>no network for $down min - REBOOTING (opt-in; reboot $(( n + 1 ))/$WIFI_WATCHDOG_REBOOT_MAX)"
+				gaveup=1
+				systemctl reboot
+			else
+				gaveup=1
+				log "<4>reboot limit ($WIFI_WATCHDOG_REBOOT_MAX) reached - not rebooting again until the network has been back once"
+			fi
+		fi
+	fi
+	sleep "$WIFI_WATCHDOG_INTERVAL"
+done

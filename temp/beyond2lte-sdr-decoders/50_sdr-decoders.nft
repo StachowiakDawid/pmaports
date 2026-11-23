@@ -1,0 +1,37 @@
+#!/usr/sbin/nft -f
+# beyond2lte-sdr-decoders: decoder outputs, reachable from private (LAN)
+# source addresses only. A port without a running service just refuses.
+#
+#   8504   tar1090 ADS-B map (lighttpd, tar1090-web.service)
+#   30002  dump1090-fa raw (AVR) output      30003  BaseStation (SBS) output
+#   30005  dump1090-fa Beast output (feeders / other ADS-B software on the LAN)
+#   8433   rtl_433 HTTP API / web UI (-F http)
+#   8000   direwolf AGWPE                    8001   direwolf KISS over TCP
+#   8100   AIS-catcher web UI
+#   10110  AIS-catcher NMEA TCP server (only when AIS_TCP_PORT=10110 is set)
+#
+# Counters: nft list chain inet filter input | grep sdr-decoders
+
+table inet filter {
+	set sdrdec_lan4 {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }
+	}
+	set sdrdec_lan6 {
+		type ipv6_addr
+		flags interval
+		elements = { fc00::/7, fe80::/10 }
+	}
+
+	chain input {
+		ip saddr @sdrdec_lan4 tcp dport { 8504, 30002, 30003, 30005 } counter accept comment "sdr-decoders ADS-B (tar1090, dump1090 outputs)"
+		ip6 saddr @sdrdec_lan6 tcp dport { 8504, 30002, 30003, 30005 } counter accept comment "sdr-decoders ADS-B (v6)"
+		ip saddr @sdrdec_lan4 tcp dport 8433 counter accept comment "sdr-decoders rtl_433 HTTP"
+		ip6 saddr @sdrdec_lan6 tcp dport 8433 counter accept comment "sdr-decoders rtl_433 HTTP (v6)"
+		ip saddr @sdrdec_lan4 tcp dport { 8000, 8001 } counter accept comment "sdr-decoders APRS direwolf AGW/KISS"
+		ip6 saddr @sdrdec_lan6 tcp dport { 8000, 8001 } counter accept comment "sdr-decoders APRS direwolf AGW/KISS (v6)"
+		ip saddr @sdrdec_lan4 tcp dport { 8100, 10110 } counter accept comment "sdr-decoders AIS-catcher web / NMEA"
+		ip6 saddr @sdrdec_lan6 tcp dport { 8100, 10110 } counter accept comment "sdr-decoders AIS-catcher web / NMEA (v6)"
+	}
+}

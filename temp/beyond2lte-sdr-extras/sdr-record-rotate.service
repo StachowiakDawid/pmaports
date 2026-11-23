@@ -1,0 +1,18 @@
+[Unit]
+Description=Apply the sdr-record size/age limits
+ConditionPathIsDirectory=/var/lib/sdr-record
+
+[Service]
+Type=oneshot
+User=sdrrec
+Group=sdr
+ExecStart=/usr/bin/sdr-record rotate
+SyslogIdentifier=sdr-record
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ReadWritePaths=/var/lib/sdr-record

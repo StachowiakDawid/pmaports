@@ -1,0 +1,59 @@
+sdr-mode hook contract (beyond2lte-sdr-services)
+================================================
+
+sdr-mode decides which ONE service may open each physical SDR:
+
+  device  node            systemd device unit     USB IDs
+  rtl     /dev/sdr/rtl    dev-sdr-rtl.device      0bda:2838, 0bda:2832
+  lime    /dev/sdr/lime   dev-sdr-lime.device     0403:601f, 1d50:6108
+
+Any package can add a service (decoder, recorder, ...) that owns a device.
+The service is then selected with `sdr-mode rtl <name>` (or `lime`), stopped
+and disabled when another mode is selected, started when the device is plugged
+in and stopped when it is unplugged.
+
+1. The unit (example for the RTL-SDR; use dev-sdr-lime.device for the LimeSDR)
+
+     [Unit]
+     BindsTo=dev-sdr-rtl.device
+     After=dev-sdr-rtl.device
+     Conflicts=rtl-tcp.service sdrpp-server-rtl.service   (+ your other units for the same device)
+     [Service]
+     Group=sdr            (or SupplementaryGroups=sdr; the device node is root:sdr 0660)
+     [Install]
+     WantedBy=dev-sdr-rtl.device
+
+   - Do NOT enable or start it from a package script and do not add
+     WantedBy=multi-user.target: `systemctl enable` is how sdr-mode records
+     the owner, it is done by `sdr-mode rtl <name>` only.
+   - LimeSDR units conflict with sdrpp-server-lime.service.
+   - No Conflicts= with beyond2lte-sdr-server.service or openwebrx.service:
+     they are shared between both SDRs, sdr-mode reconfigures or stops them
+     (SOAPY_SDR_ROOT drop-in / OpenWebRX "enabled" flags).
+   - Several processes on one device: put them behind one unit (a .target, or
+     services with PartOf=/BindsTo= the main one) and register that unit.
+   - A unit without [Install] also works (sdr-mode links it into
+     /etc/systemd/system/dev-sdr-<dev>.device.wants/ itself).
+
+2. Registration (optional but recommended): /usr/lib/sdr-mode/rtl.d/<name>.conf
+   (or lime.d; /etc/sdr-mode/<dev>.d/ for local additions), plain KEY=value:
+
+     UNIT=sdr-adsb.service
+     DESCRIPTION="ADS-B: dump1090-fa + tar1090 map"
+     PORTS="http/8504 map, tcp/30005 Beast"
+
+   Registered units show up in `sdr-mode list`/`status`, can be selected by
+   <name> and are always stopped + disabled when another mode takes the
+   device. Without registration the unit can still be selected by its unit
+   name (`sdr-mode rtl foo.service`); sdr-mode then only remembers the last
+   such unit.
+
+3. Asking sdr-mode (no root needed)
+
+     sdr-mode get rtl      selected mode (rtl_tcp, sdrpp, openwebrx, soapy-remote, off, <name>)
+     sdr-mode owner rtl    systemd unit that owns the device ("" for off)
+     sdr-mode status       human readable
+
+   State: /var/lib/sdr-mode/<dev> (mode), /var/lib/sdr-mode/<dev>.unit (applied unit).
+   A tool that needs a device temporarily should stop the owner unit, do its
+   work and start the owner again (not change the mode).

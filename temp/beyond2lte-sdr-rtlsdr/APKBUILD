@@ -1,0 +1,23 @@
+# Contributor: StachowiakDawid
+pkgname=beyond2lte-sdr-rtlsdr
+pkgver=1
+pkgrel=0
+pkgdesc="RTL-SDR support for the beyond2lte SoapySDR network server"
+url="https://postmarketos.org"
+arch="noarch"
+license="MIT"
+depends="soapy-sdr-module-rtlsdr librtlsdr rtl-sdr"
+install_if="beyond2lte-sdr-server soapy-sdr-module-rtlsdr"
+source="60-beyond2lte-rtlsdr.rules rtlsdr-blacklist.conf"
+options="!check"
+
+package() {
+	install -Dm644 "$srcdir"/60-beyond2lte-rtlsdr.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/60-beyond2lte-rtlsdr.rules
+	install -Dm644 "$srcdir"/rtlsdr-blacklist.conf \
+		"$pkgdir"/usr/lib/modprobe.d/beyond2lte-rtlsdr.conf
+}
+sha512sums="
+422504f2ef662f5c3cc8883b40215592748fd421ea1e8c87e1e2bf62ff35c0b4d8d00803085cc816931bb1cd0fe19c1cb0c641269384115bbf61a7274eac1dce  60-beyond2lte-rtlsdr.rules
+3f9c3e40bafd4d650a1cc322f7095fbb3ce03617a5a83687130dbecf3dd5c9bfaafc68d5c51e7bf1dbec0dabf990095c25b79d90c496982018dcb23f1df76d2f  rtlsdr-blacklist.conf
+"

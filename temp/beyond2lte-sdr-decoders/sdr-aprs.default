@@ -1,0 +1,32 @@
+# /etc/default/sdr-aprs - APRS receiver (rtl_fm | direwolf), read by
+# sdr-aprs.service. Apply with: systemctl restart sdr-aprs
+
+# RTL-SDR to use: index (0) or serial.
+APRS_DEVICE=0
+# APRS frequency: 144.800M Europe (IARU R1), 144.390M North America,
+# 145.175M Australia, 144.640M Japan/China.
+APRS_FREQ=144.800M
+# Tuner gain in dB; empty = auto (AGC). A fixed gain (e.g. 40) usually decodes better.
+APRS_GAIN=
+APRS_PPM=0
+# Callsign-SSID for direwolf. N0CALL is fine for receive-only use on the LAN;
+# a real callsign is mandatory for the IGate below.
+APRS_MYCALL=N0CALL
+# KISS-over-TCP (8001) and AGWPE (8000) servers for clients on the LAN
+# (Xastir, YAAC, APRSIS32, aprx...). 0 disables a port.
+APRS_KISS_PORT=8001
+APRS_AGW_PORT=8000
+# Receive-only IGate to APRS-IS - OFF unless all three are set. Needs a ham
+# licence, your callsign in APRS_MYCALL and the matching passcode.
+#   APRS_IGATE_SERVER=euro.aprs2.net
+#   APRS_IGATE_PASSCODE=12345
+#   APRS_IGATE_FILTER="m/50"        (optional server-side filter)
+APRS_IGATE_SERVER=
+APRS_IGATE_PASSCODE=
+APRS_IGATE_FILTER=
+# Daily CSV logs of decoded packets in /var/lib/sdr-decoders/aprs (removed
+# after 90 days by tmpfiles). "no" = journal only.
+APRS_LOG=yes
+# Use your own complete direwolf.conf instead of the generated one
+# (must contain "ADEVICE stdin null").
+APRS_DIREWOLF_CONF=

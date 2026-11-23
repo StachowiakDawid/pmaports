@@ -1,0 +1,27 @@
+# beyond2lte-sdr-services: stable names + systemd device units for the SDRs.
+#
+#   /dev/sdr/lime -> LimeSDR Mini / Mini 2.0 (FT601 0403:601f), LimeSDR-USB (1d50:6108)
+#   /dev/sdr/rtl  -> RTL2832U dongle (0bda:2838, 0bda:2832)
+#
+# TAG+="systemd" makes systemd track the device as dev-sdr-lime.device /
+# dev-sdr-rtl.device. Services that own a device use BindsTo=/After= on that
+# unit (stopped on unplug) and [Install] WantedBy= it (started on plug).
+# Which service is enabled is decided by sdr-mode(8).
+#
+# Permissions (group sdr, mode 0660, no autosuspend) are set by
+# 60-beyond2lte-limesdr.rules and 60-beyond2lte-rtlsdr.rules.
+#
+# The tag has to be present on every event (systemd treats a device whose
+# latest event lacks the tag as unplugged), hence ACTION!="remove" and not
+# just "add". One device of each kind is assumed: with two RTL dongles the
+# symlink points at the one probed last.
+ACTION=="remove", GOTO="sdr_mode_end"
+SUBSYSTEM!="usb", GOTO="sdr_mode_end"
+ENV{DEVTYPE}!="usb_device", GOTO="sdr_mode_end"
+
+ATTR{idVendor}=="0403", ATTR{idProduct}=="601f", SYMLINK+="sdr/lime", TAG+="systemd"
+ATTR{idVendor}=="1d50", ATTR{idProduct}=="6108", SYMLINK+="sdr/lime", TAG+="systemd"
+ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", SYMLINK+="sdr/rtl", TAG+="systemd"
+ATTR{idVendor}=="0bda", ATTR{idProduct}=="2832", SYMLINK+="sdr/rtl", TAG+="systemd"
+
+LABEL="sdr_mode_end"

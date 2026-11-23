@@ -1,0 +1,69 @@
+[Unit]
+Description=SoapySDR network server (SoapyRemote) for LimeSDR
+Documentation=man:SoapySDRServer(1) https://github.com/pothosware/SoapyRemote/wiki
+Wants=network-online.target
+After=network-online.target
+# keep retrying forever (24/7 headless server)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=soapysdr
+Group=sdr
+EnvironmentFile=-/etc/default/beyond2lte-sdr-server
+Environment=SDR_BIND=0.0.0.0
+Environment=HOME=/var/lib/soapysdr
+# 8 x 4 KiB packets per USB transfer (needs limesuiteng >= 25.1.0-r1):
+# ~5x less CPU, no sample loss at 10 MS/s on USB 2.0 HS. A client stream arg
+# packetsInBatch=N overrides it.
+Environment=LIMESUITENG_PACKETS_IN_BATCH=8
+ExecStart=/usr/bin/SoapySDRServer --bind=${SDR_BIND}
+# SoapySDRServer forks no children; stop it with SIGINT like Ctrl-C (clean
+# device close), escalate after 10 s.
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=always
+RestartSec=3
+
+# Performance: run on the big M4 cluster, allow SCHED_RR stream threads
+# (SoapyRemote raises its stream thread priority, remote:priority=0.5).
+CPUAffinity=6 7
+Nice=-5
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+# Hardening
+StateDirectory=soapysdr
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# USB device nodes only (/dev/bus/usb/*, major 189); no other devices.
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+# AF_NETLINK: libusb hotplug (udev monitor); AF_UNIX: logging/udev
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# realtime scheduling is wanted here
+RestrictRealtime=no
+
+[Install]
+WantedBy=multi-user.target

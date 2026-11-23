@@ -1,0 +1,52 @@
+#!/usr/sbin/nft -f
+# beyond2lte-sdr-server: open SoapyRemote (SoapySDRServer) ports.
+#
+# From the SoapyRemote 0.5.4 sources:
+#  - RPC/control: TCP 55132 (SOAPY_REMOTE_DEFAULT_SERVICE, server/SoapyServer.cpp)
+#  - SSDP discovery: UDP 1900, multicast 239.255.255.250 / ff02::c
+#    (common/SoapySSDPEndpoint.cpp); replies go back from port 1900
+#  - mDNS/DNS-SD (UDP 5353) is NOT used: soapy-sdr-remote is built without
+#    avahi (see its APKBUILD); install postmarketos-config-nftables-mdns if wanted
+#  - streams: per stream the server binds an *ephemeral* port (bind ":0",
+#    server/ClientHandler.cpp setupStream). In the default UDP mode the client
+#    sends the first datagram (flow-control ACK announcing its window,
+#    SoapyStreamEndpoint ctor) and for TX all sample data to that port, so it
+#    is NEW traffic for conntrack. With remote:prot=tcp the client connects to
+#    an ephemeral TCP listen port. There is no fixed port range option, so we
+#    accept the kernel's ephemeral range (net.ipv4.ip_local_port_range,
+#    default 32768-60999) but only from private/link-local source addresses.
+
+table inet filter {
+	set soapy_lan4 {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }
+	}
+	set soapy_lan6 {
+		type ipv6_addr
+		flags interval
+		elements = { fc00::/7, fe80::/10 }
+	}
+
+	# Verified on the phone over Wi-Fi with a macOS
+	# SoapyRemote 0.5.3 client): these rules are sufficient for UDP and TCP
+	# streams; a catch-all log rule after them saw no stream packets. Note
+	# that the "[ERROR] No samples or timeout" lines a client prints at
+	# stream start/stop are NOT a firewall symptom: they are forwarded from
+	# the LimeSuiteNG plugin. A 16 KiB client window (macOS default) only
+	# gives ~0.5 MS/s, which looks like a blocked stream but is not. The
+	# counters below show whether stream packets arrive:
+	#   nft list chain inet filter input | grep SoapyRemote
+	chain input {
+		tcp dport 55132 counter accept comment "SoapyRemote RPC"
+
+		udp dport 1900 ip daddr 239.255.255.250 accept comment "SoapyRemote SSDP M-SEARCH/NOTIFY"
+		udp dport 1900 ip6 daddr ff02::c accept comment "SoapyRemote SSDP M-SEARCH/NOTIFY (v6)"
+		udp sport 1900 accept comment "SSDP replies"
+
+		ip saddr @soapy_lan4 udp dport 32768-60999 counter accept comment "SoapyRemote UDP stream sockets"
+		ip6 saddr @soapy_lan6 udp dport 32768-60999 counter accept comment "SoapyRemote UDP stream sockets (v6)"
+		ip saddr @soapy_lan4 tcp dport 32768-60999 counter accept comment "SoapyRemote TCP streams (remote:prot=tcp)"
+		ip6 saddr @soapy_lan6 tcp dport 32768-60999 counter accept comment "SoapyRemote TCP streams (v6)"
+	}
+}

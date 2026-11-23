@@ -1,0 +1,3 @@
+# libusb bulk transfers for >30 MS/s need more than the default 16 MiB of usbfs
+# buffer memory (LimeSuiteNG queues many large transfers). 0 = unlimited.
+w /sys/module/usbcore/parameters/usbfs_memory_mb - - - - 256

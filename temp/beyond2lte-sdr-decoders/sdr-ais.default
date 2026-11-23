@@ -1,0 +1,30 @@
+# /etc/default/sdr-ais - AIS ship receiver (AIS-catcher), read by
+# sdr-ais.service. Apply with: systemctl restart sdr-ais
+# Receives both AIS channels (161.975 + 162.025 MHz) at once.
+
+# RTL-SDR to use: index (0) or serial number.
+AIS_DEVICE=0
+# Tuner gain in dB or "auto".
+AIS_GAIN=auto
+AIS_PPM=0
+# Web UI (map, ship list, statistics): http://<phone>:8100/ ; empty = off.
+AIS_WEB_PORT=8100
+# Station name and position shown in the web UI (position enables distances/range plot).
+AIS_STATION="beyond2lte"
+AIS_LAT=
+AIS_LON=
+# Forward NMEA (AIVDM) over UDP to a chart plotter / OpenCPN / aggregator:
+# "host port" pairs, several separated by ";". Empty = none.
+#   AIS_UDP="192.168.0.10 10110"
+AIS_UDP=
+# NMEA TCP server on the phone for LAN clients (OpenCPN "network" connection);
+# empty = off. The nftables rules open 10110 for LAN sources.
+AIS_TCP_PORT=
+# Extra AIS-catcher arguments (see `AIS-catcher -h`). Sharing with
+# aiscatcher.org ("-X") or other aggregators is NOT enabled by default.
+# Different input (replaces the RTL-SDR options above), see `AIS-catcher -h`,
+# e.g. another rtl_tcp server: AIS_INPUT_ARGS="-t 192.168.0.10 1234".
+AIS_INPUT_ARGS="-t SOAPYSDR -gs DEVICE driver=limesuiteng"
+# and replace the unit's Conflicts= (see NOTES / systemctl edit sdr-ais).
+AIS_INPUT_ARGS=
+AIS_EXTRA_ARGS=

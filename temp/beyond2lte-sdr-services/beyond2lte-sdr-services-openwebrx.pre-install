@@ -1,0 +1,6 @@
+#!/bin/sh
+addgroup -S sdr 2>/dev/null
+addgroup -S openwebrx 2>/dev/null
+adduser -S -D -H -h /var/lib/openwebrx -s /sbin/nologin -G openwebrx -g "OpenWebRX" openwebrx 2>/dev/null
+addgroup openwebrx sdr 2>/dev/null
+exit 0

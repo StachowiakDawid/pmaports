@@ -1,0 +1,10 @@
+# beyond2lte-sdr-server: Wi-Fi power save off only while an SDR radio is plugged in (SoapyRemote
+# flow-control ACKs and RPC calls are delayed by brcmfmac PS wakeups; power save costs ~40 mA when
+# off, so it is no longer disabled globally). Same IDs as the /dev/sdr/* symlinks.
+ACTION!="add", GOTO="beyond2lte_sdr_wifi_ps_end"
+SUBSYSTEM!="usb", GOTO="beyond2lte_sdr_wifi_ps_end"
+ENV{DEVTYPE}!="usb_device", GOTO="beyond2lte_sdr_wifi_ps_end"
+ATTR{idVendor}=="0403", ATTR{idProduct}=="601f", TAG+="systemd", ENV{SYSTEMD_WANTS}+="beyond2lte-sdr-wifi-ps@lime.service"
+ATTR{idVendor}=="1d50", ATTR{idProduct}=="6108", TAG+="systemd", ENV{SYSTEMD_WANTS}+="beyond2lte-sdr-wifi-ps@lime.service"
+ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838|2832", TAG+="systemd", ENV{SYSTEMD_WANTS}+="beyond2lte-sdr-wifi-ps@rtl.service"
+LABEL="beyond2lte_sdr_wifi_ps_end"

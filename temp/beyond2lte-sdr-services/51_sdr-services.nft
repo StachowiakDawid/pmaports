@@ -1,0 +1,40 @@
+#!/usr/sbin/nft -f
+# beyond2lte-sdr-services: open the SDR streaming servers to the LAN only
+# (private / link-local source addresses), same style as 50_soapyremote.nft.
+#
+#   TCP 1234  rtl_tcp                    (rtl-tcp.service)
+#   TCP 5259  SDR++ server, LimeSDR      (sdrpp-server-lime.service)
+#   TCP 5260  SDR++ server, RTL-SDR      (sdrpp-server-rtl.service)
+#   TCP 8073  OpenWebRX+ web UI          (openwebrx.service)
+#
+# All four protocols are a single client-initiated TCP connection (control and
+# samples on the same socket), so no extra stream ports are needed. A port
+# whose service is not running simply refuses the connection.
+# Counters: nft list chain inet filter input | grep -E 'rtl_tcp|SDR\+\+|OpenWebRX'
+# If you change a port in /etc/default/rtl-tcp, /etc/default/sdrpp-server or
+# /etc/openwebrx/openwebrx.conf, change it here too (this file is a conffile
+# and survives upgrades).
+
+table inet filter {
+	set sdrsvc_lan4 {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }
+	}
+	set sdrsvc_lan6 {
+		type ipv6_addr
+		flags interval
+		elements = { fc00::/7, fe80::/10 }
+	}
+
+	chain input {
+		ip saddr @sdrsvc_lan4 tcp dport 1234 counter accept comment "rtl_tcp"
+		ip6 saddr @sdrsvc_lan6 tcp dport 1234 counter accept comment "rtl_tcp (v6)"
+
+		ip saddr @sdrsvc_lan4 tcp dport { 5259, 5260 } counter accept comment "SDR++ server (5259 LimeSDR, 5260 RTL-SDR)"
+		ip6 saddr @sdrsvc_lan6 tcp dport { 5259, 5260 } counter accept comment "SDR++ server (v6)"
+
+		ip saddr @sdrsvc_lan4 tcp dport 8073 counter accept comment "OpenWebRX+ web UI"
+		ip6 saddr @sdrsvc_lan6 tcp dport 8073 counter accept comment "OpenWebRX+ web UI (v6)"
+	}
+}

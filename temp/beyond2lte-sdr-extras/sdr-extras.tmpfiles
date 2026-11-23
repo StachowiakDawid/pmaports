@@ -1,0 +1,2 @@
+# beyond2lte-sdr-extras-record: recording directory
+d /var/lib/sdr-record 0750 sdrrec sdr -

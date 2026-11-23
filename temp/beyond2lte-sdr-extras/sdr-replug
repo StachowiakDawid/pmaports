@@ -1,0 +1,54 @@
+#!/bin/sh
+# sdr-replug rtlsdr|limesdr - an SDR (re)appeared on USB (udev rule
+# 61-sdr-selfheal.rules -> sdr-replug@<kind>.service).
+#
+# Dedicated services (rtl-tcp, sdrpp-server-*, sdr-adsb, ...) are bound to
+# dev-sdr-<dev>.device by the sdr-mode contract: systemd stops them on unplug
+# and starts the enabled one on plug - nothing to do here. The shared servers
+# (SoapySDRServer, OpenWebRX) are not bound to a device, so the one that owns
+# the re-enumerated SDR is restarted here to drop stale USB handles/streams.
+REPLUG_SHARED_UNITS="beyond2lte-sdr-server openwebrx"
+REPLUG_MIN_UPTIME=90
+[ -r /etc/default/sdr-selfheal ] && . /etc/default/sdr-selfheal
+
+kind=${1:-}
+case "$kind" in
+rtlsdr) dev=rtl ;;
+limesdr) dev=lime ;;
+*) echo "usage: sdr-replug rtlsdr|limesdr" >&2; exit 2 ;;
+esac
+
+up=$(cut -d. -f1 /proc/uptime)
+if [ "$up" -lt "$REPLUG_MIN_UPTIME" ]; then
+	echo "$kind appeared ${up}s after boot (cold-plug) - nothing to do"
+	exit 0
+fi
+# let udev finish (permissions) and a flapping link settle
+sleep 3
+
+owner=
+if command -v sdr-mode >/dev/null 2>&1; then
+	owner=$(sdr-mode owner "$dev" 2>/dev/null)
+	have_mode=1
+fi
+done_any=
+for u in $REPLUG_SHARED_UNITS; do
+	case "$u" in *.*) ;; *) u=$u.service ;; esac
+	# with sdr-mode: only the unit that owns this device
+	[ -n "${have_mode:-}" ] && [ "$u" != "$owner" ] && continue
+	case "$(systemctl show -p BindsTo --value "$u" 2>/dev/null)" in
+	*dev-sdr-$dev.device*) continue ;;	# systemd handles it
+	esac
+	st=$(systemctl is-active "$u" 2>/dev/null)
+	case "$st" in
+	active|activating)
+		echo "$kind re-enumerated: restarting $u (was $st)"
+		systemctl restart --no-block "$u"
+		done_any=1
+		;;
+	esac
+done
+[ -n "$done_any" ] || echo "$kind re-enumerated: owner '${owner:-none}' needs no restart from here"
+[ "$dev" = lime ] && [ -x /usr/libexec/sdr-selfheal/sdr-usb-check ] && \
+	systemctl start --no-block sdr-usb-check.service 2>/dev/null
+exit 0

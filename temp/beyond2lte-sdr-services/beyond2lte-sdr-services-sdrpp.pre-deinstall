@@ -1,0 +1,14 @@
+#!/bin/sh
+# A device that is in mode "sdrpp" goes back to its default owner before the
+# units disappear (lime: soapy-remote, rtl: rtl_tcp); then stop + disable ours.
+[ -d /run/systemd/system ] || exit 0
+changed=0
+for dev in lime rtl; do
+	if [ "$(cat /var/lib/sdr-mode/$dev 2>/dev/null)" = sdrpp ]; then
+		rm -f /var/lib/sdr-mode/$dev
+		changed=1
+	fi
+done
+[ $changed = 1 ] && [ -x /usr/bin/sdr-mode ] && /usr/bin/sdr-mode -q apply 2>/dev/null
+systemctl disable --now --quiet sdrpp-server-lime.service sdrpp-server-rtl.service 2>/dev/null
+exit 0

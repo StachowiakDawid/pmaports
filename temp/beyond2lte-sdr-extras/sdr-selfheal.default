@@ -1,0 +1,39 @@
+# /etc/default/sdr-selfheal - self-healing helpers of beyond2lte-sdr-extras-selfheal
+# (sdr-wifi-watchdog.service, sdr-usb-check.timer, sdr-replug@.service).
+
+## Wi-Fi watchdog (sdr-wifi-watchdog.service) -------------------------------
+# Interface to watch; empty = the first Wi-Fi interface found.
+WIFI_WATCHDOG_IFACE=
+# Probe interval in seconds (one ping to the default gateway; ARP fallback).
+WIFI_WATCHDOG_INTERVAL=30
+# Gateway unreachable for this many minutes -> step 1: reconnect the interface
+# (nmcli device connect). Still down after twice that -> step 2: restart
+# NetworkManager. Afterwards steps 1/2 repeat every WIFI_WATCHDOG_RETRY_MIN.
+WIFI_WATCHDOG_FAIL_MIN=3
+WIFI_WATCHDOG_RETRY_MIN=10
+# Reboot as a last resort. OFF by default: the watchdog never reboots unless
+# this is "yes". Then: reboot after WIFI_WATCHDOG_REBOOT_AFTER_MIN minutes
+# without the gateway, at most WIFI_WATCHDOG_REBOOT_MAX times in a row (the
+# counter resets when the network is back) so a dead access point cannot
+# cause a reboot loop.
+WIFI_WATCHDOG_REBOOT=no
+WIFI_WATCHDOG_REBOOT_AFTER_MIN=30
+WIFI_WATCHDOG_REBOOT_MAX=2
+
+## SDR re-enumeration (udev -> sdr-replug@rtlsdr / sdr-replug@limesdr) --------
+# Dedicated services (rtl-tcp, sdrpp-server-*, the sdr-* decoders) are bound to
+# the device unit and are stopped/started by systemd itself on unplug/plug.
+# The shared servers below are not: the one that owns the re-enumerated SDR
+# (per `sdr-mode owner`) is restarted if it is running. Empty = never.
+REPLUG_SHARED_UNITS="beyond2lte-sdr-server openwebrx"
+# Ignore hotplug events during the first seconds after boot (cold-plug).
+REPLUG_MIN_UPTIME=90
+
+## LimeSDR USB speed check (sdr-usb-check.timer, every 5 min) ------------------
+# Expected speed in Mbit/s (5000 = USB3 SuperSpeed). A lower speed is logged as
+# a warning (journal, tag sdr-usb-check) once per change and repeated every
+# USB_CHECK_REPEAT_MIN minutes while it lasts.
+USB_CHECK_LIME_SPEED=5000
+USB_CHECK_REPEAT_MIN=360
+# "yes": also warn when no LimeSDR is on the bus at all.
+USB_CHECK_EXPECT_LIME=yes

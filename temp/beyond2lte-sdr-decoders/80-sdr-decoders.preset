@@ -1,0 +1,7 @@
+# beyond2lte-sdr-decoders: nothing starts by itself - the decoders share one
+# RTL-SDR and are selected with `sdr-mode rtl <adsb|rtl433|aprs|pocsag|ais>`.
+disable sdr-adsb.service
+disable sdr-rtl433.service
+disable sdr-aprs.service
+disable sdr-pocsag.service
+disable sdr-ais.service

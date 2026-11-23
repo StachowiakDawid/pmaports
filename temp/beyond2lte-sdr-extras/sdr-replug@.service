@@ -1,0 +1,14 @@
+[Unit]
+Description=Restart SDR services after %i re-enumerated on USB
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/sdr-selfheal/sdr-replug %i
+SyslogIdentifier=sdr-replug
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+CapabilityBoundingSet=

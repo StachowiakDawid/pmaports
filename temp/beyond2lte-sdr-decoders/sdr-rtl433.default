@@ -1,0 +1,26 @@
+# /etc/default/sdr-rtl433 - ISM band sensor decoder (rtl_433), read by
+# sdr-rtl433.service. Apply with: systemctl restart sdr-rtl433
+
+# RTL-SDR to use: index (0) or ":serial".
+RTL433_DEVICE=0
+# Frequency. Europe: 433.92M (default) or 868.3M (set RTL433_RATE=1000k for 868).
+# Several frequencies = hopping: "433.92M 868.3M" with RTL433_HOP=60 (seconds).
+RTL433_FREQ=433.92M
+RTL433_HOP=
+# Sample rate; empty = rtl_433 default (250k).
+RTL433_RATE=
+# Tuner gain in dB; empty = auto.
+RTL433_GAIN=
+RTL433_PPM=0
+# Built-in HTTP server: web UI at http://<phone>:8433/ , JSON event stream at
+# /events (chunked) and /stream, WebSocket at /ws. Empty = no HTTP server.
+RTL433_HTTP=0.0.0.0:8433
+# MQTT output (optional), e.g.
+#   RTL433_MQTT="mqtt://192.168.0.10:1883,retain=0,devices=rtl_433[/model][/id]"
+# user/password: add user=..,pass=.. or set MQTT_USERNAME / MQTT_PASSWORD here.
+RTL433_MQTT=
+# Decoded events as JSON lines in the journal (journalctl -u sdr-rtl433 -o cat).
+RTL433_JOURNAL_JSON=yes
+# Extra arguments, e.g. "-R 12 -R 19" (only these protocols), "-C si" (SI units),
+# "-c /etc/rtl_433/my.conf".
+RTL433_EXTRA_ARGS="-C si"

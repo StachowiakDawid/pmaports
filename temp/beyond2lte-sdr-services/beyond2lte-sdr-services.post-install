@@ -1,0 +1,9 @@
+#!/bin/sh
+cat <<MSG
+beyond2lte-sdr-services installed. Nothing was started or enabled. Next:
+  sudo udevadm control --reload && sudo udevadm trigger -s usb
+  sudo systemctl daemon-reload && sudo systemctl restart nftables
+  sudo sdr-mode apply        # defaults: lime = soapy-remote, rtl = rtl_tcp
+  sdr-mode status; sdr-mode help
+MSG
+exit 0

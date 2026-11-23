@@ -1,0 +1,17 @@
+# sdr-record@PROFILE.timer starts sdr-record@PROFILE.service.
+# Default: every day at 03:00 local time. Per-profile schedule:
+#   systemctl edit sdr-record@PROFILE.timer
+#     [Timer]
+#     OnCalendar=
+#     OnCalendar=Mon..Fri 18:30
+# Check with: systemd-analyze calendar "Mon..Fri 18:30"; systemctl list-timers
+[Unit]
+Description=Scheduled SDR recording (profile %i)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+AccuracySec=1s
+Persistent=no
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,109 @@
+# Contributor: StachowiakDawid
+# SDR streaming services for the Galaxy S10+ (beyond2lte) SDR server and the
+# sdr-mode arbitration tool.
+pkgname=beyond2lte-sdr-services
+pkgver=1
+pkgrel=0
+pkgdesc="rtl_tcp service and sdr-mode (which service owns which SDR) for beyond2lte"
+url="https://postmarketos.org"
+arch="noarch"
+license="MIT"
+depends="
+	beyond2lte-sdr-rtlsdr
+	beyond2lte-sdr-server
+	rtl-sdr
+	"
+install="
+	$pkgname.pre-install
+	$pkgname.post-install
+	$pkgname.pre-deinstall
+	$pkgname-openwebrx.pre-install
+	$pkgname-openwebrx.post-install
+	$pkgname-openwebrx.pre-deinstall
+	$pkgname-sdrpp.pre-deinstall
+	"
+subpackages="
+	$pkgname-sdrpp:_sdrpp:noarch
+	$pkgname-openwebrx:_openwebrx:noarch
+	$pkgname-nftables:_nftables:noarch
+	"
+source="
+	sdr-mode.sh
+	sdr-mode.README
+	61-beyond2lte-sdr-mode.rules
+	beyond2lte-sdr-services.tmpfiles
+	rtl-tcp.service
+	rtl-tcp.conf
+	sdrpp-server-lime.service
+	sdrpp-server-rtl.service
+	sdrpp-server.conf
+	sdrpp-server.sh
+	openwebrx.service
+	openwebrx.conf
+	openwebrx-prepare.sh
+	openwebrx-own.py
+	openwebrx-settings.json
+	51_sdr-services.nft
+	"
+options="!check" # no tests
+
+package() {
+	install -Dm755 "$srcdir"/sdr-mode.sh "$pkgdir"/usr/bin/sdr-mode
+	install -Dm644 "$srcdir"/61-beyond2lte-sdr-mode.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/61-beyond2lte-sdr-mode.rules
+	install -Dm644 "$srcdir"/beyond2lte-sdr-services.tmpfiles \
+		"$pkgdir"/usr/lib/tmpfiles.d/beyond2lte-sdr-services.conf
+	install -Dm644 "$srcdir"/rtl-tcp.service \
+		"$pkgdir"/usr/lib/systemd/system/rtl-tcp.service
+	install -Dm644 "$srcdir"/rtl-tcp.conf "$pkgdir"/etc/default/rtl-tcp
+	# other packages register their units in rtl.d/ and lime.d/ (hook contract)
+	install -Dm644 "$srcdir"/sdr-mode.README "$pkgdir"/usr/lib/sdr-mode/README
+	install -dm755 "$pkgdir"/usr/lib/sdr-mode/rtl.d "$pkgdir"/usr/lib/sdr-mode/lime.d
+}
+
+_sdrpp() {
+	pkgdesc="SDR++ server services (LimeSDR on TCP 5259, RTL-SDR on TCP 5260) for sdr-mode"
+	depends="$pkgname=$pkgver-r$pkgrel sdrpp soapy-sdr-module-limesuiteng soapy-sdr-module-rtlsdr"
+	install -Dm644 "$srcdir"/sdrpp-server-lime.service "$srcdir"/sdrpp-server-rtl.service \
+		-t "$subpkgdir"/usr/lib/systemd/system/
+	install -Dm755 "$srcdir"/sdrpp-server.sh "$subpkgdir"/usr/libexec/sdr-mode/sdrpp-server
+	install -Dm644 "$srcdir"/sdrpp-server.conf "$subpkgdir"/etc/default/sdrpp-server
+}
+
+_openwebrx() {
+	pkgdesc="OpenWebRX+ service (HTTP 8073, LimeSDR + RTL-SDR receiver setup) for sdr-mode"
+	depends="$pkgname=$pkgver-r$pkgrel openwebrx python3 soapy-sdr-module-limesuiteng"
+	install -Dm644 "$srcdir"/openwebrx.service \
+		"$subpkgdir"/usr/lib/systemd/system/openwebrx.service
+	install -Dm755 "$srcdir"/openwebrx-prepare.sh "$subpkgdir"/usr/libexec/sdr-mode/openwebrx-prepare
+	install -Dm755 "$srcdir"/openwebrx-own.py "$subpkgdir"/usr/libexec/sdr-mode/openwebrx-own
+	install -Dm644 "$srcdir"/openwebrx-settings.json \
+		"$subpkgdir"/usr/share/sdr-mode/openwebrx-settings.json
+	install -Dm644 "$srcdir"/openwebrx.conf "$subpkgdir"/etc/default/openwebrx
+}
+
+_nftables() {
+	pkgdesc="nftables rules: rtl_tcp 1234, SDR++ server 5259/5260, OpenWebRX 8073 from the LAN only"
+	depends=""
+	install_if="$pkgname=$pkgver-r$pkgrel nftables"
+	install -Dm644 "$srcdir"/51_sdr-services.nft \
+		"$subpkgdir"/etc/nftables.d/51_sdr-services.nft
+}
+sha512sums="
+5e302ad750135402152f4ae7e2a5fd826a485322c9e6c2d00ac29f1ce839ba3499460b17563113c43ae11694f8aeb87e73ccb21d24a887c90a8b1ad2963be622  sdr-mode.sh
+3d1825a56f426c7ac0fa5cc4525110f40f4e14278b606507ce9ed92c79e2839c91f3d53cfc1b52b4a606cf2160dead7133316120244636f386331806458fe480  sdr-mode.README
+99cfeb7ac6b5600eea1aad43f7da3f25c4ae4b53163a8769357be2b501f0bdcbe7d34efc7f478eff05ba2e74f600f6fe78150456d51daf591878b3ee8791bf63  61-beyond2lte-sdr-mode.rules
+641a4ea2d6b0a71cbbaac065788eb9e3925b3ca920d726cec93fc5efcfb7e5466065d4539d28ff0e68110e9624607fccf0db0491d77bf6556e4656bf76e2b86e  beyond2lte-sdr-services.tmpfiles
+2edbb7e8a047471480827563096d53ad3e94e7dedc234b015bd8c954af1eedda91ed99032f456270b428c1df4aff07c4ef6ff2372c534b4866e96b551c79765a  rtl-tcp.service
+8c10169ecf0700e6939713a3960c3e102fbea8c5d7decf0f770cee4475f67aa8b958df58994ec9901a360d39d57c2cde84d2bb9399c69751fa96c2e0bd2a347f  rtl-tcp.conf
+23031550778fef04ae6260058a3789340f83d3bccd87cb1b5431e6066de9adc2560354152971711430cbfb5c6db77362604ed417fb5e9b86f114de2cb7671b81  sdrpp-server-lime.service
+402d2532529b258a752935a412cde117d58b0be02866a1b9dd0ab37e5ad00b53f2ebe904bc9c5e6b2e164656454c83cf4d7917f54a7d92774fe27003f19d857f  sdrpp-server-rtl.service
+606955a7a8b0a3aae527ecf9b59e3721c62b094322f3d3fef0e4b353256e2c3baf8e6f79ae5466cb273220597188be5fb9df436258bb5381ecbe3a587866e8ed  sdrpp-server.conf
+21acc6c27e3ee0c6a62737a82b73be304dcc476bd8573c8ef17b868e5fb7db7fd0d2ad1e7f1b4abe85ff92339ae27c4b7cc8a14f5a2c1a3c202d1fd806318d0a  sdrpp-server.sh
+ca691f99cf874ceb4bd6d6625f2857bad75d2688e708fd289be0cc617ee5fa8f1d953b393e18875528b7b8e8a24ac6bb8cba5883791b0c6dd1344f7473fdc0b1  openwebrx.service
+bb83017bafc393b7e89288772938f2b792b2fb38242a6fdee3d37d968d8ba1c8715e7593bed32046bdb24dc6cbbc59a50ee35327d465c433f2833ad1aaa7e8cc  openwebrx.conf
+7137e4acfbb62840e37d98d8da395460c80801fb1dc194859873c081ab5881dd34649e43054e22e435750f36d9ce07d465292cc1114aef3ad99ddb3ac319ba86  openwebrx-prepare.sh
+7eb27d68033e752af9cddce6a6606b1f4a8138a48545049ae8cc050b41631388b2a9b8126faaf01da86d3a097bcd9f1d19367ad90a3b8bae3cc057f2436fdbcf  openwebrx-own.py
+2728ea6deaa3d9dd36d6e6ec90fb3c349062f9359e23a0f9eae3cb7697a2320c27f782a06152e745811089fb66cb44145bef83be9326e4285360e690f155b2f5  openwebrx-settings.json
+976bd0cdefd233cdfdb4d73aa8a8825f52399a740ce2f8225abc6e30c44d3488c1ed86f52b5dca6ccfbe955a79859c1919ea9501033f463c61136a5ddba24581  51_sdr-services.nft
+"

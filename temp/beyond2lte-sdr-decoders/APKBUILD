@@ -1,0 +1,125 @@
+# Contributor: StachowiakDawid
+# On-device SDR decoders for the beyond2lte SDR server: systemd services,
+# /etc/default configuration and LAN-only firewall rules. One subpackage per
+# decoder so only what is used gets installed; -all pulls everything.
+pkgname=beyond2lte-sdr-decoders
+pkgver=1
+pkgrel=0
+pkgdesc="SDR decoder services for beyond2lte (common files: user, state dir, presets)"
+url="https://postmarketos.org"
+arch="noarch"
+license="MIT"
+# beyond2lte-sdr-services: sdr-mode + the dev-sdr-rtl.device udev rule the units bind to
+depends="rtl-sdr beyond2lte-sdr-rtlsdr beyond2lte-sdr-services"
+install="$pkgname.pre-install"
+subpackages="
+	$pkgname-adsb
+	$pkgname-rtl433
+	$pkgname-aprs
+	$pkgname-pocsag
+	$pkgname-ais
+	$pkgname-all:_all
+	$pkgname-nftables:nftrules
+	"
+source="
+	sdr-adsb sdr-adsb.service sdr-adsb.default sdr-mode-adsb.conf sdr-adsb-feed.service.example
+	sdr-rtl433 sdr-rtl433.service sdr-rtl433.default sdr-mode-rtl433.conf
+	sdr-aprs sdr-aprs.service sdr-aprs.default sdr-mode-aprs.conf
+	sdr-pocsag sdr-pocsag.service sdr-pocsag.default sdr-mode-pocsag.conf
+	sdr-ais sdr-ais.service sdr-ais.default sdr-mode-ais.conf
+	sdr-decoders.tmpfiles
+	80-sdr-decoders.preset
+	50_sdr-decoders.nft
+	"
+options="!check" # no tests
+
+package() {
+	install -Dm644 "$srcdir"/sdr-decoders.tmpfiles \
+		"$pkgdir"/usr/lib/tmpfiles.d/sdr-decoders.conf
+	install -Dm644 "$srcdir"/80-sdr-decoders.preset \
+		"$pkgdir"/usr/lib/systemd/system-preset/80-sdr-decoders.preset
+}
+
+_decoder() {
+	local name="$1"
+	install -Dm755 "$srcdir"/sdr-$name "$subpkgdir"/usr/libexec/sdr-decoders/sdr-$name
+	install -Dm644 "$srcdir"/sdr-$name.service \
+		"$subpkgdir"/usr/lib/systemd/system/sdr-$name.service
+	install -Dm644 "$srcdir"/sdr-$name.default "$subpkgdir"/etc/default/sdr-$name
+	# sdr-mode registry (hook contract of beyond2lte-sdr-services): `sdr-mode rtl $name`
+	install -Dm644 "$srcdir"/sdr-mode-$name.conf "$subpkgdir"/usr/lib/sdr-mode/rtl.d/$name.conf
+}
+
+adsb() {
+	pkgdesc="ADS-B: dump1090-fa service + tar1090 web map (port 8504)"
+	depends="$pkgname=$pkgver-r$pkgrel dump1090 tar1090"
+	_decoder adsb
+	install -Dm644 "$srcdir"/sdr-adsb-feed.service.example \
+		"$subpkgdir"/usr/share/$pkgname/sdr-adsb-feed.service.example
+}
+
+rtl433() {
+	pkgdesc="ISM sensors: rtl_433 service with HTTP/JSON output (port 8433), optional MQTT"
+	depends="$pkgname=$pkgver-r$pkgrel rtl_433"
+	_decoder rtl433
+}
+
+aprs() {
+	pkgdesc="APRS: rtl_fm | direwolf service (KISS 8001, AGW 8000)"
+	depends="$pkgname=$pkgver-r$pkgrel direwolf"
+	_decoder aprs
+}
+
+pocsag() {
+	pkgdesc="Pagers: rtl_fm | multimon-ng service (POCSAG/FLEX)"
+	depends="$pkgname=$pkgver-r$pkgrel multimon-ng"
+	_decoder pocsag
+}
+
+ais() {
+	pkgdesc="AIS ships: AIS-catcher service with web UI (port 8100)"
+	depends="$pkgname=$pkgver-r$pkgrel ais-catcher"
+	_decoder ais
+}
+
+_all() {
+	pkgdesc="All beyond2lte SDR decoder services (meta package)"
+	depends="$pkgname-adsb=$pkgver-r$pkgrel $pkgname-rtl433=$pkgver-r$pkgrel
+		$pkgname-aprs=$pkgver-r$pkgrel $pkgname-pocsag=$pkgver-r$pkgrel
+		$pkgname-ais=$pkgver-r$pkgrel"
+	mkdir -p "$subpkgdir"
+}
+
+nftrules() {
+	pkgdesc="nftables rules opening the SDR decoder ports for LAN sources"
+	depends=""
+	install_if="$pkgname=$pkgver-r$pkgrel nftables"
+	install -Dm644 "$srcdir"/50_sdr-decoders.nft \
+		"$subpkgdir"/etc/nftables.d/50_sdr-decoders.nft
+}
+sha512sums="
+9ebcb05cb6337d756be2537afc9a16ba341c116e944c3e92644576d70f814dd4cb82a94028e4c998ad6931cb5663464b64f1f8757530387203e506b2de849d01  sdr-adsb
+28527a205c4d2715b848def58c1e8e86e1ea1671468626d61ea81374b639f116eef4d277402665d9a8ee16af23b79638a4a2189ac9bd981c93979d67716342dd  sdr-adsb.service
+5189b42f3959f34966449f765d13ab66fc41ae3600f3f35299ab5e6754736cdf5fa16f2d846bf2cfc22531f6aaf89fd42aabcf59963092f77ef167c1f4d51b6f  sdr-adsb.default
+50e171bace8f5f2119092945469070e03be9d755c9c850d40fbafcf219b12e9ed4fd033c796c980864c706d86f68de9e6301ddec2e7db6479054882560dc694b  sdr-mode-adsb.conf
+35e3eeb7f9f99274622f2d17383b620f3e31e9ef26c385db3337c84b9873314fec6a0f0879d4fd83a17ca13c33ffa0098035a182c76802349274d61952e4c602  sdr-adsb-feed.service.example
+c16ad1bb22a040243f80a742099c1f2090ee5fea092769aaa81eae93ee788fc436b8a009c8103f3562dc5209e1a2738049c3e1b6c91023a258262ee38502f91b  sdr-rtl433
+c6856eae17586397d105c320eda9a101b3913b7f15d355bdb4eadd72aca10c3deb434ace334c49ee258907ee47b6ed6fdae4bb063aebff04c700c7d724630fc7  sdr-rtl433.service
+b9d3015d63c93f7affe26ccb741a0b0eb58a643776781c1b468d67c2827395c34f9247a8573976ce71538e3a8d25cda5a52b519d6681d5e3aaa2a9a726a7188a  sdr-rtl433.default
+021c70fa0cd0612de276e59c5af6a0ee2e444d224373810f940b30acedc0dda40d29cd489bfb4b46426be26307a754855ec2d6f2327fb11b6e9011dc44684b05  sdr-mode-rtl433.conf
+7d178b58d416552109ca110098fe57a1997b6d6661de97c9d106396f358c24479824ba76ab0c6bb989681c06cd14401053b929770cf35a4b72055f23308fbb5a  sdr-aprs
+ba6d698ced545db945a7c98b1078647a982ca86aa2c6a439385593012ed6850063ea37ee7fa509e696edc7a3c020349be2bd01d9bd2bd146429ba44cf7d1473b  sdr-aprs.service
+aeca4c79959ca0f60856cd7e6645731e7bfd83141cc51535457c19703b40f2e9a172bd9aa3cd82dc0237f8ede0ea70175f4e734d9830ecb2bc7c110e40393fb4  sdr-aprs.default
+c76d9951365dbca0181569777a58f5f2f7a8a23969df221b87ad5e6211620a3178830bce9e57c7e301ab00fbe61e5152e987dcf28ebe07af0e0e3b1e2d7996a9  sdr-mode-aprs.conf
+1d6c049d3eb144ab0e518cfa6a0ac79f81ce7fb9af5977ce4bb3d62c78fd3e16f517c27a308121279748ce03bfe41470a8c46bb39f45c5fec9a2fcea24696d37  sdr-pocsag
+25a03660ca95e99c232f46e75498fa5d8344f03e84ec8fcd69747292e64a32b45065002895ba78cda88b36f6251852744a4d1ee9d79b7b8deff7e227da7064f8  sdr-pocsag.service
+8a4f83f3f1b1f4f693676dc2407154421ba2ec4ee98146f9800d4a3eb48904844917d925f9d5db5e72a3eb1b583761fe66ac1445c5c85ad5858c51cea002d267  sdr-pocsag.default
+32ee6f5807c9d80459b2cb88092733c3d0b4c67570abbd4e22a692cf97843bf6535a37d21dd0142be5c349e7b9bc3e37631a4afcad947d53d01a75f62d2d7ac6  sdr-mode-pocsag.conf
+67b83a34fd9156b0c226c888a9180b11181e2629e5da65f7e2ceae7f81b22b8e2d7bbf855e9081c24631a1ca56aafa361334cda2f23de61f7ffc01e99a1facec  sdr-ais
+cf34d419e99938a1b2cfb66e687516836e2015a7406a9db2cade0f74915e4308a5ab9c011a6c134b36ed6bb8b1db8c4398e26ca5daaf60cc2b620b7f022af599  sdr-ais.service
+8edf679d83b0145ff542e69401c134b559d71bc3042ddd7194abcd884c6509adf810ac04f2023d214f9a617c819b19c0e58eec02c5202c1edc74f892bee05197  sdr-ais.default
+d4ef8e4381009f9f072e1362978e0e486c990ab89111861a5000667c2855657303fa27e09463ac8f6b17541f2e94ce6c3dfe91516bc0d280fa06ad13210b203d  sdr-mode-ais.conf
+4be0569641558c0122da9fd94a7581a62984b2a4fcb0e79ae8fa7bba7a27b3d7c560a621f67e9e291ac8431a08495a72e701576e0e376ef6056b567520ba8eb2  sdr-decoders.tmpfiles
+de353741f580f89915ebf8644a1d3249fc62703187d10764f3488bf95a7558d7a13237995e2f88be84d8dbe873a3786d63ba15f9bdffc0e2af78764e26c06fba  80-sdr-decoders.preset
+4716f5c8240be5fac853db8f6404d1b735ed3cf076429e3e8ea89a7480fcd4df9c90551178f35432fcf48008cd7d89447d601079a5c565b6cc8879f37f7bf84f  50_sdr-decoders.nft
+"

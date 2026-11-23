@@ -1,0 +1,10 @@
+#!/bin/sh
+cat <<MSG
+beyond2lte-sdr-server installed. Enable with:
+  sudo systemctl enable --now beyond2lte-sdr-server
+  (optional) sudo systemctl enable --now beyond2lte-sdr-governor
+Add your login user to the 'sdr' group for local SoapySDRUtil access:
+  sudo addgroup user sdr
+Then replug the LimeSDR (or: sudo udevadm trigger -s usb -a idVendor=0403).
+MSG
+exit 0

@@ -1,0 +1,15 @@
+[Unit]
+Description=Set cpufreq governor for the SDR server CPUs (optional)
+Documentation=https://docs.kernel.org/admin-guide/pm/cpufreq.html
+Before=beyond2lte-sdr-server.service
+ConditionPathExists=/sys/devices/system/cpu/cpufreq
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/beyond2lte-sdr-server
+ExecStart=/usr/libexec/beyond2lte-sdr-governor set
+ExecStop=/usr/libexec/beyond2lte-sdr-governor restore
+
+[Install]
+WantedBy=multi-user.target

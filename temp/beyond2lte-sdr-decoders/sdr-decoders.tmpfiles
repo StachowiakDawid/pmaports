@@ -1,0 +1,4 @@
+# beyond2lte-sdr-decoders: state root for the decoders (per-decoder subdirs are
+# created by StateDirectory=), and age-based cleanup of direwolf's daily logs.
+d /var/lib/sdr-decoders 0750 sdrdec sdr -
+e /var/lib/sdr-decoders/aprs - - - 90d

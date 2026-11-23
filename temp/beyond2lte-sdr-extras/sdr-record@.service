@@ -1,0 +1,50 @@
+[Unit]
+Description=SDR recording (profile %i)
+Documentation=file:///etc/default/sdr-record
+After=network.target
+ConditionPathExists=/etc/sdr-record/%i.conf
+
+[Service]
+Type=exec
+User=sdrrec
+Group=sdr
+# root helpers ("+"): with BUSY_POLICY=preempt stop the SDR's current owner
+# before the recording and start it again afterwards; no-ops with "skip".
+ExecStartPre=+/usr/bin/sdr-record claim %i
+ExecStart=/usr/bin/sdr-record run %i
+ExecStopPost=+/usr/bin/sdr-record release %i
+ExecStopPost=/usr/bin/sdr-record rotate
+# 75 = skipped (SDR owned by another service / busy / no room): not a failure
+SuccessExitStatus=75
+TimeoutStopSec=45
+StateDirectory=sdr-record
+StateDirectoryMode=0750
+RuntimeDirectory=sdr-record
+RuntimeDirectoryPreserve=yes
+SyslogIdentifier=sdr-record
+UMask=0027
+CPUAffinity=0-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+# Hardening
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

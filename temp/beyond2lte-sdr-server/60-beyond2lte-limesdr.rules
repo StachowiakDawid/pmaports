@@ -1,0 +1,18 @@
+# beyond2lte-sdr-server: LimeSDR access for the "sdr" group, no USB autosuspend.
+#
+# LimeSDR Mini v1 and Mini 2.0 both enumerate as FTDI FT601 0403:601f; they are
+# driven entirely from userspace via libusb (no kernel driver binds to them).
+ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", \
+  ATTR{idVendor}=="0403", ATTR{idProduct}=="601f", \
+  MODE="0660", GROUP="sdr", TAG+="uaccess", ATTR{power/control}="on", \
+  SYMLINK+="limesdr-mini-%n"
+
+# LimeSDR-USB (FX3) - same treatment, harmless if absent.
+ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", \
+  ATTR{idVendor}=="1d50", ATTR{idProduct}=="6108", \
+  MODE="0660", GROUP="sdr", TAG+="uaccess", ATTR{power/control}="on"
+
+# Keep USB hubs (e.g. the USB-C hub the SDR hangs off) awake as well, otherwise
+# a suspended hub can still drop the link of an "on" child after idle periods.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", \
+  ATTR{bDeviceClass}=="09", ATTR{power/control}="on"

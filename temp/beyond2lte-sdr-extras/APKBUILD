@@ -1,0 +1,146 @@
+# Contributor: StachowiakDawid
+# Operations tooling for the beyond2lte 24/7 SDR server: health page, headless
+# switch, self-healing, recorder. The main package is a meta package; each
+# tool is its own subpackage.
+pkgname=beyond2lte-sdr-extras
+pkgver=1
+pkgrel=0
+pkgdesc="Health page, headless switch, self-healing and recorder for the beyond2lte SDR server (meta)"
+url="https://postmarketos.org"
+arch="noarch"
+license="MIT"
+depends="
+	$pkgname-status=$pkgver-r$pkgrel
+	$pkgname-headless=$pkgver-r$pkgrel
+	$pkgname-selfheal=$pkgver-r$pkgrel
+	$pkgname-record=$pkgver-r$pkgrel
+	"
+install="$pkgname-status.pre-install $pkgname-record.pre-install"
+subpackages="
+	$pkgname-status
+	$pkgname-headless
+	$pkgname-selfheal
+	$pkgname-record
+	$pkgname-nftables:nftrules
+	"
+source="
+	sdr-status-server sdr-status.service sdr-status.default
+	sdr-headless sdr-headless.default sdr-headless-panel.service greetd-sdr-headless.conf
+	sdr-wifi-watchdog sdr-wifi-watchdog.service
+	sdr-usb-check sdr-usb-check.service sdr-usb-check.timer
+	sdr-replug sdr-replug@.service 61-sdr-selfheal.rules
+	sdr-selfheal.default
+	sdr-record sdr-record.default sdr-record@.service sdr-record@.timer
+	sdr-record-rotate.service sdr-record-rotate.timer
+	profile-ism-iq.conf profile-fm-audio.conf profile-lime-iq.conf
+	sdr-extras.tmpfiles
+	50_sdr-status.nft
+	"
+options="!check" # no tests
+_unitdir=/usr/lib/systemd/system
+
+package() {
+	mkdir -p "$pkgdir"
+}
+
+# what `systemctl preset` (apk trigger on pmOS) does when a subpackage is installed
+_preset() {
+	local name="$1"; shift
+	mkdir -p "$subpkgdir"/usr/lib/systemd/system-preset
+	printf '%s\n' "# $pkgname-$name" "$@" \
+		> "$subpkgdir"/usr/lib/systemd/system-preset/80-sdr-$name.preset
+}
+
+status() {
+	pkgdesc="Tiny LAN health/status page for the beyond2lte SDR server (python http.server, port 8080)"
+	depends="python3 iw"
+	_preset status "enable sdr-status.service"
+	install -Dm755 "$srcdir"/sdr-status-server "$subpkgdir"/usr/libexec/sdr-status/sdr-status-server
+	install -Dm644 "$srcdir"/sdr-status.service "$subpkgdir"$_unitdir/sdr-status.service
+	install -Dm644 "$srcdir"/sdr-status.default "$subpkgdir"/etc/default/sdr-status
+}
+
+headless() {
+	pkgdesc="sdr-headless on|off|status: run beyond2lte without Phosh, panel off"
+	depends=""
+	# the panel unit only acts while /etc/sdr-headless/enabled exists
+	_preset headless "enable sdr-headless-panel.service"
+	install -Dm755 "$srcdir"/sdr-headless "$subpkgdir"/usr/bin/sdr-headless
+	install -Dm644 "$srcdir"/sdr-headless.default "$subpkgdir"/etc/default/sdr-headless
+	install -Dm644 "$srcdir"/sdr-headless-panel.service \
+		"$subpkgdir"$_unitdir/sdr-headless-panel.service
+	install -Dm644 "$srcdir"/greetd-sdr-headless.conf \
+		"$subpkgdir"$_unitdir/greetd.service.d/60-sdr-headless.conf
+}
+
+selfheal() {
+	pkgdesc="Self-healing for the beyond2lte SDR server: Wi-Fi watchdog, USB re-enumeration restarts, USB3 speed check"
+	depends=""
+	local f
+	# the Wi-Fi watchdog acts on the network: left for the admin to enable
+	_preset selfheal "enable sdr-usb-check.timer" "disable sdr-wifi-watchdog.service"
+	for f in sdr-wifi-watchdog sdr-usb-check sdr-replug; do
+		install -Dm755 "$srcdir"/$f "$subpkgdir"/usr/libexec/sdr-selfheal/$f
+	done
+	for f in sdr-wifi-watchdog.service sdr-usb-check.service sdr-usb-check.timer \
+		sdr-replug@.service; do
+		install -Dm644 "$srcdir"/$f "$subpkgdir"$_unitdir/$f
+	done
+	install -Dm644 "$srcdir"/61-sdr-selfheal.rules \
+		"$subpkgdir"/usr/lib/udev/rules.d/61-sdr-selfheal.rules
+	install -Dm644 "$srcdir"/sdr-selfheal.default "$subpkgdir"/etc/default/sdr-selfheal
+}
+
+record() {
+	pkgdesc="sdr-record: scheduled IQ (SoapySDR/SigMF) and audio (rtl_fm/FLAC) recordings with rotation"
+	depends="python3 py3-soapy-sdr rtl-sdr flac"
+	local f
+	_preset record "enable sdr-record-rotate.timer" "disable sdr-record@.timer"
+	install -Dm755 "$srcdir"/sdr-record "$subpkgdir"/usr/bin/sdr-record
+	install -Dm644 "$srcdir"/sdr-record.default "$subpkgdir"/etc/default/sdr-record
+	for f in sdr-record@.service sdr-record@.timer sdr-record-rotate.service \
+		sdr-record-rotate.timer; do
+		install -Dm644 "$srcdir"/$f "$subpkgdir"$_unitdir/$f
+	done
+	for f in ism-iq fm-audio lime-iq; do
+		install -Dm644 "$srcdir"/profile-$f.conf "$subpkgdir"/etc/sdr-record/$f.conf
+	done
+	install -Dm644 "$srcdir"/sdr-extras.tmpfiles "$subpkgdir"/usr/lib/tmpfiles.d/sdr-record.conf
+}
+
+nftrules() {
+	pkgdesc="nftables rule opening the sdr-status health page (TCP 8080) for LAN sources"
+	depends=""
+	install_if="$pkgname-status=$pkgver-r$pkgrel nftables"
+	install -Dm644 "$srcdir"/50_sdr-status.nft \
+		"$subpkgdir"/etc/nftables.d/50_sdr-status.nft
+}
+sha512sums="
+6983d437594d8e3ef873a5971d69261aadb81ffb0ef90c0bde8d5ae466b84bac9d194c9cc5ef5654ba979dcf361304a254b4a2175a40a3da75bf7d02bd58b8ac  sdr-status-server
+6c712155322960b229a3f657f0bf411aff8c9dd69b4c6baa41e4d7fac29d97dba33fe12761bc5471de508611b76c5fe941aa01421b4e682e1b45e1b4f3046353  sdr-status.service
+e5b35b912e054e592934cda0a733911df8adadd54587d79a12164cae61f991dc4cc43cb9631094657091b34412b606244cab36d407a067bd05a87b558c9a05a7  sdr-status.default
+55d27151fce06ab7c0458b16c6527520c2755f06257425a4b14ef7348957e2fc7ddc03069f54917c5c4423a4b1a573145486c6d1ac1b4aead57d24ec19de1d17  sdr-headless
+38a6fb4e9fc379df68faaa61dd124d8161a37560f335a77a1ab9846f3ac8cfe844743cdbad9cb873ca9046f1f94459340c543c23ebf62faa6680390278e23c1a  sdr-headless.default
+6c7dc636787db12f14b1cf62ab80769bf954e6a5ba3e9631f896cec26e8e0f3a171f776341d8e0d48cb50abedc36f63facd3c3d00ef45b708ffa1f01cd2f747b  sdr-headless-panel.service
+8565eec4a260947d27b3c01f29a31b8cdfd34437869f834c587fdd34d0042662c185ac541d691f5373c64c037d91d73edf73cd51e440f1d1f1eacaa72102bd40  greetd-sdr-headless.conf
+ef9217a52c9cd34f6fde77d0e90eb44adb6b618ac90b54ffe5dfaa2a678f8ebcf93c26c02a73391b205d333b12a060cbde84004141ce5fc2ad61d38ccd12d615  sdr-wifi-watchdog
+fd43a8dc1b40bf73253264726d09bd191dc487694ac7f296f02e79e84ea28866b27afe27695de995a1e42d0148891d1e3a8a86809d79a3ed90108a49177f7134  sdr-wifi-watchdog.service
+94f4eb744a1c24a3a036cbfd07b2515c92f7d44ff0ed3c0878a061b4c7d13bf5d2f305c514cf40ae9cda8f4af483b44d6427491a7b2384d9c68d622bc15241fc  sdr-usb-check
+f62d79350eec3df293a55acaac3322b276f60fc5f0d0fe8f0733ea9c24e0a3e7c75f890d6751bfa278c550c1063c39db03a61d74d4b22cbe2af9a739a5663c61  sdr-usb-check.service
+f5a0f04b001e0afd0fc0906521b8af20f5f5407fe708c28089bb22430711ebec8949fbce3b49f84eaf82a02650fdb451d42ea1c7ebe13d30f206bd1a70210370  sdr-usb-check.timer
+68880a438cc0225631deafddf386eb517f6c2fd9c397ba283594de752f0e514d5d777eee785325af56f392f42bba9077421a6b2303b6413001d1fd7d38aede23  sdr-replug
+7c79481460eb10387a38395e92377bb50afbfc85475d429dcbccfbbb35bdca99cb2fecbf9313e5a1db347b3496a9ee17286cba01d4ad3c13bf3ab0708ae37a19  sdr-replug@.service
+52f5a37186938094c60c11f0cc9068bd8b5dd05e82c94cfd5fbab2f0c431d00dccdab6f525fe0a92dce5aa7c83afaae5fbfcf8c0e6f317143a8afe39f353b7db  61-sdr-selfheal.rules
+0e2f61795f80a772900c883e7bf3b3297e855ea3fea433e4d4a9114679adba3eb8430b73d5f507d93883e0b0c7a6832749ed31dbb15189cc51d6d4412e3d6385  sdr-selfheal.default
+5dd69a6ccdbf1fa54af94ab84ff643943b75224113ec2465ccd9f458faffe03fbfb5208339fe8a99814bedc23267a4bf14f292dc7550ac43b571bc6d68f5aa86  sdr-record
+2e536fe3059a95c80df5eed9738e31e04db57ff948a9375a33e86593b259c2dbf696ab49dd9228da518ec87225e1b1908a0237030a78dd9f8c481522f3119dee  sdr-record.default
+90df314d4e91507b003f5f0d7ac15dbb26ec15674762a48588ac2c5db98c835a23bda10d062144c54b8ffc08f515a925edabcee590e4770f149ae4d5a1a6a5d2  sdr-record@.service
+d1c7fcd5a28a23e37db194b953d0a32500a5db1e53f87593c2623ab325ce51900aea4719bd526d40f7405c0038f594c020efcb927a546fdca75dcadc378eea4e  sdr-record@.timer
+8325c1b74ccb7cac032caf239d3c70f2b6ef4fa2a1e50276e8d4cac502eaf025773aa98daaeb8589850a4d0f174f0c26aa6663b928a30029c2fe00b9b8222a92  sdr-record-rotate.service
+3e07820ac873df2140d212c2a087e6cacc4268220ab638e14ef9f969bf2b3d7f3b9c4e325473034df4ea35892a573ef6947d9a556b6f9d6120949d1b289ebe97  sdr-record-rotate.timer
+19edd40e7973386ad82a7e74ef7d6cf8973d7a25db7cf3fef58867645a7ad5c52d2ca18c041571bfc4a85c2af17d21a3c898d73bf94c5cf67e82ac750238b379  profile-ism-iq.conf
+234c888afa2594e5aeafe11c43724ba186a83cdc1b06b93e8689819fca3388bca79aafe4135c6b0418bde15ed7a8f3e56f6a2038db304aae02828a540210c968  profile-fm-audio.conf
+523537ce79d76eb42257c0c697c852f74d1cfb27aaab84d946c376da534fcb6f2c02001ba58c91afb02645576b2fbd4568c73efb0b3ccd09d74e94f38f2ff742  profile-lime-iq.conf
+ac5b4dbded88b0d1a3f45bea602e55c6a42f2f86b54e431d974ca5ca481c1ba2244e17ca2f35d69e693ad0b6050cd253f2ecb6b6c0a50479d35c25d3ee45c05a  sdr-extras.tmpfiles
+022f5fd3d184699b5098587212d6b9414c4ea648fadec6c42b5d14c8e2a1cc5ba30b5fd80ec777dbd22888ef1511e4a6d303458ec21fcf89f9c14d3bea87ae81  50_sdr-status.nft
+"

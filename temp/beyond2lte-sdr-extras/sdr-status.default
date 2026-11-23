@@ -1,0 +1,12 @@
+# /etc/default/sdr-status - health page (sdr-status.service).
+# http://<phone>:8080/  (HTML)   /status.json   /metrics (Prometheus text)
+SDR_STATUS_BIND=0.0.0.0
+SDR_STATUS_PORT=8080
+# Browser auto-refresh in seconds (0 = off); data is cached for 5 s server-side.
+SDR_STATUS_REFRESH=15
+# Number of recent journal entries with priority <= err shown (0 = hide).
+SDR_STATUS_JOURNAL_LINES=20
+# More units to list (space separated), in addition to the built-in SDR set.
+SDR_STATUS_EXTRA_UNITS=
+# Filesystems to report (deduplicated by device).
+SDR_STATUS_DISKS=/ /var/lib/sdr-record

@@ -1,0 +1,187 @@
+#!/bin/sh
+# sdr-headless on|off|status - run the phone without the graphical session.
+#
+# on:   greetd (Phosh) is stopped and stays off across reboots, the OLED panel
+#       is switched off, the power key no longer powers the phone off.
+# off:  everything back: panel on, greetd started.
+#
+# How: the flag file /etc/sdr-headless/enabled. The package ships
+#   /usr/lib/systemd/system/greetd.service.d/60-sdr-headless.conf
+#       ConditionPathExists=!/etc/sdr-headless/enabled   (greetd is skipped, not masked)
+#   sdr-headless-panel.service    (ConditionPathExists=flag: panel off at boot)
+# and "on" writes /etc/systemd/logind.conf.d/60-sdr-headless.conf (HandlePowerKey=ignore;
+# without Phosh nobody inhibits logind's default "poweroff" on a short press).
+# Nothing here touches sshd, NetworkManager or the USB gadget.
+set -u
+FLAGDIR=/etc/sdr-headless
+FLAG=$FLAGDIR/enabled
+LOGIND=/etc/systemd/logind.conf.d/60-sdr-headless.conf
+DM=greetd.service
+# bl_power value for "panel off". 1 = display off, panel awake (what the device
+# package's beyond2lte-blank uses, tested); 4 = FB_BLANK_POWERDOWN.
+SDR_HEADLESS_BL_POWER=1
+# also DPMS-blank the fbcon framebuffer (stops the DECON scanout; untested -> off)
+SDR_HEADLESS_FB_BLANK=no
+# seconds the guard waits for the network after stopping the session
+SDR_HEADLESS_GUARD_SECS=90
+[ -r /etc/default/sdr-headless ] && . /etc/default/sdr-headless
+
+log() { echo "sdr-headless: $*"; }
+die() { echo "sdr-headless: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || die "must be root (sudo sdr-headless $*)"; }
+
+panel() { # off|on
+	found=0
+	if [ "$1" = off ]; then
+		# at boot the backlight device shows up late
+		i=0
+		while [ $i -lt 30 ]; do
+			ls /sys/class/backlight/*/bl_power >/dev/null 2>&1 && break
+			i=$((i + 1)); sleep 1
+		done
+	fi
+	for b in /sys/class/backlight/*/bl_power; do
+		[ -w "$b" ] || continue
+		found=1
+		if [ "$1" = off ]; then echo "$SDR_HEADLESS_BL_POWER" > "$b"; else echo 0 > "$b"; fi
+	done
+	if [ "$SDR_HEADLESS_FB_BLANK" = yes ] && [ -w /sys/class/graphics/fb0/blank ]; then
+		if [ "$1" = off ]; then echo 4 > /sys/class/graphics/fb0/blank; else echo 0 > /sys/class/graphics/fb0/blank; fi
+	fi 2>/dev/null
+	[ $found = 1 ] || log "no /sys/class/backlight/*/bl_power (panel left as is)"
+	return 0
+}
+
+default_gw() { ip -4 route show default 2>/dev/null | awk '/default via/ {print $3; exit}'; }
+
+net_ok() {
+	gw=$(default_gw)
+	[ -n "$gw" ] || return 1
+	ping -c 1 -W 3 "$gw" >/dev/null 2>&1 && return 0
+	# gateways that drop ICMP: a resolved neighbour entry is good enough
+	ip neigh show "$gw" 2>/dev/null | grep -Eq 'REACHABLE|DELAY|STALE' 
+}
+
+# Wi-Fi profiles that only work inside a login session would drop when the
+# session ends: per-user permissions, or a key kept by the user's secret agent.
+preflight() {
+	command -v nmcli >/dev/null 2>&1 || { log "nmcli not found - skipping the Wi-Fi profile check"; return 0; }
+	bad=0
+	for uuid in $(nmcli -t -f UUID,TYPE connection show --active 2>/dev/null | awk -F: '$2 ~ /wireless/ {print $1}'); do
+		name=$(nmcli -g connection.id connection show "$uuid" 2>/dev/null)
+		perm=$(nmcli -g connection.permissions connection show "$uuid" 2>/dev/null)
+		flags=$(nmcli -g 802-11-wireless-security.psk-flags connection show "$uuid" 2>/dev/null | sed 's/ .*//')
+		auto=$(nmcli -g connection.autoconnect connection show "$uuid" 2>/dev/null)
+		this=0
+		[ -n "$perm" ] && { log "Wi-Fi profile '$name' is restricted to: $perm"; this=1; }
+		case "${flags:-0}" in
+		0) ;;
+		*) log "Wi-Fi profile '$name': the key is not stored system-wide (psk-flags=$flags)"; this=1 ;;
+		esac
+		[ "$auto" = no ] && { log "Wi-Fi profile '$name' has autoconnect=no"; this=1; }
+		if [ $this = 1 ]; then
+			bad=1
+			cat >&2 <<MSG
+  This profile would drop (or not come back after a reboot) without a login session. Fix:
+    nmcli connection modify $uuid connection.permissions "" connection.autoconnect yes \\
+        802-11-wireless-security.psk-flags 0 802-11-wireless-security.psk 'THE-WIFI-PASSWORD'
+  then run 'sdr-headless on' again (or 'sdr-headless on --force' to skip this check).
+MSG
+		fi
+	done
+	return $bad
+}
+
+cmd_on() {
+	need_root on
+	if [ "${1:-}" != --force ]; then
+		net_ok || die "the default gateway is not reachable right now - not switching (use --force to override)"
+		preflight || die "refusing: Wi-Fi would not survive without the session (see above)"
+	fi
+	mkdir -p "$FLAGDIR" "${LOGIND%/*}"
+	: > "$FLAG"
+	cat > "$LOGIND" <<CONF
+# written by 'sdr-headless on', removed by 'sdr-headless off'
+[Login]
+HandlePowerKey=ignore
+HandlePowerKeyLongPress=ignore
+CONF
+	systemctl reload systemd-logind.service 2>/dev/null || systemctl kill -s HUP systemd-logind.service 2>/dev/null
+	systemctl daemon-reload
+	log "stopping $DM (Phosh)"
+	systemctl stop "$DM" 2>/dev/null
+	# end whatever is left of the local (seat) sessions; SSH sessions have no seat
+	if command -v loginctl >/dev/null 2>&1; then
+		for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+			[ "$(loginctl show-session "$s" -p Seat --value 2>/dev/null)" = seat0 ] || continue
+			[ "$(loginctl show-session "$s" -p Remote --value 2>/dev/null)" = yes ] && continue
+			log "terminating local session $s"
+			loginctl terminate-session "$s" 2>/dev/null
+		done
+	fi
+	systemctl start sdr-headless-panel.service 2>/dev/null || panel off
+	# Dead-man: if the network is gone after the session ended, undo everything.
+	# Runs as its own unit so it survives a dropped SSH connection.
+	if [ "${1:-}" != --force ] && command -v systemd-run >/dev/null 2>&1; then
+		systemctl stop sdr-headless-guard.service 2>/dev/null
+		systemctl reset-failed sdr-headless-guard.service 2>/dev/null
+		systemd-run --quiet --unit=sdr-headless-guard --collect \
+			--description="sdr-headless network guard" /usr/bin/sdr-headless guard &&
+			log "guard armed: reverts automatically if the gateway is unreachable for ${SDR_HEADLESS_GUARD_SECS}s (journalctl -u sdr-headless-guard)"
+	fi
+	log "headless ON (persists across reboots). Undo: sdr-headless off"
+}
+
+cmd_guard() {
+	need_root guard
+	end=$(( $(cut -d. -f1 /proc/uptime) + SDR_HEADLESS_GUARD_SECS ))
+	sleep 15
+	while [ "$(cut -d. -f1 /proc/uptime)" -lt "$end" ]; do
+		if net_ok; then log "guard: network OK, staying headless"; exit 0; fi
+		sleep 10
+	done
+	[ -e "$FLAG" ] || exit 0
+	log "guard: gateway unreachable for ${SDR_HEADLESS_GUARD_SECS}s after stopping the session - REVERTING to graphical mode"
+	cmd_off
+	exit 1
+}
+
+cmd_off() {
+	need_root off
+	rm -f "$FLAG" "$LOGIND"
+	systemctl reload systemd-logind.service 2>/dev/null || systemctl kill -s HUP systemd-logind.service 2>/dev/null
+	systemctl daemon-reload
+	systemctl stop sdr-headless-panel.service 2>/dev/null
+	panel on
+	if systemctl cat "$DM" >/dev/null 2>&1; then
+		log "starting $DM (Phosh)"
+		systemctl start --no-block "$DM"
+	fi
+	log "headless OFF"
+}
+
+cmd_status() {
+	if [ -e "$FLAG" ]; then echo "headless: ON (flag $FLAG)"; else echo "headless: off"; fi
+	echo "$DM: $(systemctl is-active "$DM" 2>/dev/null) / $(systemctl is-enabled "$DM" 2>/dev/null)"
+	for b in /sys/class/backlight/*/bl_power; do
+		[ -r "$b" ] && echo "panel ${b%/bl_power}: bl_power=$(cat "$b") (0 = on) brightness=$(cat "${b%/bl_power}/brightness" 2>/dev/null)"
+	done
+	[ -e "$LOGIND" ] && echo "power key: ignored by logind ($LOGIND)" || echo "power key: logind default (Phosh handles it while it runs)"
+	echo "sshd: $(systemctl is-active sshd 2>/dev/null)   NetworkManager: $(systemctl is-active NetworkManager 2>/dev/null)   gateway: $(default_gw) $(net_ok && echo reachable || echo UNREACHABLE)"
+	for s in /sys/class/power_supply/*; do
+		[ -r "$s/current_now" ] && [ -r "$s/voltage_now" ] || continue
+		i=$(cat "$s/current_now"); v=$(cat "$s/voltage_now")
+		echo "power ${s##*/}: $((i / 1000)) mA x $((v / 1000)) mV = $((i / 1000 * (v / 1000) / 1000)) mW ($(cat "$s/status" 2>/dev/null))"
+	done
+	awk '/MemAvailable/ {printf "MemAvailable: %d MiB\n", $2/1024}' /proc/meminfo
+}
+
+case "${1:-status}" in
+on) cmd_on "${2:-}" ;;
+off) cmd_off ;;
+status) cmd_status ;;
+panel-off) need_root panel-off; panel off ;;
+panel-on) need_root panel-on; panel on ;;
+guard) cmd_guard ;;
+*) echo "usage: sdr-headless on [--force] | off | status" >&2; exit 2 ;;
+esac

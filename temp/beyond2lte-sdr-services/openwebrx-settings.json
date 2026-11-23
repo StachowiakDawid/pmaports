@@ -1,0 +1,102 @@
+{
+    "version": 8,
+    "sdrs": {
+        "lime": {
+            "name": "LimeSDR Mini 2.0",
+            "type": "lime_sdr",
+            "enabled": true,
+            "antenna": "LNAW",
+            "rf_gain": 40,
+            "profiles": {
+                "fm": {
+                    "name": "FM broadcast",
+                    "center_freq": 98000000,
+                    "samp_rate": 2400000,
+                    "start_freq": 98000000,
+                    "start_mod": "wfm",
+                    "tuning_step": 100000
+                },
+                "air": {
+                    "name": "Airband",
+                    "center_freq": 127000000,
+                    "samp_rate": 2400000,
+                    "start_freq": 127000000,
+                    "start_mod": "am",
+                    "tuning_step": 8333
+                },
+                "2m": {
+                    "name": "2m",
+                    "center_freq": 145000000,
+                    "samp_rate": 2400000,
+                    "start_freq": 145500000,
+                    "start_mod": "nfm",
+                    "tuning_step": 12500
+                },
+                "70cm": {
+                    "name": "70cm",
+                    "center_freq": 438800000,
+                    "samp_rate": 2400000,
+                    "start_freq": 439275000,
+                    "start_mod": "nfm",
+                    "tuning_step": 12500
+                },
+                "23cm": {
+                    "name": "23cm",
+                    "center_freq": 1297000000,
+                    "samp_rate": 2400000,
+                    "start_freq": 1297500000,
+                    "start_mod": "nfm",
+                    "tuning_step": 25000
+                }
+            }
+        },
+        "rtlsdr": {
+            "name": "RTL-SDR",
+            "type": "rtl_sdr",
+            "enabled": true,
+            "rf_gain": 29,
+            "profiles": {
+                "fm": {
+                    "name": "FM broadcast",
+                    "center_freq": 98000000,
+                    "samp_rate": 2400000,
+                    "start_freq": 98000000,
+                    "start_mod": "wfm",
+                    "tuning_step": 100000
+                },
+                "air": {
+                    "name": "Airband",
+                    "center_freq": 127000000,
+                    "samp_rate": 2400000,
+                    "start_freq": 127000000,
+                    "start_mod": "am",
+                    "tuning_step": 8333
+                },
+                "2m": {
+                    "name": "2m",
+                    "center_freq": 145000000,
+                    "samp_rate": 2048000,
+                    "start_freq": 145500000,
+                    "start_mod": "nfm",
+                    "tuning_step": 12500
+                },
+                "70cm": {
+                    "name": "70cm",
+                    "center_freq": 438800000,
+                    "samp_rate": 2400000,
+                    "start_freq": 439275000,
+                    "start_mod": "nfm",
+                    "tuning_step": 12500
+                },
+                "ism433": {
+                    "name": "433 MHz ISM",
+                    "center_freq": 433920000,
+                    "samp_rate": 2048000,
+                    "start_freq": 433920000,
+                    "start_mod": "nfm",
+                    "tuning_step": 25000
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,30 @@
+# /etc/default/sdr-record - global settings of the sdr-record recorder.
+
+# Where recordings go (SigMF pairs *.sigmf-data/*.sigmf-meta, *.flac + *.json).
+# A different directory also needs ReadWritePaths= in a drop-in for sdr-record@.service.
+RECORD_DIR=/var/lib/sdr-record
+
+# Rotation: the oldest recordings are deleted when the total exceeds
+# MAX_TOTAL_MB, when they are older than MAX_AGE_DAYS (0 = keep forever), or
+# when the filesystem has less than MIN_FREE_MB left. A recording that would
+# not fit is shortened. (2.4 MS/s CS8 = 288 MB/min; 5 MS/s CS16 = 1.2 GB/min.)
+MAX_TOTAL_MB=20000
+MAX_AGE_DAYS=30
+MIN_FREE_MB=5000
+
+# What to do when another service owns the SDR (per profile: BUSY_POLICY= in
+# the profile):
+#   skip     leave the owner (sdr-mode selection) alone, skip this recording
+#            (exit 75, logged)
+#   preempt  stop the owner, record, start it again afterwards
+#            (only via sdr-record@PROFILE.service, which has the root helper)
+BUSY_POLICY=skip
+
+# Dedicated services that hold the RTL-SDR / the LimeSDR while they run (the
+# owner reported by `sdr-mode owner rtl|lime` is added automatically). The
+# shared servers (SoapySDRServer, OpenWebRX) only open a device while a client
+# uses it: they are left alone, and if they are streaming the recording ends
+# as "busy" (skipped) because the device cannot be opened.
+RECORD_RTLSDR_UNITS="rtl-tcp sdrpp-server-rtl sdr-adsb sdr-rtl433 sdr-aprs sdr-pocsag sdr-ais"
+RECORD_LIMESDR_UNITS="sdrpp-server-lime"
+RECORD_SHARED_UNITS="beyond2lte-sdr-server openwebrx"
