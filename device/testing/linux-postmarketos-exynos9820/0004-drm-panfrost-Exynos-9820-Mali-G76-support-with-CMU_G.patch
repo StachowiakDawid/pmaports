@@ -1,0 +1,1180 @@
+From 81535e92f7afa9f43baee68812bc1ce88cef4949 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] drm/panfrost: Exynos 9820 Mali-G76 support with CMU_G3D and
+ G3D power domain
+
+GPU of the Exynos 9820 (Galaxy S10/S10+):
+
+ - clk: the CMU_G3D muxes, dividers and gates with their binding IDs.
+   PLL_G3D and the G3D rail are owned by the ACPM firmware (DVFS_G3D);
+   the CMU_G3D clocks are registered for visibility and for the
+   suspend save/restore lists, no rate is propagated to the PLL.
+ - pmdomain: the embedded G3D domain follows the vendor PMUCAL
+   sequence. On: route PLL_G3D, cycle the outer G3D block, power the
+   embedded G3D, restore the CMU_G3D and SYSREG_G3D registers lost by
+   the outer block reset. Off: save them, power off, park the GPU mux
+   on the oscillator and release the PLL. With samsung,dtzpc-addr the
+   EL3 monitor saves the D_TZPC configuration of a domain before power
+   off and restores it after power on, as the vendor kernel does;
+   otherwise the SFRs can be left secure-only after a power cycle.
+ - panfrost: compatible and platform data for the Mali-G76 MP12 with
+   the setup the vendor kbase driver uses on this SoC: all 12 cores
+   (the dead-core fuse is only logged), AARCH64_4K page tables with
+   the kbase non-coherent values (GPU_COHERENCY_ENABLE = none,
+   AS_MEMATTR 0x88 for cached mappings, no INA bits in AS_TRANSCFG).
+   Job faults log the time since the last runtime resume.
+
+The binding changes (pd-samsung, mali-bifrost) are part of this commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ .../bindings/gpu/arm,mali-bifrost.yaml        |   1 +
+ .../devicetree/bindings/power/pd-samsung.yaml |  44 ++-
+ drivers/clk/samsung/clk-exynos9820.c          | 226 +++++++++++++-
+ drivers/gpu/drm/panfrost/panfrost_device.c    |   2 +
+ drivers/gpu/drm/panfrost/panfrost_device.h    |  22 ++
+ drivers/gpu/drm/panfrost/panfrost_drv.c       |  29 ++
+ drivers/gpu/drm/panfrost/panfrost_gpu.c       | 106 +++++++
+ drivers/gpu/drm/panfrost/panfrost_gpu.h       |   1 +
+ drivers/gpu/drm/panfrost/panfrost_job.c       |  11 +-
+ drivers/gpu/drm/panfrost/panfrost_mmu.c       |  67 ++++-
+ drivers/pmdomain/samsung/exynos-pm-domains.c  | 282 +++++++++++++++++-
+ include/dt-bindings/clock/exynos9820.h        |  32 ++
+ 12 files changed, 811 insertions(+), 12 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml b/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml
+index ece2b637cd..b695a097dd 100644
+--- a/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml
++++ b/Documentation/devicetree/bindings/gpu/arm,mali-bifrost.yaml
+@@ -35,6 +35,7 @@ properties:
+               - rockchip,rk3568-mali
+               - rockchip,rk3576-mali
+               - samsung,exynos850-mali
++              - samsung,exynos9820-mali
+           - const: arm,mali-bifrost # Mali Bifrost GPU model/revision is fully discoverable
+       - items:
+           - enum:
+diff --git a/Documentation/devicetree/bindings/power/pd-samsung.yaml b/Documentation/devicetree/bindings/power/pd-samsung.yaml
+index 9c2c511334..04a69529f3 100644
+--- a/Documentation/devicetree/bindings/power/pd-samsung.yaml
++++ b/Documentation/devicetree/bindings/power/pd-samsung.yaml
+@@ -21,9 +21,34 @@ properties:
+     enum:
+       - samsung,exynos4210-pd
+       - samsung,exynos5433-pd
++      - samsung,exynos9820-pd
++      - samsung,exynos9820-pd-g3d
+ 
+   reg:
+-    maxItems: 1
++    minItems: 1
++    items:
++      - description: domain CONFIGURATION/STATUS registers
++      - description: PMU G3D_CONFIGURATION/STATUS registers
++      - description: PMU EMBEDDED_G3D_OUT atomic set alias
++      - description: CMU_TOP PLL_CON0_PLL_G3D..PLL_CON2_PLL_G3D
++      - description: CMU_G3D
++      - description: SYSREG_G3D BUS_COMPONENT_DRCG_EN
++
++  reg-names:
++    items:
++      - const: pd
++      - const: g3d
++      - const: out-set
++      - const: pll
++      - const: cmu
++      - const: sysreg
++
++  samsung,dtzpc-addr:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    description:
++      Physical address of the D_TZPC protection register of the blocks in
++      this domain. The secure monitor is asked to save it before the domain
++      is powered off and to restore it after power on (Exynos 9820).
+ 
+   clocks:
+     deprecated: true
+@@ -49,6 +74,23 @@ required:
+   - "#power-domain-cells"
+   - reg
+ 
++if:
++  properties:
++    compatible:
++      contains:
++        const: samsung,exynos9820-pd-g3d
++then:
++  properties:
++    reg:
++      minItems: 6
++  required:
++    - reg-names
++else:
++  properties:
++    reg:
++      maxItems: 1
++    reg-names: false
++
+ unevaluatedProperties: false
+ 
+ examples:
+diff --git a/drivers/clk/samsung/clk-exynos9820.c b/drivers/clk/samsung/clk-exynos9820.c
+index fca06c4ef2..c531cb52d6 100644
+--- a/drivers/clk/samsung/clk-exynos9820.c
++++ b/drivers/clk/samsung/clk-exynos9820.c
+@@ -1903,14 +1903,238 @@ static const struct samsung_cmu_info cmgp_cmu_info __initconst = {
+ 
+ /*
+  * Register offsets for CMU_G3D (0x18400000)
++ *
++ * Taken from the downstream cmucal tables (cal-if/exynos9820/cmucal-sfr.c).
++ *
++ * The GPU core clock is fout_pll_g3d (CMU_TOP) -> mout_g3d_bus_user ->
++ * mout_g3d_busd -> dout_g3d_busd -> mout_g3d_embedded_user -> gout_g3d_gpu.
++ * PLL_G3D itself (and the G3D voltage) is owned by the ACPM firmware: Linux
++ * requests a GPU frequency through the ACPM DVFS clock
++ * (EXYNOS9820_CLK_ACPM_DVFS_G3D) and must not reprogram the PLL directly,
++ * which is why nothing here sets CLK_SET_RATE_PARENT towards fout_pll_g3d.
++ * mout_g3d_switch_user is the glitch-free fallback that ACPM switches
++ * mout_g3d_busd to while it relocks PLL_G3D.
+  */
+-#define G3D_CMU_G3D_CONTROLLER_OPTION		0x0800
++#define PLL_CON0_MUX_CLKCMU_EMBEDDED_G3D_USER				0x0100
++#define PLL_CON2_MUX_CLKCMU_EMBEDDED_G3D_USER				0x0108
++#define PLL_CON0_MUX_CLKCMU_G3D_BUS_USER				0x0120
++#define PLL_CON2_MUX_CLKCMU_G3D_BUS_USER				0x0128
++#define PLL_CON0_MUX_CLKCMU_G3D_SWITCH_USER				0x0140
++#define PLL_CON2_MUX_CLKCMU_G3D_SWITCH_USER				0x0148
++#define G3D_CMU_G3D_CONTROLLER_OPTION					0x0800
++#define G3D_EMBEDDED_CMU_G3D_CONTROLLER_OPTION				0x0804
++#define G3D_SHORTSTOP							0x0820
++#define G3D_CLKDIV2PH							0x0824
++#define CLK_CON_MUX_MUX_CLK_G3D_BUSD					0x1000
++#define CLK_CON_DIV_DIV_CLK_G3D_BUSD					0x1800
++#define CLK_CON_DIV_DIV_CLK_G3D_BUSP					0x1804
++#define CLK_CON_GAT_CLK_BLK_G3D_UID_G3D_CMU_G3D_IPCLKPORT_PCLK		0x2000
++#define CLK_CON_GAT_CLK_BLK_G3D_UID_GPU_IPCLKPORT_CLK			0x2004
++#define CLK_CON_GAT_CLK_BLK_G3D_UID_HPM_G3D0_IPCLKPORT_HPM_TARGETCLK_C	0x2008
++#define CLK_CON_GAT_CLK_BLK_G3D_UID_RSTNSYNC_CLK_G3D_OSCCLK_IPCLKPORT_CLK	0x200c
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D0_PCLK	0x2014
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D1_PCLK	0x2018
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D2_PCLK	0x201c
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D3_PCLK	0x2020
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D0_PCLK	0x2024
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D1_PCLK	0x2028
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D2_PCLK	0x202c
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D3_PCLK	0x2030
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_AXI2APB_G3D_IPCLKPORT_ACLK		0x2034
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_BUSIF_HPMG3D_IPCLKPORT_PCLK		0x2038
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_D_TZPC_G3D_IPCLKPORT_PCLK		0x203c
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_GRAY2BIN_G3D_IPCLKPORT_CLK		0x2040
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_LHM_AXI_G3DSFR_IPCLKPORT_I_CLK	0x2044
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_LHM_AXI_P_G3D_IPCLKPORT_I_CLK	0x2048
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_LHS_AXI_G3DSFR_IPCLKPORT_I_CLK	0x204c
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_RSTNSYNC_CLK_G3D_BUSP_IPCLKPORT_CLK	0x2050
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_SYSREG_G3D_IPCLKPORT_PCLK		0x2054
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_VGEN_LITE_G3D_IPCLKPORT_CLK		0x2058
++#define CLK_CON_GAT_GOUT_BLK_G3D_UID_XIU_P_G3D_IPCLKPORT_ACLK		0x205c
+ 
+ static const unsigned long g3d_clk_regs[] __initconst = {
++	PLL_CON0_MUX_CLKCMU_EMBEDDED_G3D_USER,
++	PLL_CON2_MUX_CLKCMU_EMBEDDED_G3D_USER,
++	PLL_CON0_MUX_CLKCMU_G3D_BUS_USER,
++	PLL_CON2_MUX_CLKCMU_G3D_BUS_USER,
++	PLL_CON0_MUX_CLKCMU_G3D_SWITCH_USER,
++	PLL_CON2_MUX_CLKCMU_G3D_SWITCH_USER,
+ 	G3D_CMU_G3D_CONTROLLER_OPTION,
++	G3D_EMBEDDED_CMU_G3D_CONTROLLER_OPTION,
++	G3D_SHORTSTOP,
++	G3D_CLKDIV2PH,
++	CLK_CON_MUX_MUX_CLK_G3D_BUSD,
++	CLK_CON_DIV_DIV_CLK_G3D_BUSD,
++	CLK_CON_DIV_DIV_CLK_G3D_BUSP,
++	CLK_CON_GAT_CLK_BLK_G3D_UID_G3D_CMU_G3D_IPCLKPORT_PCLK,
++	CLK_CON_GAT_CLK_BLK_G3D_UID_GPU_IPCLKPORT_CLK,
++	CLK_CON_GAT_CLK_BLK_G3D_UID_HPM_G3D0_IPCLKPORT_HPM_TARGETCLK_C,
++	CLK_CON_GAT_CLK_BLK_G3D_UID_RSTNSYNC_CLK_G3D_OSCCLK_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D0_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D1_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D2_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D3_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D0_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D1_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D2_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D3_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_AXI2APB_G3D_IPCLKPORT_ACLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_BUSIF_HPMG3D_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_D_TZPC_G3D_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_GRAY2BIN_G3D_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_LHM_AXI_G3DSFR_IPCLKPORT_I_CLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_LHM_AXI_P_G3D_IPCLKPORT_I_CLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_LHS_AXI_G3DSFR_IPCLKPORT_I_CLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_RSTNSYNC_CLK_G3D_BUSP_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_SYSREG_G3D_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_VGEN_LITE_G3D_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_G3D_UID_XIU_P_G3D_IPCLKPORT_ACLK,
++};
++
++static const struct samsung_fixed_rate_clock g3d_fixed_clks[] __initconst = {
++	/* Free-running oscillator inside the embedded G3D power domain */
++	FRATE(0, "oscclk_embedded_g3d", NULL, 0, 100000000),
++};
++
++PNAME(mout_g3d_switch_user_p)	= { "oscclk", "dout_cmu_g3d_switch" };
++PNAME(mout_g3d_bus_user_p)	= { "oscclk", "fout_pll_g3d" };
++PNAME(mout_g3d_busd_p)		= { "mout_g3d_bus_user",
++				    "mout_g3d_switch_user" };
++PNAME(mout_g3d_embedded_user_p)	= { "oscclk_embedded_g3d", "dout_g3d_busd" };
++
++/*
++ * The muxes are only read back by Linux: ACPM (DVFS) and the G3D power
++ * sequence in the PMU own them, so mark them CLK_GET_RATE_NOCACHE to always
++ * report what the hardware is actually doing.
++ */
++static const struct samsung_mux_clock g3d_mux_clks[] __initconst = {
++	MUX_F(CLK_MOUT_G3D_SWITCH_USER, "mout_g3d_switch_user",
++	      mout_g3d_switch_user_p, PLL_CON0_MUX_CLKCMU_G3D_SWITCH_USER, 4, 1,
++	      CLK_GET_RATE_NOCACHE, 0),
++	MUX_F(CLK_MOUT_G3D_BUS_USER, "mout_g3d_bus_user", mout_g3d_bus_user_p,
++	      PLL_CON0_MUX_CLKCMU_G3D_BUS_USER, 4, 1, CLK_GET_RATE_NOCACHE, 0),
++	MUX_F(CLK_MOUT_G3D_BUSD, "mout_g3d_busd", mout_g3d_busd_p,
++	      CLK_CON_MUX_MUX_CLK_G3D_BUSD, 0, 1, CLK_GET_RATE_NOCACHE, 0),
++	MUX_F(CLK_MOUT_G3D_EMBEDDED_USER, "mout_g3d_embedded_user",
++	      mout_g3d_embedded_user_p, PLL_CON0_MUX_CLKCMU_EMBEDDED_G3D_USER,
++	      4, 1, CLK_GET_RATE_NOCACHE, 0),
++};
++
++static const struct samsung_div_clock g3d_div_clks[] __initconst = {
++	DIV(CLK_DOUT_G3D_BUSP, "dout_g3d_busp", "mout_g3d_busd",
++	    CLK_CON_DIV_DIV_CLK_G3D_BUSP, 0, 3),
++};
++
++static const struct samsung_fixed_factor_clock g3d_fixed_factor_clks[] __initconst = {
++	/* DIV_CLK_G3D_BUSD has no DIVRATIO field, it is a fixed 1:1 divider */
++	FFACTOR(CLK_DOUT_G3D_BUSD, "dout_g3d_busd", "mout_g3d_busd", 1, 1,
++		CLK_GET_RATE_NOCACHE),
++};
++
++static const struct samsung_gate_clock g3d_gate_clks[] __initconst = {
++	GATE(CLK_GOUT_G3D_CMU_G3D_PCLK, "gout_g3d_cmu_g3d_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_CLK_BLK_G3D_UID_G3D_CMU_G3D_IPCLKPORT_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_GPU_CLK, "gout_g3d_gpu_clk", "mout_g3d_embedded_user",
++	     CLK_CON_GAT_CLK_BLK_G3D_UID_GPU_IPCLKPORT_CLK, 21,
++	     CLK_IGNORE_UNUSED | CLK_GET_RATE_NOCACHE, 0),
++	GATE(CLK_GOUT_G3D_HPM_G3D0_TARGETCLK, "gout_g3d_hpm_g3d0_targetclk",
++	     "dout_cmu_hpm",
++	     CLK_CON_GAT_CLK_BLK_G3D_UID_HPM_G3D0_IPCLKPORT_HPM_TARGETCLK_C, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_OSCCLK_CLK, "gout_g3d_oscclk_clk", "oscclk",
++	     CLK_CON_GAT_CLK_BLK_G3D_UID_RSTNSYNC_CLK_G3D_OSCCLK_IPCLKPORT_CLK,
++	     21, CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_PPMU_G3D0_PCLK, "gout_g3d_ppmu_g3d0_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D0_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_PPMU_G3D1_PCLK, "gout_g3d_ppmu_g3d1_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D1_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_PPMU_G3D2_PCLK, "gout_g3d_ppmu_g3d2_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D2_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_PPMU_G3D3_PCLK, "gout_g3d_ppmu_g3d3_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_PPMU_G3D3_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_QE_G3D0_PCLK, "gout_g3d_qe_g3d0_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D0_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_QE_G3D1_PCLK, "gout_g3d_qe_g3d1_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D1_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_QE_G3D2_PCLK, "gout_g3d_qe_g3d2_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D2_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_QE_G3D3_PCLK, "gout_g3d_qe_g3d3_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_ASB_G3D_IPCLKPORT_QE_G3D3_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_AXI2APB_G3D_ACLK, "gout_g3d_axi2apb_g3d_aclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_AXI2APB_G3D_IPCLKPORT_ACLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_BUSIF_HPMG3D_PCLK, "gout_g3d_busif_hpmg3d_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_BUSIF_HPMG3D_IPCLKPORT_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_D_TZPC_G3D_PCLK, "gout_g3d_d_tzpc_g3d_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_D_TZPC_G3D_IPCLKPORT_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_GRAY2BIN_G3D_CLK, "gout_g3d_gray2bin_g3d_clk",
++	     "mout_g3d_embedded_user",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_GRAY2BIN_G3D_IPCLKPORT_CLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_LHM_AXI_G3DSFR_I_CLK, "gout_g3d_lhm_axi_g3dsfr_i_clk",
++	     "mout_g3d_embedded_user",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_LHM_AXI_G3DSFR_IPCLKPORT_I_CLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_LHM_AXI_P_G3D_I_CLK, "gout_g3d_lhm_axi_p_g3d_i_clk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_LHM_AXI_P_G3D_IPCLKPORT_I_CLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_LHS_AXI_G3DSFR_I_CLK, "gout_g3d_lhs_axi_g3dsfr_i_clk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_LHS_AXI_G3DSFR_IPCLKPORT_I_CLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_BUSP_CLK, "gout_g3d_busp_clk", "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_RSTNSYNC_CLK_G3D_BUSP_IPCLKPORT_CLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_SYSREG_G3D_PCLK, "gout_g3d_sysreg_g3d_pclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_SYSREG_G3D_IPCLKPORT_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_VGEN_LITE_G3D_CLK, "gout_g3d_vgen_lite_g3d_clk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_VGEN_LITE_G3D_IPCLKPORT_CLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_G3D_XIU_P_G3D_ACLK, "gout_g3d_xiu_p_g3d_aclk",
++	     "dout_g3d_busp",
++	     CLK_CON_GAT_GOUT_BLK_G3D_UID_XIU_P_G3D_IPCLKPORT_ACLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
+ };
+ 
+ static const struct samsung_cmu_info g3d_cmu_info __initconst = {
++	.mux_clks		= g3d_mux_clks,
++	.nr_mux_clks		= ARRAY_SIZE(g3d_mux_clks),
++	.div_clks		= g3d_div_clks,
++	.nr_div_clks		= ARRAY_SIZE(g3d_div_clks),
++	.gate_clks		= g3d_gate_clks,
++	.nr_gate_clks		= ARRAY_SIZE(g3d_gate_clks),
++	.fixed_clks		= g3d_fixed_clks,
++	.nr_fixed_clks		= ARRAY_SIZE(g3d_fixed_clks),
++	.fixed_factor_clks	= g3d_fixed_factor_clks,
++	.nr_fixed_factor_clks	= ARRAY_SIZE(g3d_fixed_factor_clks),
++	.nr_clk_ids		= CLK_NR_G3D,
+ 	.clk_regs		= g3d_clk_regs,
+ 	.nr_clk_regs		= ARRAY_SIZE(g3d_clk_regs),
+ 	.auto_clock_gate	= true,
+diff --git a/drivers/gpu/drm/panfrost/panfrost_device.c b/drivers/gpu/drm/panfrost/panfrost_device.c
+index 40eda3612f..54544e84a6 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_device.c
++++ b/drivers/gpu/drm/panfrost/panfrost_device.c
+@@ -542,6 +542,8 @@ static int panfrost_device_runtime_resume(struct device *dev)
+ 
+ 	panfrost_device_reset(pfdev, true);
+ 	panfrost_devfreq_resume(pfdev);
++	pfdev->last_resume = ktime_get();
++	pfdev->resume_count++;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/panfrost/panfrost_device.h b/drivers/gpu/drm/panfrost/panfrost_device.h
+index 63452febb1..bdeb1ae00e 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_device.h
++++ b/drivers/gpu/drm/panfrost/panfrost_device.h
+@@ -10,6 +10,7 @@
+ #include <linux/pm.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/spinlock.h>
++#include <linux/ktime.h>
+ #include <drm/drm_auth.h>
+ #include <drm/drm_device.h>
+ #include <drm/drm_mm.h>
+@@ -53,9 +54,13 @@ enum panfrost_gpu_pm {
+ /**
+  * enum panfrost_gpu_quirks - GPU optional quirks
+  * @GPU_QUIRK_FORCE_AARCH64_PGTABLE: Use AARCH64_4K page table format
++ * @GPU_QUIRK_KBASE_NONCOHERENT: Program the GPU the way kbase does on a
++ *	non-coherent integration: GPU_COHERENCY_ENABLE = NONE (31), kbase
++ *	non-coherent AS_MEMATTR values, AS_TRANSCFG.INA_BITS left 0.
+  */
+ enum panfrost_gpu_quirks {
+ 	GPU_QUIRK_FORCE_AARCH64_PGTABLE,
++	GPU_QUIRK_KBASE_NONCOHERENT,
+ };
+ 
+ struct panfrost_features {
+@@ -144,10 +149,27 @@ struct panfrost_device {
+ 	struct device_link *pm_domain_links[MAX_PM_DOMAINS];
+ 	bool coherent;
+ 
++	/*
++	 * Implementation-specific config registers as read right after the
++	 * first soft reset (kbase does read-modify-write on these).
++	 */
++	struct {
++		bool valid;
++		u32 shader_config;
++		u32 tiler_config;
++		u32 jm_config;
++		u32 l2_mmu_config;
++		u32 coherency_enable;
++	} reset_cfg;
++
+ 	struct panfrost_features features;
+ 	const struct panfrost_compatible *comp;
+ 	DECLARE_BITMAP(is_suspended, PANFROST_COMP_BIT_MAX);
+ 
++	/* Diagnostics: last runtime resume (GPU power-up) and their count */
++	ktime_t last_resume;
++	unsigned int resume_count;
++
+ 	spinlock_t as_lock;
+ 	unsigned long as_alloc_mask;
+ 	unsigned long as_faulty_mask;
+diff --git a/drivers/gpu/drm/panfrost/panfrost_drv.c b/drivers/gpu/drm/panfrost/panfrost_drv.c
+index eeda113037..13d1ca0b73 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -842,6 +842,15 @@ static int panfrost_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, pfdev);
+ 
++	/*
++	 * Expected: usage_count=0 runtime_auto=1. A non-zero count with
++	 * runtime_auto=1 is a reference leaked by an earlier unbind (e.g. a
++	 * panfrost.ko without the put in panfrost_remove()).
++	 */
++	dev_info(&pdev->dev, "probe: runtime PM usage_count=%d runtime_auto=%d\n",
++		 atomic_read(&pdev->dev.power.usage_count),
++		 pdev->dev.power.runtime_auto);
++
+ 	return panfrost_device_init(pfdev);
+ }
+ 
+@@ -914,6 +923,25 @@ static const struct panfrost_compatible amlogic_data = {
+ 	.vendor_quirk = panfrost_gpu_amlogic_quirk,
+ };
+ 
++/*
++ * Exynos 9820: one power domain (embedded G3D), no Linux-visible supply: the
++ * G3D rail is driven by the ACPM firmware together with the frequency
++ * requested through the ACPM DVFS clock.
++ */
++static const struct panfrost_compatible exynos9820_data = {
++	.num_supplies = ARRAY_SIZE(default_supplies) - 1,
++	.supply_names = default_supplies,
++	.num_pm_domains = 1,
++	.vendor_quirk = panfrost_gpu_exynos9820_quirk,
++	/*
++	 * kbase-exact MMU/bus setup (AARCH64_4K page tables, no coherency,
++	 * kbase memattrs): 0 job faults on the device, whereas the legacy
++	 * LPAE + ACE-Lite reset setup faults after every G3D power-up.
++	 */
++	.gpu_quirks = BIT(GPU_QUIRK_FORCE_AARCH64_PGTABLE) |
++		      BIT(GPU_QUIRK_KBASE_NONCOHERENT),
++};
++
+ static const char * const mediatek_pm_domains[] = { "core0", "core1", "core2",
+ 						    "core3", "core4" };
+ /*
+@@ -982,6 +1010,7 @@ static const struct of_device_id dt_match[] = {
+ 	{ .compatible = "amlogic,meson-g12a-mali",
+ 	  .data = &amlogic_data, },
+ 	{ .compatible = "renesas,r9a08g046-mali", .data = &default_pm_rt_data },
++	{ .compatible = "samsung,exynos9820-mali", .data = &exynos9820_data },
+ 	{ .compatible = "renesas,r9a09g047-mali", .data = &default_pm_rt_data },
+ 	{ .compatible = "arm,mali-t604", .data = &default_data, },
+ 	{ .compatible = "arm,mali-t624", .data = &default_data, },
+diff --git a/drivers/gpu/drm/panfrost/panfrost_gpu.c b/drivers/gpu/drm/panfrost/panfrost_gpu.c
+index 5c3fee65c9..0526d03f91 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_gpu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_gpu.c
+@@ -21,6 +21,17 @@
+ #include "panfrost_perfcnt.h"
+ #include "panfrost_regs.h"
+ 
++/*
++ * GPU_COHERENCY_ENABLE value written at power-on: 31 (none) on exynos9820,
++ * -3 = leave the reset value (the historical panfrost behaviour).
++ */
++static int panfrost_coherency_mode_get(struct panfrost_device *pfdev)
++{
++	if (pfdev->comp->gpu_quirks & BIT(GPU_QUIRK_KBASE_NONCOHERENT))
++		return 31;
++	return -3;
++}
++
+ static irqreturn_t panfrost_gpu_irq_handler(int irq, void *data)
+ {
+ 	struct panfrost_device *pfdev = data;
+@@ -113,10 +124,103 @@ void panfrost_gpu_amlogic_quirk(struct panfrost_device *pfdev)
+ 	gpu_write(pfdev, GPU_PWR_OVERRIDE1, 0xfff | (0x20 << 16));
+ }
+ 
++/*
++ * Exynos 9820: the downstream kbase platform code has a gpu_core_mask_set()
++ * that derives a core mask from a "dead core" fuse at 0x1000a024. It is only
++ * built with CONFIG_MALI_GPU_CORE_MASK_SELECTION, which the beyond2lte
++ * defconfig does not set, and the r32p1 Exynos platform code actually
++ * shipped on the G975F has no such logic: the vendor driver powers every
++ * core in SHADER_PRESENT. The logic also assumes a 20-core layout
++ * (0x17771777) while the MP12 part reports SHADER_PRESENT = 0x770077, and
++ * on the production lot the fuse word (e.g. 0xe0251fdc) has bits set all
++ * over that layout; applying it left only 4 of the 12 cores (0x20023).
++ *
++ * Only log the fuse for reference.
++ */
++#define EXYNOS9820_LOTID_REG		0x10000004
++#define EXYNOS9820_GPU_DEAD_CORE_REG	0x1000a024
++
++void panfrost_gpu_exynos9820_quirk(struct panfrost_device *pfdev)
++{
++	static bool done;
++	void __iomem *reg;
++	u32 lotid, dead;
++
++	if (done)
++		return;
++	done = true;
++
++	reg = ioremap(EXYNOS9820_LOTID_REG, 4);
++	if (!reg)
++		return;
++	lotid = readl(reg) & 0xfffff;
++	iounmap(reg);
++
++	reg = ioremap(EXYNOS9820_GPU_DEAD_CORE_REG, 4);
++	if (!reg)
++		return;
++	dead = readl(reg);
++	iounmap(reg);
++
++	dev_info(pfdev->base.dev,
++		 "exynos9820: lotid=0x%05x core fuse=0x%08x (not applied) shader_present=0x%llx\n",
++		 lotid, dead, pfdev->features.shader_present);
++}
++
++static void panfrost_gpu_capture_reset_cfg(struct panfrost_device *pfdev)
++{
++	if (pfdev->reset_cfg.valid)
++		return;
++
++	pfdev->reset_cfg.shader_config = gpu_read(pfdev, GPU_SHADER_CONFIG);
++	pfdev->reset_cfg.tiler_config = gpu_read(pfdev, GPU_TILER_CONFIG);
++	pfdev->reset_cfg.jm_config = gpu_read(pfdev, GPU_JM_CONFIG);
++	pfdev->reset_cfg.l2_mmu_config = gpu_read(pfdev, GPU_L2_MMU_CONFIG);
++	if (panfrost_has_hw_feature(pfdev, HW_FEATURE_COHERENCY_REG))
++		pfdev->reset_cfg.coherency_enable = gpu_read(pfdev, GPU_COHERENCY_ENABLE);
++	pfdev->reset_cfg.valid = true;
++
++	dev_info(pfdev->base.dev,
++		 "reset cfg: SHADER_CONFIG=0x%08x TILER_CONFIG=0x%08x JM_CONFIG=0x%08x L2_MMU_CONFIG=0x%08x COHERENCY_FEATURES=0x%x COHERENCY_ENABLE=0x%x STACK_PRESENT=0x%x\n",
++		 pfdev->reset_cfg.shader_config, pfdev->reset_cfg.tiler_config,
++		 pfdev->reset_cfg.jm_config, pfdev->reset_cfg.l2_mmu_config,
++		 pfdev->features.coherency_features,
++		 pfdev->reset_cfg.coherency_enable,
++		 gpu_read(pfdev, GPU_STACK_PRESENT_LO));
++	dev_info(pfdev->base.dev,
++		 "coherency enable=%d dma-coherent=%d\n",
++		 panfrost_coherency_mode_get(pfdev), pfdev->coherent);
++}
++
++static void panfrost_gpu_init_bus_quirks(struct panfrost_device *pfdev, bool log)
++{
++	int coherency_mode = panfrost_coherency_mode_get(pfdev);
++
++	if (coherency_mode != -3 &&
++	    panfrost_has_hw_feature(pfdev, HW_FEATURE_COHERENCY_REG)) {
++		u32 mode = (u32)coherency_mode;
++
++		gpu_write(pfdev, GPU_COHERENCY_ENABLE, mode);
++	}
++
++	if (log)
++		dev_info(pfdev->base.dev,
++			 "applied cfg: SHADER_CONFIG=0x%08x TILER_CONFIG=0x%08x JM_CONFIG=0x%08x L2_MMU_CONFIG=0x%08x COHERENCY_ENABLE=0x%x\n",
++			 gpu_read(pfdev, GPU_SHADER_CONFIG),
++			 gpu_read(pfdev, GPU_TILER_CONFIG),
++			 gpu_read(pfdev, GPU_JM_CONFIG),
++			 gpu_read(pfdev, GPU_L2_MMU_CONFIG),
++			 panfrost_has_hw_feature(pfdev, HW_FEATURE_COHERENCY_REG) ?
++			 gpu_read(pfdev, GPU_COHERENCY_ENABLE) : 0);
++}
++
+ static void panfrost_gpu_init_quirks(struct panfrost_device *pfdev)
+ {
++	bool first = !pfdev->reset_cfg.valid;
+ 	u32 quirks = 0;
+ 
++	panfrost_gpu_capture_reset_cfg(pfdev);
++
+ 	if (panfrost_has_hw_issue(pfdev, HW_ISSUE_8443) ||
+ 	    panfrost_has_hw_issue(pfdev, HW_ISSUE_11035))
+ 		quirks |= SC_LS_PAUSEBUFFER_DISABLE;
+@@ -168,6 +272,8 @@ static void panfrost_gpu_init_quirks(struct panfrost_device *pfdev)
+ 	if (quirks)
+ 		gpu_write(pfdev, GPU_JM_CONFIG, quirks);
+ 
++	panfrost_gpu_init_bus_quirks(pfdev, first);
++
+ 	/* Here goes platform specific quirks */
+ 	if (pfdev->comp->vendor_quirk)
+ 		pfdev->comp->vendor_quirk(pfdev);
+diff --git a/drivers/gpu/drm/panfrost/panfrost_gpu.h b/drivers/gpu/drm/panfrost/panfrost_gpu.h
+index b4fef11211..00fcabfb6a 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_gpu.h
++++ b/drivers/gpu/drm/panfrost/panfrost_gpu.h
+@@ -23,5 +23,6 @@ unsigned long long panfrost_cycle_counter_read(struct panfrost_device *pfdev);
+ unsigned long long panfrost_timestamp_read(struct panfrost_device *pfdev);
+ 
+ void panfrost_gpu_amlogic_quirk(struct panfrost_device *pfdev);
++void panfrost_gpu_exynos9820_quirk(struct panfrost_device *pfdev);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index 3a46dd61cf..de99dd144a 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -465,10 +465,12 @@ static void panfrost_job_handle_err(struct panfrost_device *pfdev,
+ 			job_read(pfdev, JS_HEAD_LO(js)),
+ 			job_read(pfdev, JS_TAIL_LO(js)));
+ 	} else {
+-		dev_err(pfdev->base.dev, "js fault, js=%d, status=%s, head=0x%x, tail=0x%x",
++		dev_err(pfdev->base.dev, "js fault, js=%d, status=%s, head=0x%x, tail=0x%x, %lld ms after runtime resume #%u",
+ 			js, exception_name,
+ 			job_read(pfdev, JS_HEAD_LO(js)),
+-			job_read(pfdev, JS_TAIL_LO(js)));
++			job_read(pfdev, JS_TAIL_LO(js)),
++			ktime_ms_delta(ktime_get(), pfdev->last_resume),
++			pfdev->resume_count);
+ 	}
+ 
+ 	if (js_status == DRM_PANFROST_EXCEPTION_STOPPED) {
+@@ -789,13 +791,14 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+ 		return DRM_GPU_SCHED_STAT_NO_HANG;
+ 	}
+ 
+-	dev_err(pfdev->base.dev, "gpu sched timeout, js=%d, config=0x%x, status=0x%x, head=0x%x, tail=0x%x, sched_job=%p",
++	dev_err(pfdev->base.dev, "gpu sched timeout, js=%d, config=0x%x, status=0x%x, head=0x%x, tail=0x%x, sched_job=%p, MMU_INT_MASK=0x%x, runtime resume #%u",
+ 		js,
+ 		job_read(pfdev, JS_CONFIG(js)),
+ 		job_read(pfdev, JS_STATUS(js)),
+ 		job_read(pfdev, JS_HEAD_LO(js)),
+ 		job_read(pfdev, JS_TAIL_LO(js)),
+-		sched_job);
++		sched_job, readl(pfdev->iomem + MMU_INT_MASK),
++		pfdev->resume_count);
+ 
+ 	panfrost_core_dump(job);
+ 
+diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+index faa62643ca..e74741b907 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -204,6 +204,29 @@ static void panfrost_mmu_disable(struct panfrost_device *pfdev, u32 as_nr)
+ 	write_cmd(pfdev, as_nr, AS_COMMAND_UPDATE);
+ }
+ 
++static bool panfrost_kbase_noncoherent(struct panfrost_device *pfdev)
++{
++	return pfdev->comp->gpu_quirks & BIT(GPU_QUIRK_KBASE_NONCOHERENT);
++}
++
++static int panfrost_memattr_mode_get(struct panfrost_device *pfdev)
++{
++	/*
++	 * Memory attributes as programmed by kbase on non-coherent systems
++	 * (GPU_QUIRK_KBASE_NONCOHERENT), 0 = io-pgtable default otherwise.
++	 * exynos9820: 3 = 0x4C/0x88. 0x88 is kbase's attribute for ordinary
++	 * memory; with 1 (0x8D, explicit write-allocate) GPU-rendered scanout
++	 * buffers reach the non-coherent display controller torn.
++	 */
++	return panfrost_kbase_noncoherent(pfdev) ? 3 : 0;
++}
++
++static bool panfrost_transcfg_ina_get(struct panfrost_device *pfdev)
++{
++	/* AS_TRANSCFG.INA_BITS: off on exynos9820 like kbase */
++	return !panfrost_kbase_noncoherent(pfdev);
++}
++
+ static int mmu_cfg_init_mali_lpae(struct panfrost_mmu *mmu)
+ {
+ 	struct io_pgtable_cfg *pgtbl_cfg = &mmu->pgtbl_cfg;
+@@ -234,11 +257,27 @@ static int mmu_cfg_init_aarch64_4k(struct panfrost_mmu *mmu)
+ 
+ 	mmu->cfg.transcfg = AS_TRANSCFG_PTW_MEMATTR_WB |
+ 			    AS_TRANSCFG_PTW_RA |
+-			    AS_TRANSCFG_ADRMODE_AARCH64_4K |
+-			    AS_TRANSCFG_INA_BITS(55 - pgtbl_cfg->ias);
++			    AS_TRANSCFG_ADRMODE_AARCH64_4K;
++	if (panfrost_transcfg_ina_get(pfdev))
++		mmu->cfg.transcfg |= AS_TRANSCFG_INA_BITS(55 - pgtbl_cfg->ias);
+ 	if (pgtbl_cfg->coherent_walk)
+ 		mmu->cfg.transcfg |= AS_TRANSCFG_PTW_SH_OS;
+ 
++	/*
++	 * io-pgtable attribute indices: 0 = NC, 1 = cached (used for all
++	 * panfrost mappings), 2 = device, 3 = inner-NC/outer-WB.
++	 */
++	/*
++	 * 3: cached index = 0x88 (AS_MEMATTR_AARCH64_OUTER_IMPL_DEF, what
++	 * kbase uses for ordinary memory) instead of 0x8D (explicit
++	 * write-allocate, no read-allocate). With 0x8D, GPU-rendered scanout
++	 * buffers reach the non-coherent DECON torn; with 0x88 the same test
++	 * pattern is clean. Same bytes as memattr=0x884c884c.
++	 */
++	if (panfrost_memattr_mode_get(pfdev) == 3)
++		mmu->cfg.memattr = 0x4CULL | 0x88ULL << 8 | 0x4CULL << 16 |
++				   0x88ULL << 24;
++
+ 	return 0;
+ }
+ 
+@@ -246,17 +285,31 @@ static int panfrost_mmu_cfg_init(struct panfrost_mmu *mmu,
+ 				 enum io_pgtable_fmt fmt)
+ {
+ 	struct panfrost_device *pfdev = mmu->pfdev;
++	int ret;
+ 
+ 	switch (fmt) {
+ 	case ARM_64_LPAE_S1:
+-		return mmu_cfg_init_aarch64_4k(mmu);
++		ret = mmu_cfg_init_aarch64_4k(mmu);
++		break;
+ 	case ARM_MALI_LPAE:
+-		return mmu_cfg_init_mali_lpae(mmu);
++		ret = mmu_cfg_init_mali_lpae(mmu);
++		break;
+ 	default:
+ 		/* This should never happen */
+ 		drm_WARN(&pfdev->base, 1, "Invalid pgtable format");
+ 		return -EINVAL;
+ 	}
++	if (ret)
++		return ret;
++
++	dev_info_once(pfdev->base.dev,
++		      "AS cfg: %s transtab=0x%llx memattr=0x%016llx transcfg=0x%llx memattr mode %d INA %d\n",
++		      fmt == ARM_64_LPAE_S1 ? "AARCH64_4K" : "LPAE",
++		      mmu->cfg.transtab & 0xfffULL, mmu->cfg.memattr,
++		      mmu->cfg.transcfg, panfrost_memattr_mode_get(pfdev),
++		      panfrost_transcfg_ina_get(pfdev));
++
++	return 0;
+ }
+ 
+ int panfrost_mmu_as_get(struct panfrost_device *pfdev, struct panfrost_mmu *mmu)
+@@ -788,7 +841,9 @@ struct panfrost_mmu *panfrost_mmu_ctx_create(struct panfrost_device *pfdev)
+ 	enum io_pgtable_fmt fmt;
+ 	int ret;
+ 
+-	if (pfdev->comp->gpu_quirks & BIT(GPU_QUIRK_FORCE_AARCH64_PGTABLE)) {
++	bool aarch64 = pfdev->comp->gpu_quirks & BIT(GPU_QUIRK_FORCE_AARCH64_PGTABLE);
++
++	if (aarch64) {
+ 		if (!panfrost_has_hw_feature(pfdev, HW_FEATURE_AARCH64_MMU)) {
+ 			dev_err_once(pfdev->base.dev,
+ 				     "AARCH64_4K page table not supported\n");
+@@ -798,6 +853,8 @@ struct panfrost_mmu *panfrost_mmu_ctx_create(struct panfrost_device *pfdev)
+ 	} else {
+ 		fmt = ARM_MALI_LPAE;
+ 	}
++	dev_info_once(pfdev->base.dev, "page table format: %s\n",
++		      aarch64 ? "AARCH64_4K" : "legacy Mali LPAE");
+ 
+ 	mmu = kzalloc_obj(*mmu);
+ 	if (!mmu)
+diff --git a/drivers/pmdomain/samsung/exynos-pm-domains.c b/drivers/pmdomain/samsung/exynos-pm-domains.c
+index 5e0790e0ae..b2313bc876 100644
+--- a/drivers/pmdomain/samsung/exynos-pm-domains.c
++++ b/drivers/pmdomain/samsung/exynos-pm-domains.c
+@@ -9,8 +9,11 @@
+ // conjunction with runtime-pm. Support for both device-tree and non-device-tree
+ // based power domain support is included.
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/io.h>
++#include <linux/iopoll.h>
+ #include <linux/err.h>
++#include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/pm_domain.h>
+@@ -19,9 +22,32 @@
+ #include <linux/of_address.h>
+ #include <linux/pm_runtime.h>
+ 
++struct exynos_pm_domain;
++
+ struct exynos_pm_domain_config {
+ 	/* Value for LOCAL_PWR_CFG and STATUS fields for each domain */
+ 	u32 local_pwr_cfg;
++	/* Optional SoC specific setup, called from probe */
++	int (*init)(struct platform_device *pdev, struct exynos_pm_domain *pd);
++};
++
++/*
++ * Exynos 9820 embedded G3D (Mali GPU) domain.
++ *
++ * Powering the GPU on is more than flipping EMBEDDED_G3D_CONFIGURATION: the
++ * downstream PMUCAL sequence (cal-if/exynos9820/flexpmu_cal_local_exynos9820.h,
++ * embedded_g3d_{on,off,save}) also routes PLL_G3D, cycles the outer G3D block
++ * (which resets CMU_G3D) and therefore saves/restores the CMU_G3D and
++ * SYSREG_G3D registers around the power cycle.
++ */
++struct exynos9820_g3d {
++	void __iomem *g3d_cfg;	/* PMU G3D_CONFIGURATION/STATUS */
++	void __iomem *out_set;	/* PMU EMBEDDED_G3D_OUT atomic set alias */
++	void __iomem *pll;	/* CMU_TOP PLL_CON0_PLL_G3D .. PLL_CON2 */
++	void __iomem *cmu;	/* CMU_G3D */
++	void __iomem *sysreg;	/* SYSREG_G3D BUS_COMPONENT_DRCG_EN */
++	u32 cmu_save[11];
++	u32 sysreg_save;
+ };
+ 
+ /*
+@@ -31,6 +57,9 @@ struct exynos_pm_domain {
+ 	void __iomem *base;
+ 	struct generic_pm_domain pd;
+ 	u32 local_pwr_cfg;
++	/* D_TZPC SFR the secure monitor saves/restores, 0 if none */
++	u32 dtzpc_addr;
++	struct exynos9820_g3d *g3d;
+ };
+ 
+ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
+@@ -63,16 +92,250 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
+ 	return 0;
+ }
+ 
++/* Samsung EL3 monitor: D-TZPC save/restore for runtime power gated blocks */
++#define EXYNOS_SMC_CMD_PREPARE_PD_ONOFF		0x82000410
++#define EXYNOS_GET_IN_PD_DOWN			0
++#define EXYNOS_WAKEUP_PD_DOWN			1
++#define EXYNOS_RUNTIME_PM_TZPC_GROUP		2
++
++static int exynos_pd_dtzpc(struct exynos_pm_domain *pd, bool wakeup)
++{
++	struct arm_smccc_res res;
++
++	if (!pd->dtzpc_addr)
++		return 0;
++
++	arm_smccc_smc(EXYNOS_SMC_CMD_PREPARE_PD_ONOFF,
++		      wakeup ? EXYNOS_WAKEUP_PD_DOWN : EXYNOS_GET_IN_PD_DOWN,
++		      pd->dtzpc_addr, EXYNOS_RUNTIME_PM_TZPC_GROUP,
++		      0, 0, 0, 0, &res);
++	if (res.a0) {
++		pr_err("Power domain %s: D_TZPC %s SMC failed: 0x%lx\n",
++		       pd->pd.name, wakeup ? "restore" : "save", res.a0);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/* CMU_G3D registers saved by the downstream embedded_g3d_save sequence */
++static const u16 exynos9820_g3d_cmu_regs[] = {
++	0x1804,	/* CLK_CON_DIV_DIV_CLK_G3D_BUSP */
++	0x1800,	/* CLK_CON_DIV_DIV_CLK_G3D_BUSD */
++	0x1000,	/* CLK_CON_MUX_MUX_CLK_G3D_BUSD */
++	0x0100,	/* PLL_CON0_MUX_CLKCMU_EMBEDDED_G3D_USER */
++	0x0120,	/* PLL_CON0_MUX_CLKCMU_G3D_BUS_USER */
++	0x0140,	/* PLL_CON0_MUX_CLKCMU_G3D_SWITCH_USER */
++	0x0820,	/* G3D_SHORTSTOP */
++	0x0824,	/* G3D_CLKDIV2PH */
++	0x303c,	/* QCH_CON_BUSIF_HPMG3D_QCH */
++	0x0804,	/* G3D_EMBEDDED_CMU_G3D_CONTROLLER_OPTION */
++	0x0800,	/* G3D_CMU_G3D_CONTROLLER_OPTION */
++};
++
++#define EXYNOS9820_G3D_CMU_SIZE			0x4000
++#define EXYNOS9820_G3D_MUX_EMBEDDED_USER	0x0100
++#define EXYNOS9820_G3D_QCH_BUSIF_HPMG3D		0x303c
++#define EXYNOS9820_PLL_CON0			0x0
++#define EXYNOS9820_PLL_CON2			0x8
++#define EXYNOS9820_PLL_MUX_SEL			BIT(4)
++#define EXYNOS9820_PLL_G3D_CON2_ON		0x30000003
++#define EXYNOS9820_PLL_G3D_CON2_OFF		0x10000001
++#define EXYNOS9820_EMBEDDED_G3D_OUT_BIT		2
++
++static void exynos9820_g3d_save(struct exynos9820_g3d *g3d)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(exynos9820_g3d_cmu_regs); i++)
++		g3d->cmu_save[i] = readl(g3d->cmu + exynos9820_g3d_cmu_regs[i]);
++	g3d->sysreg_save = readl(g3d->sysreg);
++}
++
++static void exynos9820_g3d_restore(struct exynos9820_g3d *g3d)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(exynos9820_g3d_cmu_regs); i++)
++		writel(g3d->cmu_save[i], g3d->cmu + exynos9820_g3d_cmu_regs[i]);
++	writel(g3d->sysreg_save, g3d->sysreg);
++}
++
++static void exynos_pd_rmw(void __iomem *reg, u32 mask, u32 val)
++{
++	writel((readl(reg) & ~mask) | (val & mask), reg);
++}
++
++static int exynos9820_g3d_outer(struct exynos_pm_domain *pd, bool on)
++{
++	void __iomem *cfg = pd->g3d->g3d_cfg;
++	u32 want = on ? 0x1 : 0x0;
++	u32 val;
++	int ret;
++
++	exynos_pd_rmw(cfg, 0x1, want);
++	ret = readl_poll_timeout(cfg + 0x4, val, (val & 0x1) == want, 1, 2000);
++	if (ret)
++		pr_err("Power domain %s: G3D_STATUS stuck (0x%x, want %u)\n",
++		       pd->pd.name, val, want);
++
++	return ret;
++}
++
++static int exynos9820_g3d_power_on(struct exynos_pm_domain *pd)
++{
++	struct exynos9820_g3d *g3d = pd->g3d;
++	int ret;
++
++	/* Route PLL_G3D to the G3D block */
++	writel(EXYNOS9820_PLL_G3D_CON2_ON, g3d->pll + EXYNOS9820_PLL_CON2);
++	exynos_pd_rmw(g3d->pll + EXYNOS9820_PLL_CON0, EXYNOS9820_PLL_MUX_SEL,
++		      EXYNOS9820_PLL_MUX_SEL);
++
++	/* Cycle the outer G3D block with EMBEDDED_G3D_OUT asserted */
++	ret = exynos9820_g3d_outer(pd, false);
++	if (ret)
++		return ret;
++	writel(EXYNOS9820_EMBEDDED_G3D_OUT_BIT, g3d->out_set);
++	udelay(280);
++	ret = exynos9820_g3d_outer(pd, true);
++	if (ret)
++		return ret;
++	udelay(280);
++
++	/* Finally the GPU itself */
++	return exynos_pd_power(&pd->pd, true);
++}
++
++static int exynos9820_g3d_power_off(struct exynos_pm_domain *pd)
++{
++	struct exynos9820_g3d *g3d = pd->g3d;
++	int ret;
++
++	exynos_pd_rmw(g3d->cmu + EXYNOS9820_G3D_QCH_BUSIF_HPMG3D, BIT(2), 0);
++
++	ret = exynos_pd_power(&pd->pd, false);
++	if (ret)
++		return ret;
++	udelay(138);
++
++	/* Park the GPU clock on the oscillator and release PLL_G3D */
++	exynos_pd_rmw(g3d->cmu + EXYNOS9820_G3D_MUX_EMBEDDED_USER, BIT(4), 0);
++	exynos_pd_rmw(g3d->pll + EXYNOS9820_PLL_CON0, EXYNOS9820_PLL_MUX_SEL, 0);
++	writel(EXYNOS9820_PLL_G3D_CON2_OFF, g3d->pll + EXYNOS9820_PLL_CON2);
++
++	return 0;
++}
++
+ static int exynos_pd_power_on(struct generic_pm_domain *domain)
+ {
+-	return exynos_pd_power(domain, true);
++	struct exynos_pm_domain *pd =
++		container_of(domain, struct exynos_pm_domain, pd);
++	int ret;
++
++	if (pd->g3d)
++		ret = exynos9820_g3d_power_on(pd);
++	else
++		ret = exynos_pd_power(domain, true);
++	if (ret)
++		return ret;
++
++	ret = exynos_pd_dtzpc(pd, true);
++	if (ret)
++		return ret;
++
++	if (pd->g3d) {
++		exynos9820_g3d_restore(pd->g3d);
++		pr_debug("Power domain %s: on, MUX_EMBEDDED_G3D_USER=0x%08x MUX_G3D_BUSD=0x%08x\n",
++			 domain->name,
++			 readl(pd->g3d->cmu + EXYNOS9820_G3D_MUX_EMBEDDED_USER),
++			 readl(pd->g3d->cmu + 0x1000));
++	}
++
++	return 0;
+ }
+ 
+ static int exynos_pd_power_off(struct generic_pm_domain *domain)
+ {
++	struct exynos_pm_domain *pd =
++		container_of(domain, struct exynos_pm_domain, pd);
++	int ret;
++
++	if (pd->g3d)
++		exynos9820_g3d_save(pd->g3d);
++
++	ret = exynos_pd_dtzpc(pd, false);
++	if (ret)
++		return ret;
++
++	if (pd->g3d)
++		return exynos9820_g3d_power_off(pd);
++
+ 	return exynos_pd_power(domain, false);
+ }
+ 
++static void __iomem *exynos_pd_ioremap_byname(struct platform_device *pdev,
++					      const char *name,
++					      resource_size_t min_size)
++{
++	struct resource *res;
++
++	/*
++	 * These registers belong to blocks that have their own drivers
++	 * (PMU, CMU_TOP, CMU_G3D, SYSREG_G3D), so map them without claiming
++	 * the memory region.
++	 */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res || resource_size(res) < min_size) {
++		dev_err(&pdev->dev, "missing or too small \"%s\" reg\n", name);
++		return IOMEM_ERR_PTR(-EINVAL);
++	}
++
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res)) ?:
++	       IOMEM_ERR_PTR(-ENOMEM);
++}
++
++static int exynos9820_g3d_init(struct platform_device *pdev,
++			       struct exynos_pm_domain *pd)
++{
++	struct exynos9820_g3d *g3d;
++
++	g3d = devm_kzalloc(&pdev->dev, sizeof(*g3d), GFP_KERNEL);
++	if (!g3d)
++		return -ENOMEM;
++
++	g3d->g3d_cfg = exynos_pd_ioremap_byname(pdev, "g3d", 0x8);
++	if (IS_ERR(g3d->g3d_cfg))
++		return PTR_ERR(g3d->g3d_cfg);
++	g3d->out_set = exynos_pd_ioremap_byname(pdev, "out-set", 0x4);
++	if (IS_ERR(g3d->out_set))
++		return PTR_ERR(g3d->out_set);
++	g3d->pll = exynos_pd_ioremap_byname(pdev, "pll", 0xc);
++	if (IS_ERR(g3d->pll))
++		return PTR_ERR(g3d->pll);
++	g3d->cmu = exynos_pd_ioremap_byname(pdev, "cmu", EXYNOS9820_G3D_CMU_SIZE);
++	if (IS_ERR(g3d->cmu))
++		return PTR_ERR(g3d->cmu);
++	g3d->sysreg = exynos_pd_ioremap_byname(pdev, "sysreg", 0x4);
++	if (IS_ERR(g3d->sysreg))
++		return PTR_ERR(g3d->sysreg);
++
++	/*
++	 * CMU_G3D sits in the outer G3D block, which is up whenever the
++	 * kernel runs (the clock driver programs it at boot). Take a first
++	 * snapshot now so that the reset done by the first power-on gets
++	 * undone even if the domain was off at boot.
++	 */
++	exynos9820_g3d_save(g3d);
++	pd->g3d = g3d;
++
++	dev_info(&pdev->dev, "G3D sequencing enabled, MUX_EMBEDDED_G3D_USER=0x%08x MUX_G3D_BUSD=0x%08x PLL_CON0_PLL_G3D=0x%08x\n",
++		 g3d->cmu_save[3], g3d->cmu_save[2],
++		 readl(g3d->pll + EXYNOS9820_PLL_CON0));
++
++	return 0;
++}
++
+ static const struct exynos_pm_domain_config exynos4210_cfg = {
+ 	.local_pwr_cfg		= 0x7,
+ };
+@@ -85,6 +348,11 @@ static const struct exynos_pm_domain_config exynos9820_cfg = {
+ 	.local_pwr_cfg		= 0x1,
+ };
+ 
++static const struct exynos_pm_domain_config exynos9820_g3d_cfg = {
++	.local_pwr_cfg		= 0x1,
++	.init			= exynos9820_g3d_init,
++};
++
+ static const struct of_device_id exynos_pm_domain_of_match[] = {
+ 	{
+ 		.compatible = "samsung,exynos4210-pd",
+@@ -95,6 +363,9 @@ static const struct of_device_id exynos_pm_domain_of_match[] = {
+ 	}, {
+ 		.compatible = "samsung,exynos9820-pd",
+ 		.data = &exynos9820_cfg,
++	}, {
++		.compatible = "samsung,exynos9820-pd-g3d",
++		.data = &exynos9820_g3d_cfg,
+ 	},
+ 	{ },
+ };
+@@ -134,6 +405,15 @@ static int exynos_pd_probe(struct platform_device *pdev)
+ 	pd->pd.power_off = exynos_pd_power_off;
+ 	pd->pd.power_on = exynos_pd_power_on;
+ 	pd->local_pwr_cfg = pm_domain_cfg->local_pwr_cfg;
++	of_property_read_u32(np, "samsung,dtzpc-addr", &pd->dtzpc_addr);
++
++	if (pm_domain_cfg->init) {
++		ret = pm_domain_cfg->init(pdev, pd);
++		if (ret) {
++			iounmap(pd->base);
++			return ret;
++		}
++	}
+ 
+ 	/*
+ 	 * Some Samsung platforms with bootloaders turning on the splash-screen
+diff --git a/include/dt-bindings/clock/exynos9820.h b/include/dt-bindings/clock/exynos9820.h
+index f90e45d67f..2d8cf72d5e 100644
+--- a/include/dt-bindings/clock/exynos9820.h
++++ b/include/dt-bindings/clock/exynos9820.h
+@@ -310,6 +310,38 @@
+ #define CLK_GOUT_CMGP_USI_CMGP3_PCLK		56
+ #define CLK_NR_CMGP				57
+ 
++/* CMU_G3D */
++#define CLK_MOUT_G3D_SWITCH_USER		1
++#define CLK_MOUT_G3D_BUS_USER			2
++#define CLK_MOUT_G3D_BUSD			3
++#define CLK_DOUT_G3D_BUSD			4
++#define CLK_MOUT_G3D_EMBEDDED_USER		5
++#define CLK_DOUT_G3D_BUSP			6
++#define CLK_GOUT_G3D_CMU_G3D_PCLK		7
++#define CLK_GOUT_G3D_GPU_CLK			8
++#define CLK_GOUT_G3D_HPM_G3D0_TARGETCLK		9
++#define CLK_GOUT_G3D_OSCCLK_CLK			10
++#define CLK_GOUT_G3D_PPMU_G3D0_PCLK		11
++#define CLK_GOUT_G3D_PPMU_G3D1_PCLK		12
++#define CLK_GOUT_G3D_PPMU_G3D2_PCLK		13
++#define CLK_GOUT_G3D_PPMU_G3D3_PCLK		14
++#define CLK_GOUT_G3D_QE_G3D0_PCLK		15
++#define CLK_GOUT_G3D_QE_G3D1_PCLK		16
++#define CLK_GOUT_G3D_QE_G3D2_PCLK		17
++#define CLK_GOUT_G3D_QE_G3D3_PCLK		18
++#define CLK_GOUT_G3D_AXI2APB_G3D_ACLK		19
++#define CLK_GOUT_G3D_BUSIF_HPMG3D_PCLK		20
++#define CLK_GOUT_G3D_D_TZPC_G3D_PCLK		21
++#define CLK_GOUT_G3D_GRAY2BIN_G3D_CLK		22
++#define CLK_GOUT_G3D_LHM_AXI_G3DSFR_I_CLK	23
++#define CLK_GOUT_G3D_LHM_AXI_P_G3D_I_CLK	24
++#define CLK_GOUT_G3D_LHS_AXI_G3DSFR_I_CLK	25
++#define CLK_GOUT_G3D_BUSP_CLK			26
++#define CLK_GOUT_G3D_SYSREG_G3D_PCLK		27
++#define CLK_GOUT_G3D_VGEN_LITE_G3D_CLK		28
++#define CLK_GOUT_G3D_XIU_P_G3D_ACLK		29
++#define CLK_NR_G3D				30
++
+ /* CMU_DPU */
+ #define CLK_MOUT_DPU_BUS_USER						1
+ #define CLK_DOUT_DPU_BUSP						2

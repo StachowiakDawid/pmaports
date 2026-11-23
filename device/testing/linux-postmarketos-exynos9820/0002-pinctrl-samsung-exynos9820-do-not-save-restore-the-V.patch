@@ -1,0 +1,93 @@
+From 996f90f615bd9b39fcb38a6c6f81e717c96497fb Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] pinctrl: samsung: exynos9820: do not save/restore the VTS
+ block across suspend
+
+pinctrl@15580000 (VTS, bank gpv0) lives in the VTS power domain, which
+is off on the Galaxy S10 boards. The suspend code reads every bank's
+registers, and the access to the powered-down block takes a synchronous
+external abort.
+
+Add a no_sleep_save flag for controllers whose registers are not
+accessible during system sleep and set it for the Exynos 9820 VTS
+instance; gpv0 has no users.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/pinctrl/samsung/pinctrl-exynos-arm64.c | 6 ++++++
+ drivers/pinctrl/samsung/pinctrl-samsung.c      | 8 ++++++++
+ drivers/pinctrl/samsung/pinctrl-samsung.h      | 2 ++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c b/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c
+index c2ea5c0ede..ecdaa4f257 100644
+--- a/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c
++++ b/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c
+@@ -1516,6 +1516,12 @@ static const struct samsung_pin_ctrl exynos9820_pin_ctrl[] __initconst = {
+ 		/* pin-controller instance 7 VTS data */
+ 		.pin_banks	= exynos9820_pin_banks7,
+ 		.nr_banks	= ARRAY_SIZE(exynos9820_pin_banks7),
++		/*
++		 * The VTS block sits in the VTS power domain, which is off
++		 * (no VTS driver); saving its registers at suspend takes a
++		 * synchronous external abort. gpv0 has no users here.
++		 */
++		.no_sleep_save	= true,
+ 	},
+ };
+ 
+diff --git a/drivers/pinctrl/samsung/pinctrl-samsung.c b/drivers/pinctrl/samsung/pinctrl-samsung.c
+index 3d85a1e645..dab7562886 100644
+--- a/drivers/pinctrl/samsung/pinctrl-samsung.c
++++ b/drivers/pinctrl/samsung/pinctrl-samsung.c
+@@ -1195,6 +1195,7 @@ samsung_pinctrl_get_soc_data(struct samsung_pinctrl_drv_data *d,
+ 
+ 	d->suspend = ctrl->suspend;
+ 	d->resume = ctrl->resume;
++	d->no_sleep_save = ctrl->no_sleep_save;
+ 	d->nr_banks = ctrl->nr_banks;
+ 	d->pin_banks = devm_kzalloc_objs(&pdev->dev, *d->pin_banks, d->nr_banks);
+ 	if (!d->pin_banks)
+@@ -1336,6 +1337,10 @@ static int __maybe_unused samsung_pinctrl_suspend(struct device *dev)
+ 	struct samsung_pin_bank *bank;
+ 	int i;
+ 
++	/* block in a power domain that is off: registers not accessible */
++	if (drvdata->no_sleep_save)
++		return 0;
++
+ 	i = clk_enable(drvdata->pclk);
+ 	if (i) {
+ 		dev_err(drvdata->dev,
+@@ -1401,6 +1406,9 @@ static int __maybe_unused samsung_pinctrl_resume(struct device *dev)
+ 	int ret;
+ 	int i;
+ 
++	if (drvdata->no_sleep_save)
++		return 0;
++
+ 	/*
+ 	 * enable clock before the callback, as we don't want to have to deal
+ 	 * with callback cleanup on clock failures.
+diff --git a/drivers/pinctrl/samsung/pinctrl-samsung.h b/drivers/pinctrl/samsung/pinctrl-samsung.h
+index 310603f4d4..d59c78636a 100644
+--- a/drivers/pinctrl/samsung/pinctrl-samsung.h
++++ b/drivers/pinctrl/samsung/pinctrl-samsung.h
+@@ -291,6 +291,7 @@ struct samsung_pin_ctrl {
+ 	void		(*pud_value_init)(struct samsung_pinctrl_drv_data *drvdata);
+ 	void		(*suspend)(struct samsung_pin_bank *bank);
+ 	void		(*resume)(struct samsung_pin_bank *bank);
++	bool		no_sleep_save;
+ };
+ 
+ /**
+@@ -341,6 +342,7 @@ struct samsung_pinctrl_drv_data {
+ 
+ 	void (*suspend)(struct samsung_pin_bank *bank);
+ 	void (*resume)(struct samsung_pin_bank *bank);
++	bool no_sleep_save;
+ };
+ 
+ /**

@@ -1,0 +1,131 @@
+From c1f011340c7e59ba446a11484fd3fc785ae552ff Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] PM: add a sleep state hook and a syscore resume hook
+
+- pm_suspend_state_hook: pm_suspend() calls it, if set, with the
+  requested state before anything else and enters the state it
+  returns. A platform can fall back to suspend-to-idle when
+  suspend-to-RAM is not safe at the moment.
+- syscore_resume_hook, called with the index and the callback before
+  every syscore resume callback, and syscore_for_each_resume() to
+  list them. A platform can leave a trace that survives a hang.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/base/syscore.c      | 22 ++++++++++++++++++++++
+ include/linux/suspend.h     |  1 +
+ include/linux/syscore_ops.h |  2 ++
+ kernel/power/suspend.c      | 15 +++++++++++++++
+ 4 files changed, 40 insertions(+)
+
+diff --git a/drivers/base/syscore.c b/drivers/base/syscore.c
+index 483adb7966..77a2dbcee8 100644
+--- a/drivers/base/syscore.c
++++ b/drivers/base/syscore.c
+@@ -85,6 +85,24 @@ int syscore_suspend(void)
+ }
+ EXPORT_SYMBOL_GPL(syscore_suspend);
+ 
++/*
++ * Debug hook: called with the index and the callback
++ * before every syscore resume callback, so a platform can leave a trace that
++ * survives a hang (e.g. breadcrumbs in a PMIC). NULL = off.
++ */
++void (*syscore_resume_hook)(unsigned int idx, void *fn);
++
++/* Enumerate the resume callbacks in the order syscore_resume() runs them. */
++void syscore_for_each_resume(void (*cb)(unsigned int idx, void *fn))
++{
++	struct syscore *syscore;
++	unsigned int idx = 0;
++
++	list_for_each_entry(syscore, &syscore_list, node)
++		if (syscore->ops->resume)
++			cb(idx++, syscore->ops->resume);
++}
++
+ /**
+  * syscore_resume - Execute all the registered system core resume callbacks.
+  *
+@@ -93,6 +111,7 @@ EXPORT_SYMBOL_GPL(syscore_suspend);
+ void syscore_resume(void)
+ {
+ 	struct syscore *syscore;
++	unsigned int idx = 0;
+ 
+ 	trace_suspend_resume(TPS("syscore_resume"), 0, true);
+ 	WARN_ONCE(!irqs_disabled(),
+@@ -100,6 +119,9 @@ void syscore_resume(void)
+ 
+ 	list_for_each_entry(syscore, &syscore_list, node)
+ 		if (syscore->ops->resume) {
++			if (syscore_resume_hook)
++				syscore_resume_hook(idx, syscore->ops->resume);
++			idx++;
+ 			pm_pr_dbg("Calling %pS\n", syscore->ops->resume);
+ 			syscore->ops->resume(syscore->data);
+ 			WARN_ONCE(!irqs_disabled(),
+diff --git a/include/linux/suspend.h b/include/linux/suspend.h
+index a381502777..323615c5a3 100644
+--- a/include/linux/suspend.h
++++ b/include/linux/suspend.h
+@@ -145,6 +145,7 @@ struct platform_s2idle_ops {
+ #ifdef CONFIG_SUSPEND
+ extern suspend_state_t pm_suspend_target_state;
+ extern suspend_state_t mem_sleep_current;
++extern suspend_state_t (*pm_suspend_state_hook)(suspend_state_t state);
+ extern suspend_state_t mem_sleep_default;
+ 
+ /**
+diff --git a/include/linux/syscore_ops.h b/include/linux/syscore_ops.h
+index ac6d71be5c..9556de3d34 100644
+--- a/include/linux/syscore_ops.h
++++ b/include/linux/syscore_ops.h
+@@ -27,6 +27,8 @@ extern void unregister_syscore(struct syscore *syscore);
+ #ifdef CONFIG_PM_SLEEP
+ extern int syscore_suspend(void);
+ extern void syscore_resume(void);
++extern void (*syscore_resume_hook)(unsigned int idx, void *fn);
++extern void syscore_for_each_resume(void (*cb)(unsigned int idx, void *fn));
+ #endif
+ extern void syscore_shutdown(void);
+ 
+diff --git a/kernel/power/suspend.c b/kernel/power/suspend.c
+index 32c055df02..ca62cadf73 100644
+--- a/kernel/power/suspend.c
++++ b/kernel/power/suspend.c
+@@ -630,6 +630,13 @@ static int enter_state(suspend_state_t state)
+ 	return error;
+ }
+ 
++/*
++ * Platform hook: called with the requested sleep state before anything else
++ * is done, returns the state to enter instead (e.g. suspend-to-idle when the
++ * platform cannot do suspend-to-RAM safely right now).
++ */
++suspend_state_t (*pm_suspend_state_hook)(suspend_state_t state);
++
+ /**
+  * pm_suspend - Externally visible function for suspending the system.
+  * @state: System sleep state to enter.
+@@ -639,11 +646,19 @@ static int enter_state(suspend_state_t state)
+  */
+ int pm_suspend(suspend_state_t state)
+ {
++	suspend_state_t (*hook)(suspend_state_t);
+ 	int error;
+ 
+ 	if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
+ 		return -EINVAL;
+ 
++	hook = READ_ONCE(pm_suspend_state_hook);
++	if (hook) {
++		state = hook(state);
++		if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
++			return -EINVAL;
++	}
++
+ 	pr_info("suspend entry (%s)\n", mem_sleep_labels[state]);
+ 	error = enter_state(state);
+ 	dpm_save_errno(error);

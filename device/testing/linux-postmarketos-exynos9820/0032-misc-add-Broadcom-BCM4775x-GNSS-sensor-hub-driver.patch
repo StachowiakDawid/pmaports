@@ -1,0 +1,2793 @@
+From 7be1e3bc53067c0213698c64e7b0e0b437ee82e0 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] misc: add Broadcom BCM4775x GNSS/sensor hub driver
+
+SPI link layer ("SSI") and power control for the Broadcom BCM4775x
+combined GNSS receiver and sensor hub of the Galaxy S10 family. The
+byte stream is exposed as /dev/bcm4775x; the boot ROM
+dialogue, firmware download and the protocols above are left to user
+space. The driver can also run the sensor hub itself and then provides
+the sensors behind it as IIO devices, the magnetometer with a buffer
+and a compass heading (magn_hard_iron / magn_soft_iron correction
+parameters). The hub is powered off after 60 s without a reader.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/misc/Kconfig    |   19 +
+ drivers/misc/Makefile   |    1 +
+ drivers/misc/bcm4775x.c | 2726 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 2746 insertions(+)
+ create mode 100644 drivers/misc/bcm4775x.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index c40e89cc57..8241fa450d 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -583,6 +583,25 @@ config TC9564_PCI
+ 	  quirk causes the ranges property in the endpoint's devicetree
+ 	  node to be updated dynamically.
+ 
++config BCM4775X
++	tristate "Broadcom BCM4775x GNSS/sensor hub SPI link"
++	depends on SPI && OF && IIO
++	select FW_LOADER
++	select IIO_BUFFER
++	select IIO_KFIFO_BUF
++	help
++	  SPI link layer ("SSI") and power control for the Broadcom BCM4775x
++	  combined GNSS receiver and sensor hub found in the Samsung Galaxy
++	  S10 family. The byte stream is exposed as /dev/bcm4775x; the boot
++	  ROM dialogue, firmware download and the protocols above are left
++	  to user space. The driver can also run the sensor hub itself
++	  (firmware brcm/bcm4775x-sensorhub.bin) and then provides the
++	  sensors behind it as IIO devices, the magnetometer with a buffer
++	  and a compass heading.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called bcm4775x.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 7cc3d615d3..49c1ba093e 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -72,3 +72,4 @@ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
+ obj-$(CONFIG_INTEL_SSEI)	+= issei/
+ obj-$(CONFIG_TC9564_PCI)	+= tc9564-pci.o
++obj-$(CONFIG_BCM4775X)		+= bcm4775x.o
+diff --git a/drivers/misc/bcm4775x.c b/drivers/misc/bcm4775x.c
+new file mode 100644
+index 0000000000..0ef5b14e83
+--- /dev/null
++++ b/drivers/misc/bcm4775x.c
+@@ -0,0 +1,2726 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Broadcom BCM4775x GNSS receiver + sensor hub: SPI link layer ("SSI")
++ *
++ * The chip (BCM47752 on the Samsung Galaxy S10 family) talks to the host
++ * over SPI with a small streaming protocol: every SPI transfer starts with a
++ * control byte and a 16 bit length, the chip answers with a status byte and
++ * the number of bytes it has for the host. Two GPIOs (MCU_REQ/MCU_RESP) wake
++ * the chip before a transfer, HOST_REQ is raised by the chip when it has
++ * data.
++ *
++ * This driver implements that link layer and the power control, and hands
++ * the byte stream to user space through /dev/bcm4775x (for GNSS and for
++ * experiments). It can also run the sensor hub itself: it downloads the
++ * firmware, speaks the transport layer, the RPCs and Samsung's SSP sensor
++ * protocol and offers the sensors behind the hub as IIO devices. The two users
++ * exclude each other. The magnetometer also has an IIO buffer and a tilt
++ * compensated compass heading computed here from it and the accelerometer.
++ *
++ * The SSI framing follows the vendor driver (drivers/sensorhub/brcm/bbdpl/
++ * bcm_gps_spi.c, Copyright 2015 Broadcom Corporation, GPL-2.0) of the
++ * SM-G975F kernel.
++ *
++ * The chip is unpowered until user space writes 1 to the "chip_power" attribute;
++ * until then all pins stay in their idle (input, pull-down) state.
++ */
++
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/gpio/consumer.h>
++#include <linux/iio/buffer.h>
++#include <linux/iio/iio.h>
++#include <linux/iio/kfifo_buf.h>
++#include <linux/interrupt.h>
++#include <linux/kfifo.h>
++#include <linux/math64.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/poll.h>
++#include <linux/property.h>
++#include <linux/regulator/consumer.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/unaligned.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++#define SSI_MODE_FULL_DUPLEX	0x40
++#define SSI_READ_TRANS		0x20
++#define SSI_PCKT_2B_LENGTH	0x10
++#define SSI_FLOW_CONTROL	0x08
++
++/* host -> chip: full duplex, 2 byte length, flow control */
++#define SSI_TX_CTRL	(SSI_MODE_FULL_DUPLEX | SSI_PCKT_2B_LENGTH | SSI_FLOW_CONTROL)
++/* chip -> host: full duplex, 2 byte length, read */
++#define SSI_RX_CTRL	(SSI_MODE_FULL_DUPLEX | SSI_PCKT_2B_LENGTH | SSI_READ_TRANS)
++
++#define SSI_LEN_BYTES		2
++#define SSI_TX_CTRL_LEN		(1 + SSI_LEN_BYTES + SSI_LEN_BYTES)	/* cmd, len, fc */
++#define SSI_RX_CTRL_LEN		(1 + SSI_LEN_BYTES)			/* status, len */
++#define SSI_MAX_FRAME		8192
++#define SSI_MIN_FRAME		254
++#define SSI_FC_RETRIES		3
++
++/* status byte: free space in the chip's receive ring ("PZC") and an error flag */
++#define SSI_STAT_CNT_MASK	0x07
++#define SSI_STAT_SZE_MASK	0x18
++#define SSI_STAT_SZE_SHIFT	3
++#define SSI_STAT_PE		0x40
++
++#define BCM4775X_RX_FIFO	(64 * 1024)
++#define BCM4775X_TX_FIFO	(32 * 1024)
++#define BCM4775X_HELLO_MS	100
++
++struct bcm4775x_hub;
++
++struct bcm4775x {
++	struct spi_device *spi;
++	struct bcm4775x_hub *hub;
++	bool hub_active;	/* the in-kernel sensor hub owns the stream */
++	struct miscdevice misc;
++
++	struct regulator *vdd;
++	struct gpio_desc *nstandby;
++	struct gpio_desc *mcu_req;
++	struct gpio_desc *mcu_resp;
++	struct gpio_desc *host_req;
++	struct gpio_desc *cs;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pins_idle;
++	struct pinctrl_state *pins_active;
++	int irq;
++	spinlock_t irq_lock;
++	bool irq_masked;	/* level interrupt masked until the work served it */
++
++	/* power state, open count, irq_on */
++	struct mutex lock;
++	bool powered;
++	bool opened;
++	bool irq_on;
++	bool suspended;
++
++	/* serialises SPI traffic and the handshake lines */
++	struct mutex io_lock;
++	struct workqueue_struct *wq;
++	struct work_struct work;
++	u8 *tx_buf;
++	u8 *rx_buf;
++
++	DECLARE_KFIFO_PTR(rx_fifo, u8);
++	DECLARE_KFIFO_PTR(tx_fifo, u8);
++	struct mutex rx_lock;	/* readers */
++	struct mutex tx_lock;	/* writers */
++	wait_queue_head_t wait;
++
++	/* statistics */
++	unsigned long tx_bytes, rx_bytes, tx_frames, rx_frames;
++	unsigned long fc_retries, fc_errors, hello_fail, spi_errors, rx_dropped;
++	unsigned long parity_errors;
++	u8 last_status;
++	bool link_error;
++};
++
++static unsigned int ssi_get_len(const u8 *p)
++{
++	return p[0] | (p[1] << 8);
++}
++
++static void ssi_set_len(u8 *p, unsigned int len)
++{
++	p[0] = len & 0xff;
++	p[1] = len >> 8;
++}
++
++static unsigned int bcm4775x_frame_len(void)
++{
++	return SSI_MAX_FRAME;
++}
++
++/* One SPI transfer with the chip select (a GPIO of ours) held for its length */
++static int bcm4775x_xfer(struct bcm4775x *priv, unsigned int len)
++{
++	struct spi_transfer xfer = {
++		.tx_buf = priv->tx_buf,
++		.rx_buf = priv->rx_buf,
++		.len = len,
++	};
++	int ret;
++
++	gpiod_set_value_cansleep(priv->cs, 1);
++	ret = spi_sync_transfer(priv->spi, &xfer, 1);
++	gpiod_set_value_cansleep(priv->cs, 0);
++
++	if (ret) {
++		priv->spi_errors++;
++		dev_err(&priv->spi->dev, "SPI transfer failed: %d\n", ret);
++		return ret;
++	}
++
++	priv->last_status = priv->rx_buf[0];
++	if (priv->last_status & SSI_STAT_PE)
++		priv->parity_errors++;
++	return 0;
++}
++
++/* Raise MCU_REQ and wait until the chip answers on MCU_RESP */
++static int bcm4775x_hello(struct bcm4775x *priv)
++{
++	int count = 0;
++
++	gpiod_set_value_cansleep(priv->mcu_req, 1);
++	while (!gpiod_get_value_cansleep(priv->mcu_resp)) {
++		if (++count > BCM4775X_HELLO_MS) {
++			gpiod_set_value_cansleep(priv->mcu_req, 0);
++			priv->hello_fail++;
++			return -ETIMEDOUT;
++		}
++		usleep_range(1000, 1200);
++		if (count % 20 == 0) {
++			gpiod_set_value_cansleep(priv->mcu_req, 0);
++			usleep_range(1000, 1200);
++			gpiod_set_value_cansleep(priv->mcu_req, 1);
++			usleep_range(1000, 1200);
++		}
++	}
++	return count;
++}
++
++static void bcm4775x_bye(struct bcm4775x *priv)
++{
++	gpiod_set_value_cansleep(priv->mcu_req, 0);
++}
++
++static void bcm4775x_hub_rx(struct bcm4775x *priv, const u8 *data,
++			    unsigned int len);
++
++static void bcm4775x_push_rx(struct bcm4775x *priv, const u8 *data,
++			     unsigned int len)
++{
++	unsigned int done;
++
++	if (!len)
++		return;
++	if (priv->hub_active) {
++		priv->rx_bytes += len;
++		bcm4775x_hub_rx(priv, data, len);
++		return;
++	}
++	done = kfifo_in(&priv->rx_fifo, data, len);
++	priv->rx_bytes += done;
++	if (done != len) {
++		priv->rx_dropped += len - done;
++		dev_warn_ratelimited(&priv->spi->dev,
++				     "receive buffer overrun, %u bytes lost\n",
++				     len - done);
++	}
++	wake_up_interruptible(&priv->wait);
++}
++
++/* Read one frame from the chip. Returns the number of bytes or an error. */
++static int bcm4775x_ssi_rx(struct bcm4775x *priv)
++{
++	unsigned int len, room;
++	int ret;
++
++	room = kfifo_avail(&priv->rx_fifo);
++	if (!room)
++		return -ENOSPC;
++
++	/* how much does the chip have? */
++	memset(priv->tx_buf, 0, SSI_RX_CTRL_LEN);
++	priv->tx_buf[0] = SSI_RX_CTRL;
++	ret = bcm4775x_xfer(priv, SSI_RX_CTRL_LEN);
++	if (ret)
++		return ret;
++
++	len = ssi_get_len(priv->rx_buf + 1);
++	if (!len)
++		len = SSI_MIN_FRAME;	/* as the vendor driver: try anyway */
++	len = min3(len, room, bcm4775x_frame_len() - SSI_RX_CTRL_LEN);
++
++	memset(priv->tx_buf, 0, len + SSI_RX_CTRL_LEN);
++	priv->tx_buf[0] = SSI_RX_CTRL;
++	ret = bcm4775x_xfer(priv, len + SSI_RX_CTRL_LEN);
++	if (ret)
++		return ret;
++
++	len = min(len, ssi_get_len(priv->rx_buf + 1));
++	priv->rx_frames++;
++	bcm4775x_push_rx(priv, priv->rx_buf + SSI_RX_CTRL_LEN, len);
++	return len;
++}
++
++/*
++ * Write @len bytes that already sit at tx_buf + 3. The link is full duplex:
++ * the chip clocks out its own pending bytes during the same transfer, and
++ * reports after our data how many of our bytes it accepted (flow control).
++ */
++static int bcm4775x_ssi_tx(struct bcm4775x *priv, unsigned int len)
++{
++	u8 *tx = priv->tx_buf, *rx = priv->rx_buf;
++	unsigned int mwrite = len, nread = 0, xlen, got, written;
++	int retries = SSI_FC_RETRIES;
++	int ret;
++
++	do {
++		xlen = max(mwrite, nread);
++		tx[0] = SSI_TX_CTRL;
++		ssi_set_len(tx + 1, mwrite);
++		if (xlen > mwrite)
++			memset(tx + 1 + SSI_LEN_BYTES + mwrite, 0, xlen - mwrite);
++		ssi_set_len(tx + 1 + SSI_LEN_BYTES + xlen, 0);
++
++		ret = bcm4775x_xfer(priv, xlen + SSI_TX_CTRL_LEN);
++		if (ret)
++			return ret;
++		priv->tx_frames++;
++
++		/*
++		 * Bytes from the chip that came along: up to mwrite bytes
++		 * before the flow control field, the rest (if we clocked
++		 * more than we wrote) after it.
++		 */
++		nread = ssi_get_len(rx + 1);
++		if (nread > bcm4775x_frame_len() - SSI_TX_CTRL_LEN)
++			nread = bcm4775x_frame_len() - SSI_TX_CTRL_LEN;
++		got = min(nread, mwrite);
++		bcm4775x_push_rx(priv, rx + 1 + SSI_LEN_BYTES, got);
++		nread -= got;
++		got = min(nread, xlen - mwrite);
++		bcm4775x_push_rx(priv,
++				 rx + 1 + SSI_LEN_BYTES + mwrite + SSI_LEN_BYTES,
++				 got);
++		nread -= got;
++
++		/* flow control: how much of our data was taken */
++		written = ssi_get_len(rx + 1 + SSI_LEN_BYTES + mwrite);
++		if (written > mwrite) {
++			priv->fc_errors++;
++			dev_err_ratelimited(&priv->spi->dev,
++					    "flow control error: %u of %u written\n",
++					    written, mwrite);
++			return -EIO;
++		}
++		priv->tx_bytes += written;
++		if (written == mwrite)
++			return 0;
++
++		priv->fc_retries++;
++		mwrite -= written;
++		memmove(tx + 1 + SSI_LEN_BYTES, tx + 1 + SSI_LEN_BYTES + written,
++			mwrite);
++	} while (--retries > 0);
++
++	dev_err_ratelimited(&priv->spi->dev,
++			    "chip did not take %u bytes (status %#04x)\n",
++			    mwrite, priv->last_status);
++	return -EIO;
++}
++
++static void bcm4775x_irq_unmask(struct bcm4775x *priv)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->irq_lock, flags);
++	if (priv->irq_masked) {
++		priv->irq_masked = false;
++		enable_irq(priv->irq);
++	}
++	spin_unlock_irqrestore(&priv->irq_lock, flags);
++}
++
++static void bcm4775x_irq_enable(struct bcm4775x *priv, bool on)
++{
++	/* priv->lock held */
++	if (on && !priv->irq_on && priv->powered && priv->opened &&
++	    !priv->suspended) {
++		priv->irq_on = true;
++		enable_irq(priv->irq);
++	} else if (!on && priv->irq_on) {
++		priv->irq_on = false;
++		disable_irq(priv->irq);
++	}
++}
++
++static void bcm4775x_work(struct work_struct *work)
++{
++	struct bcm4775x *priv = container_of(work, struct bcm4775x, work);
++	unsigned int max_data = bcm4775x_frame_len() - SSI_TX_CTRL_LEN;
++	bool rx_full = false;
++	int ret = 0;
++
++	mutex_lock(&priv->io_lock);
++	if (!priv->powered || priv->suspended)
++		goto out;
++
++	ret = bcm4775x_hello(priv);
++	if (ret < 0) {
++		dev_err_ratelimited(&priv->spi->dev,
++				    "MCU_RESP does not answer MCU_REQ\n");
++		priv->link_error = true;
++		/* drop pending output, a dead chip will not take it */
++		kfifo_reset_out(&priv->tx_fifo);
++		wake_up_interruptible(&priv->wait);
++		goto out;
++	}
++	priv->link_error = false;
++
++	do {
++		unsigned int n;
++
++		ret = 0;
++		if (gpiod_get_value_cansleep(priv->host_req)) {
++			ret = bcm4775x_ssi_rx(priv);
++			if (ret == -ENOSPC) {
++				rx_full = true;
++				ret = 0;
++			} else if (ret < 0) {
++				break;
++			}
++		}
++
++		n = kfifo_out(&priv->tx_fifo, priv->tx_buf + 1 + SSI_LEN_BYTES,
++			      max_data);
++		if (n) {
++			ret = bcm4775x_ssi_tx(priv, n);
++			wake_up_interruptible(&priv->wait);
++			if (ret)
++				break;
++		}
++	} while (!kfifo_is_empty(&priv->tx_fifo) ||
++		 (gpiod_get_value_cansleep(priv->host_req) && !rx_full));
++
++	bcm4775x_bye(priv);
++	if (ret < 0) {
++		priv->link_error = true;
++		wake_up_interruptible(&priv->wait);
++	}
++out:
++	mutex_unlock(&priv->io_lock);
++
++	/*
++	 * HOST_REQ is a level interrupt and was masked by the handler. Leave it
++	 * masked after an error or while the reader is not draining the buffer;
++	 * read() and write() queue the work again.
++	 */
++	if (ret >= 0 && !rx_full)
++		bcm4775x_irq_unmask(priv);
++}
++
++/* The handler masks the level interrupt, the work unmasks it when served */
++static irqreturn_t bcm4775x_irq(int irq, void *data)
++{
++	struct bcm4775x *priv = data;
++
++	spin_lock(&priv->irq_lock);
++	if (!priv->irq_masked) {
++		priv->irq_masked = true;
++		disable_irq_nosync(irq);
++	}
++	spin_unlock(&priv->irq_lock);
++
++	queue_work(priv->wq, &priv->work);
++	return IRQ_HANDLED;
++}
++
++static void bcm4775x_kick(struct bcm4775x *priv)
++{
++	queue_work(priv->wq, &priv->work);
++}
++
++static int bcm4775x_power_on(struct bcm4775x *priv)
++{
++	int ret;
++
++	/* priv->lock held */
++	if (priv->powered)
++		return 0;
++
++	ret = regulator_enable(priv->vdd);
++	if (ret)
++		return ret;
++	usleep_range(10000, 12000);
++
++	ret = pinctrl_select_state(priv->pinctrl, priv->pins_active);
++	if (ret) {
++		regulator_disable(priv->vdd);
++		return ret;
++	}
++	gpiod_direction_output(priv->cs, 0);
++	gpiod_set_value_cansleep(priv->mcu_req, 0);
++
++	mutex_lock(&priv->rx_lock);
++	mutex_lock(&priv->tx_lock);
++	mutex_lock(&priv->io_lock);
++	kfifo_reset(&priv->rx_fifo);
++	kfifo_reset(&priv->tx_fifo);
++	priv->link_error = false;
++	priv->powered = true;
++	mutex_unlock(&priv->io_lock);
++	mutex_unlock(&priv->tx_lock);
++	mutex_unlock(&priv->rx_lock);
++
++	bcm4775x_irq_enable(priv, true);
++	dev_info(&priv->spi->dev, "powered on\n");
++	return 0;
++}
++
++static void bcm4775x_power_off(struct bcm4775x *priv)
++{
++	/* priv->lock held */
++	if (!priv->powered)
++		return;
++
++	bcm4775x_irq_enable(priv, false);
++	mutex_lock(&priv->io_lock);
++	priv->powered = false;
++	mutex_unlock(&priv->io_lock);
++	cancel_work_sync(&priv->work);
++	bcm4775x_irq_unmask(priv);
++
++	/* nothing may drive the chip once its supply is gone */
++	gpiod_set_value_cansleep(priv->nstandby, 0);
++	gpiod_set_value_cansleep(priv->mcu_req, 0);
++	gpiod_direction_input(priv->cs);
++	pinctrl_select_state(priv->pinctrl, priv->pins_idle);
++	regulator_disable(priv->vdd);
++	wake_up_interruptible(&priv->wait);
++	dev_info(&priv->spi->dev, "powered off\n");
++}
++
++/* --- sensor hub: transport layer, RPCs, SSP, IIO devices --------------------- */
++
++/*
++ * On top of the SSI byte stream the chip (boot ROM and firmware alike) speaks
++ * Broadcom's transport layer:
++ *
++ *   B0 00 <body> B0 01, body = seq, size, flags, [detail per flag], payload, crc
++ *
++ * (B0, XON and XOFF escaped as B0 03/04/05; CRC-8 over the body without the
++ * sequence number, nibbles swapped). The payload carries RPCs: id, length,
++ * data. The boot ROM takes memory writes, so the firmware ("patch") is
++ * written into RAM and started; the firmware then tunnels Samsung's SSP
++ * sensor protocol through the SensorRequest/SensorResponse RPCs.
++ *
++ * The receive side follows bbd_rpc_lh.c of the vendor kernel; the transmit
++ * side, the RPC numbers and the boot sequence were worked out against the
++ * chip.
++ */
++
++#define TL_ESC			0xb0
++#define TL_SOP			0x00
++#define TL_EOP			0x01
++#define TL_XON			0x11
++#define TL_XOFF			0x13
++
++#define TL_F_ACK		BIT(0)
++#define TL_F_RELIABLE		BIT(1)
++#define TL_F_REL_ACK		BIT(2)
++#define TL_F_REL_NACK		BIT(3)
++#define TL_F_SIZE_EXT		BIT(6)
++#define TL_F_EXT		BIT(7)
++#define TL_F_INTERNAL		BIT(8)
++#define TL_F_IGNORE_SEQ		BIT(9)
++
++#define TL_MAX_PAYLOAD		1024
++#define TL_MAX_BODY		(TL_MAX_PAYLOAD + 16)
++#define TL_RX_MAX		(2048 + 16)
++
++#define RPC_GET_VERSION		0x00
++#define RPC_VERSION_RESPONSE	0x03
++#define RPC_MEMORY_WRITE	0x05
++#define RPC_SENSOR_REQUEST	0x20
++#define RPC_SENSOR_RESPONSE	0x21
++#define RPC_START_SCRATCH_APP	0x2e
++
++#define PATCH_CMD_WRITE		0xf1
++
++#define SSP_AP2HUB_READ		0
++#define SSP_AP2HUB_WRITE	1
++#define SSP_HUB2AP_WRITE	2
++#define SSP_TYPE_MASK		3
++
++#define SSP_CMD_WHOAMI		0x0f
++#define SSP_CMD_SENSOR_ADD	0xa1
++#define SSP_CMD_SENSOR_REMOVE	0xa2
++#define SSP_CMD_AP_INFORMATION	0xb6
++#define SSP_CMD_FIRMWARE_REV	0xf0
++#define SSP_CMD_SENSOR_FORMATION 0xf1
++#define SSP_CMD_PROX_THRESHOLD	0xf2
++#define SSP_CMD_SENSOR_SCANNING	0xf4
++#define SSP_WHOAMI_ID		0x55
++
++#define SSP_INST_DEBUG		0x03
++#define SSP_INST_INIT_DONE	0x0a
++#define SSP_INST_BYPASS_DATA	0x37
++
++#define HUB_FIRMWARE		"brcm/bcm4775x-sensorhub.bin"
++#define HUB_SENSOR_IDLE_MS	5000
++#define HUB_NUM_SENSORS		6
++#define HUB_ACCEL		0	/* indices into hub_sensors[] */
++#define HUB_MAGN		2
++#define HUB_RESTART_MS		30000
++#define HUB_FILTER_SHIFT	4	/* fraction bits of the smoothed values */
++
++/* near threshold given to the hub and to user space (far: HUB_PROX_FAR) */
++#define HUB_PROX_NEAR		2400
++#define HUB_PROX_FAR		1600
++
++/*
++ * Hard-iron field of the phone itself at the magnetometer, in raw counts
++ * (sphere fit on one SM-G975F: 94, 41, -142 uT). Reported as channel offsets.
++ */
++static int magn_hard_iron[3] = { 627, 271, -944 };
++module_param_array(magn_hard_iron, int, NULL, 0644);
++MODULE_PARM_DESC(magn_hard_iron, "magnetometer hard-iron offsets x,y,z in raw counts");
++
++/*
++ * Soft-iron correction for the compass heading: field = matrix * (raw - hard
++ * iron), row by row, in 1/1000. A wrong mounting of the magnetometer relative
++ * to the accelerometer can be put right here as well (-1000,0,0, 0,-1000,0,
++ * 0,0,1000 turns it by 180 degrees around z). The raw channels are not
++ * changed by it.
++ */
++static int magn_soft_iron[9] = { 1000, 0, 0, 0, 1000, 0, 0, 0, 1000 };
++module_param_array(magn_soft_iron, int, NULL, 0644);
++MODULE_PARM_DESC(magn_soft_iron,
++		 "magnetometer soft-iron matrix for the heading, 9 values in 1/1000");
++
++/* seconds without a reader before the hub is powered off */
++#define HUB_OFF_DELAY		60
++
++struct hub_sensor;
++
++struct hub_sensor_desc {
++	const char *name;
++	u8 type;		/* SSP sensor type */
++	s8 companion;		/* type that must run as well, or -1 */
++	u8 size;		/* payload bytes in a bypass data record */
++	u16 period_ms;
++	bool (*decode)(struct hub_sensor *s, const u8 *d);	/* false: no value */
++	const struct iio_chan_spec *channels;
++	unsigned int num_channels;
++};
++
++struct hub_sensor {
++	const struct hub_sensor_desc *desc;
++	struct iio_dev *indio;
++	bool on;
++	unsigned int keep;	/* users that need it without reading (buffer) */
++	unsigned long last_read;
++	int val[5];
++	int filt[3];		/* smoothed val[0..2] << HUB_FILTER_SHIFT */
++	bool filt_valid;
++	struct completion fresh;
++};
++
++struct hub_iio {
++	struct bcm4775x *priv;
++	unsigned int index;
++};
++
++struct bcm4775x_hub {
++	struct bcm4775x *priv;
++	struct iio_mount_matrix orientation;
++	struct hub_sensor sensor[HUB_NUM_SENSORS];
++
++	struct mutex lock;		/* hub state, one command at a time */
++	bool running;
++	unsigned long last_read;
++	unsigned long retry_after;	/* no new start attempt before this */
++	bool failed;
++	bool suspending;
++	struct delayed_work idle_work;
++	struct delayed_work restart_work;
++
++	/* one scan of the magnetometer buffer */
++	struct {
++		s16 magn[3];
++		s32 heading;
++		aligned_s64 timestamp;
++	} scan;
++
++	/* transmit: sequence numbers and the tx fifo writer side */
++	struct mutex tl_lock;
++	u8 tx_seq;
++	u8 rel_seq;
++	u8 last_rx_seq;
++	unsigned int unacked;
++	u8 tx_body[TL_MAX_BODY];
++	u8 tx_esc[2 * TL_MAX_BODY + 4];
++
++	/* receive parser, runs in the link work */
++	unsigned int rx_state;
++	unsigned int rx_len;
++	u8 rx_msg[TL_RX_MAX];
++
++	struct completion rel_done;
++	u8 rel_wait;
++	bool rel_waiting;
++	bool rel_nack;
++
++	struct completion sync_done;
++	u8 sync_req;
++	u8 sync_rsp[6];
++
++	struct completion version_done;
++	u32 version[3];
++
++	/* SSP byte stream from the hub */
++	u8 ssp_buf[4096];
++	unsigned int ssp_len;
++	struct completion ssp_done;
++	bool ssp_waiting;
++	u16 ssp_want;
++	u8 ssp_rsp[16];
++	unsigned int ssp_rsp_len;
++	struct completion init_done;
++
++	u32 fw_rev;
++	u64 sensors;
++};
++
++static const u8 tl_crc_table[256] = {
++	0x00, 0x4d, 0x9a, 0xd7, 0x79, 0x34, 0xe3, 0xae, 0xf2, 0xbf, 0x68, 0x25, 0x8b, 0xc6, 0x11, 0x5c,
++	0xa9, 0xe4, 0x33, 0x7e, 0xd0, 0x9d, 0x4a, 0x07, 0x5b, 0x16, 0xc1, 0x8c, 0x22, 0x6f, 0xb8, 0xf5,
++	0x1f, 0x52, 0x85, 0xc8, 0x66, 0x2b, 0xfc, 0xb1, 0xed, 0xa0, 0x77, 0x3a, 0x94, 0xd9, 0x0e, 0x43,
++	0xb6, 0xfb, 0x2c, 0x61, 0xcf, 0x82, 0x55, 0x18, 0x44, 0x09, 0xde, 0x93, 0x3d, 0x70, 0xa7, 0xea,
++	0x3e, 0x73, 0xa4, 0xe9, 0x47, 0x0a, 0xdd, 0x90, 0xcc, 0x81, 0x56, 0x1b, 0xb5, 0xf8, 0x2f, 0x62,
++	0x97, 0xda, 0x0d, 0x40, 0xee, 0xa3, 0x74, 0x39, 0x65, 0x28, 0xff, 0xb2, 0x1c, 0x51, 0x86, 0xcb,
++	0x21, 0x6c, 0xbb, 0xf6, 0x58, 0x15, 0xc2, 0x8f, 0xd3, 0x9e, 0x49, 0x04, 0xaa, 0xe7, 0x30, 0x7d,
++	0x88, 0xc5, 0x12, 0x5f, 0xf1, 0xbc, 0x6b, 0x26, 0x7a, 0x37, 0xe0, 0xad, 0x03, 0x4e, 0x99, 0xd4,
++	0x7c, 0x31, 0xe6, 0xab, 0x05, 0x48, 0x9f, 0xd2, 0x8e, 0xc3, 0x14, 0x59, 0xf7, 0xba, 0x6d, 0x20,
++	0xd5, 0x98, 0x4f, 0x02, 0xac, 0xe1, 0x36, 0x7b, 0x27, 0x6a, 0xbd, 0xf0, 0x5e, 0x13, 0xc4, 0x89,
++	0x63, 0x2e, 0xf9, 0xb4, 0x1a, 0x57, 0x80, 0xcd, 0x91, 0xdc, 0x0b, 0x46, 0xe8, 0xa5, 0x72, 0x3f,
++	0xca, 0x87, 0x50, 0x1d, 0xb3, 0xfe, 0x29, 0x64, 0x38, 0x75, 0xa2, 0xef, 0x41, 0x0c, 0xdb, 0x96,
++	0x42, 0x0f, 0xd8, 0x95, 0x3b, 0x76, 0xa1, 0xec, 0xb0, 0xfd, 0x2a, 0x67, 0xc9, 0x84, 0x53, 0x1e,
++	0xeb, 0xa6, 0x71, 0x3c, 0x92, 0xdf, 0x08, 0x45, 0x19, 0x54, 0x83, 0xce, 0x60, 0x2d, 0xfa, 0xb7,
++	0x5d, 0x10, 0xc7, 0x8a, 0x24, 0x69, 0xbe, 0xf3, 0xaf, 0xe2, 0x35, 0x78, 0xd6, 0x9b, 0x4c, 0x01,
++	0xf4, 0xb9, 0x6e, 0x23, 0x8d, 0xc0, 0x17, 0x5a, 0x06, 0x4b, 0x9c, 0xd1, 0x7f, 0x32, 0xe5, 0xa8,
++};
++
++/* CRC over body[1..len-1], nibbles swapped */
++static u8 tl_crc(const u8 *body, unsigned int len)
++{
++	u8 crc = 0;
++	unsigned int i;
++
++	for (i = 1; i < len; i++)
++		crc = tl_crc_table[crc ^ body[i]];
++	return (crc << 4) | (crc >> 4);
++}
++
++/* Queue raw bytes for the chip. hub->tl_lock held. */
++static int hub_raw_write(struct bcm4775x *priv, const u8 *buf, unsigned int len,
++			 bool can_wait)
++{
++	int tries = 500;
++
++	while (priv->powered && kfifo_avail(&priv->tx_fifo) < len) {
++		if (!can_wait)
++			return -EAGAIN;
++		if (!--tries)
++			return -ETIMEDOUT;
++		usleep_range(2000, 2500);
++	}
++	if (!priv->powered)
++		return -ENODEV;
++	kfifo_in(&priv->tx_fifo, buf, len);
++	bcm4775x_kick(priv);
++	return 0;
++}
++
++/*
++ * Build and queue one packet. @seq < 0: use and advance the running sequence
++ * number. @detail is the detail byte of TL_F_RELIABLE or TL_F_REL_ACK.
++ */
++static int hub_tl_send(struct bcm4775x *priv, int seq, u16 flags, u8 detail,
++		       const u8 *payload, unsigned int len, bool can_wait)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	u8 *body = hub->tx_body, *out = hub->tx_esc;
++	unsigned int n = 0, i, o = 0;
++	int ret;
++
++	if (len > TL_MAX_PAYLOAD)
++		return -EMSGSIZE;
++
++	mutex_lock(&hub->tl_lock);
++	if (len > 0xff)
++		flags |= TL_F_SIZE_EXT;
++	if (flags > 0xff)
++		flags |= TL_F_EXT;
++
++	body[n++] = seq < 0 ? hub->tx_seq++ : seq;
++	body[n++] = len & 0xff;
++	body[n++] = flags & 0xff;
++	if (flags & TL_F_ACK)
++		body[n++] = hub->last_rx_seq;
++	if (flags & TL_F_RELIABLE)
++		body[n++] = detail;
++	if (flags & TL_F_REL_ACK)
++		body[n++] = detail;
++	if (flags & TL_F_SIZE_EXT)
++		body[n++] = len >> 8;
++	if (flags & TL_F_EXT)
++		body[n++] = flags >> 8;
++	if (flags & TL_F_INTERNAL)
++		body[n++] = 0;
++	if (flags & TL_F_IGNORE_SEQ)
++		body[n++] = 0;
++	memcpy(body + n, payload, len);
++	n += len;
++	body[n] = tl_crc(body, n);
++	n++;
++
++	out[o++] = TL_ESC;
++	out[o++] = TL_SOP;
++	for (i = 0; i < n; i++) {
++		switch (body[i]) {
++		case TL_ESC:
++			out[o++] = TL_ESC;
++			out[o++] = 0x03;
++			break;
++		case TL_XON:
++			out[o++] = TL_ESC;
++			out[o++] = 0x04;
++			break;
++		case TL_XOFF:
++			out[o++] = TL_ESC;
++			out[o++] = 0x05;
++			break;
++		default:
++			out[o++] = body[i];
++		}
++	}
++	out[o++] = TL_ESC;
++	out[o++] = TL_EOP;
++
++	ret = hub_raw_write(priv, out, o, can_wait);
++	mutex_unlock(&hub->tl_lock);
++	return ret;
++}
++
++/* Send RPC bytes in a reliable packet and wait for the chip's RELIABLE_ACK */
++static int hub_send_reliable(struct bcm4775x *priv, const u8 *payload,
++			     unsigned int len)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	int tries, ret;
++
++	for (tries = 0; tries < 5; tries++) {
++		reinit_completion(&hub->rel_done);
++		hub->rel_nack = false;
++		hub->rel_wait = hub->rel_seq;
++		hub->rel_waiting = true;
++		ret = hub_tl_send(priv, -1, TL_F_RELIABLE, hub->rel_seq, payload,
++				  len, true);
++		if (ret)
++			break;
++		if (wait_for_completion_timeout(&hub->rel_done, HZ)) {
++			hub->rel_waiting = false;
++			if (hub->rel_nack)
++				return -EIO;
++			hub->rel_seq++;
++			return 0;
++		}
++		ret = -ETIMEDOUT;
++		if (!priv->powered || priv->link_error)
++			break;
++	}
++	hub->rel_waiting = false;
++	return ret;
++}
++
++/* One RPC: id, length (two bytes above 127), data */
++static int hub_rpc(struct bcm4775x *priv, u8 id, const u8 *a, unsigned int alen,
++		   const u8 *b, unsigned int blen, bool reliable)
++{
++	unsigned int len = alen + blen, n = 0;
++	u8 *buf;
++	int ret;
++
++	buf = kmalloc(len + 3, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	buf[n++] = id;
++	if (len > 0x7f)
++		buf[n++] = 0x80 | (len >> 8);
++	buf[n++] = len & 0xff;
++	memcpy(buf + n, a, alen);
++	memcpy(buf + n + alen, b, blen);
++	n += len;
++
++	if (reliable)
++		ret = hub_send_reliable(priv, buf, n);
++	else
++		ret = hub_tl_send(priv, -1, 0, 0, buf, n, true);
++	kfree(buf);
++	return ret;
++}
++
++/* --- receive ------------------------------------------------------------- */
++
++static unsigned int hub_bypass_size(u8 type);
++static void hub_bypass_data(struct bcm4775x_hub *hub, u8 type, const u8 *d);
++
++static void hub_ssp_event(struct bcm4775x *priv, const u8 *d, unsigned int len)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	unsigned int i = 0, n;
++
++	while (i < len) {
++		switch (d[i++]) {
++		case SSP_INST_BYPASS_DATA:
++			/* sensor type, payload, 64 bit timestamp */
++			if (i >= len)
++				return;
++			n = hub_bypass_size(d[i]);
++			if (!n || i + 1 + n + 8 > len)
++				return;
++			hub_bypass_data(hub, d[i], d + i + 1);
++			i += 1 + n + 8;
++			break;
++		case SSP_INST_DEBUG:
++			if (i + 2 > len)
++				return;
++			n = get_unaligned_le16(d + i);
++			i += 2;
++			if (i + n > len)
++				return;
++			dev_dbg(&priv->spi->dev, "hub: %.*s\n", n, d + i);
++			i += n;
++			break;
++		case SSP_INST_INIT_DONE:
++			complete(&hub->init_done);
++			break;
++		default:
++			return;
++		}
++	}
++}
++
++/* Frames from the hub: u16 options, u16 length, data for reads and events */
++static void hub_ssp_rx(struct bcm4775x *priv, const u8 *data, unsigned int len)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	unsigned int need, n, type;
++	u16 opts;
++
++	if (hub->ssp_len + len > sizeof(hub->ssp_buf)) {
++		dev_warn_ratelimited(&priv->spi->dev, "SSP stream overflow\n");
++		hub->ssp_len = 0;
++		return;
++	}
++	memcpy(hub->ssp_buf + hub->ssp_len, data, len);
++	hub->ssp_len += len;
++
++	while (hub->ssp_len >= 4) {
++		opts = get_unaligned_le16(hub->ssp_buf);
++		n = get_unaligned_le16(hub->ssp_buf + 2);
++		type = opts & SSP_TYPE_MASK;
++		need = 4;
++		if (type == SSP_AP2HUB_READ || type == SSP_HUB2AP_WRITE)
++			need += n;
++		if (need > sizeof(hub->ssp_buf)) {
++			hub->ssp_len = 0;
++			return;
++		}
++		if (hub->ssp_len < need)
++			return;
++
++		if (type == SSP_HUB2AP_WRITE) {
++			hub_ssp_event(priv, hub->ssp_buf + 4, n);
++		} else if (hub->ssp_waiting && opts == hub->ssp_want) {
++			hub->ssp_rsp_len = min_t(unsigned int, need - 4,
++						 sizeof(hub->ssp_rsp));
++			memcpy(hub->ssp_rsp, hub->ssp_buf + 4, hub->ssp_rsp_len);
++			hub->ssp_waiting = false;
++			complete(&hub->ssp_done);
++		}
++		hub->ssp_len -= need;
++		memmove(hub->ssp_buf, hub->ssp_buf + need, hub->ssp_len);
++	}
++}
++
++static void hub_rpc_rx(struct bcm4775x *priv, const u8 *p, unsigned int len)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	unsigned int i = 0, id, n;
++
++	while (i + 2 <= len) {
++		id = p[i++];
++		if (id & 0x80)
++			id = ((id & 0x7f) << 8) | p[i++];
++		if (i >= len)
++			return;
++		n = p[i++];
++		if (n & 0x80) {
++			if (i >= len)
++				return;
++			n = ((n & 0x7f) << 8) | p[i++];
++		}
++		if (i + n > len)
++			return;
++
++		if (id == RPC_VERSION_RESPONSE && n >= 12) {
++			hub->version[0] = get_unaligned_le32(p + i);
++			hub->version[1] = get_unaligned_le32(p + i + 4);
++			hub->version[2] = get_unaligned_le32(p + i + 8);
++			complete(&hub->version_done);
++		} else if (id == RPC_SENSOR_RESPONSE && n >= 2) {
++			hub_ssp_rx(priv, p + i + 2, n - 2);
++		}
++		i += n;
++	}
++}
++
++static void hub_tl_packet(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	const u8 *m = hub->rx_msg;
++	unsigned int len = hub->rx_len, pos = 3, size, bit;
++	u16 flags;
++	u8 detail, rel_seq = 0;
++	bool reliable = false;
++
++	if (len < 4 || tl_crc(m, len - 1) != m[len - 1])
++		return;
++	size = m[1];
++	flags = m[2];
++	len--;				/* drop the CRC */
++
++	for (bit = 0; bit < 16; bit++) {
++		if (!(flags & BIT(bit)))
++			continue;
++		if (pos >= len)
++			break;
++		detail = m[pos++];
++		switch (BIT(bit)) {
++		case TL_F_RELIABLE:
++			reliable = true;
++			rel_seq = detail;
++			break;
++		case TL_F_REL_ACK:
++			if (hub->rel_waiting && detail == hub->rel_wait)
++				complete(&hub->rel_done);
++			break;
++		case TL_F_REL_NACK:
++			if (hub->rel_waiting) {
++				hub->rel_nack = true;
++				complete(&hub->rel_done);
++			}
++			break;
++		case TL_F_SIZE_EXT:
++			size |= detail << 8;
++			break;
++		case TL_F_EXT:
++			flags |= detail << 8;
++			break;
++		}
++	}
++	if (pos > len || size != len - pos)
++		return;
++
++	hub->last_rx_seq = m[0];
++	if (flags & TL_F_INTERNAL) {
++		/* SeqIdResponse: 01, request id, six sequence numbers */
++		if (size == 8 && m[pos] == 1 && m[pos + 1] == hub->sync_req) {
++			memcpy(hub->sync_rsp, m + pos + 2, 6);
++			complete(&hub->sync_done);
++		}
++		return;
++	}
++
++	if (size)
++		hub_rpc_rx(priv, m + pos, size);
++
++	/* acknowledge like the vendor daemon: reliable packets and now and then */
++	if (reliable)
++		hub_tl_send(priv, -1, TL_F_ACK | TL_F_REL_ACK, rel_seq, NULL, 0,
++			    false);
++	else if (size && ++hub->unacked >= 100) {
++		hub->unacked = 0;
++		hub_tl_send(priv, -1, TL_F_ACK, 0, NULL, 0, false);
++	}
++}
++
++/* Bytes from the chip, called from the link work */
++static void bcm4775x_hub_rx(struct bcm4775x *priv, const u8 *data,
++			    unsigned int len)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	unsigned int i;
++	u8 c;
++
++	for (i = 0; i < len; i++) {
++		c = data[i];
++		if (c == TL_XON || c == TL_XOFF)
++			continue;
++		switch (hub->rx_state) {
++		case 0:			/* wait for ESC */
++			if (c == TL_ESC)
++				hub->rx_state = 1;
++			break;
++		case 1:			/* wait for SOP */
++			if (c == TL_SOP) {
++				hub->rx_state = 2;
++				hub->rx_len = 0;
++			} else if (c != TL_ESC) {
++				hub->rx_state = 0;
++			}
++			break;
++		case 2:			/* body */
++			if (c == TL_ESC)
++				hub->rx_state = 3;
++			else if (hub->rx_len < sizeof(hub->rx_msg))
++				hub->rx_msg[hub->rx_len++] = c;
++			else
++				hub->rx_state = 0;
++			break;
++		default:		/* after ESC inside the body */
++			if (c == TL_EOP) {
++				hub_tl_packet(priv);
++				hub->rx_state = 0;
++				break;
++			}
++			if (c == TL_SOP) {
++				hub->rx_state = 2;
++				hub->rx_len = 0;
++				break;
++			}
++			if (c == TL_ESC) {
++				hub->rx_state = 1;
++				break;
++			}
++			if (c == 0x03)
++				c = TL_ESC;
++			else if (c == 0x04)
++				c = TL_XON;
++			else if (c == 0x05)
++				c = TL_XOFF;
++			else {
++				hub->rx_state = 0;
++				break;
++			}
++			if (hub->rx_len < sizeof(hub->rx_msg)) {
++				hub->rx_msg[hub->rx_len++] = c;
++				hub->rx_state = 2;
++			} else {
++				hub->rx_state = 0;
++			}
++		}
++	}
++}
++
++/* --- hub commands (hub->lock held) ---------------------------------------- */
++
++static int hub_sync(struct bcm4775x *priv, int tries)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	static const u8 autobaud[36] = { [0 ... 35] = 0x80 };
++	u8 req[2] = { 0 };
++	int i, ret;
++
++	hub->rx_state = 0;
++	mutex_lock(&hub->tl_lock);
++	ret = hub_raw_write(priv, autobaud, sizeof(autobaud), true);
++	mutex_unlock(&hub->tl_lock);
++	if (ret)
++		return ret;
++	msleep(100);
++
++	for (i = 1; i <= tries; i++) {
++		reinit_completion(&hub->sync_done);
++		hub->sync_req = req[1] = i;
++		ret = hub_tl_send(priv, i - 1, TL_F_INTERNAL | TL_F_IGNORE_SEQ, 0,
++				  req, sizeof(req), true);
++		if (ret)
++			return ret;
++		if (wait_for_completion_timeout(&hub->sync_done, HZ / 2)) {
++			hub->tx_seq = hub->sync_rsp[0] + 1;
++			hub->rel_seq = hub->sync_rsp[2] + 1;
++			hub->unacked = 0;
++			return 0;
++		}
++	}
++	return -ETIMEDOUT;
++}
++
++static int hub_get_version(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	int ret;
++
++	reinit_completion(&hub->version_done);
++	ret = hub_rpc(priv, RPC_GET_VERSION, NULL, 0, NULL, 0, true);
++	if (ret)
++		return ret;
++	if (!wait_for_completion_timeout(&hub->version_done, HZ))
++		return -ETIMEDOUT;
++	return 0;
++}
++
++/*
++ * The firmware file is the blob of the vendor's patch file: commands of
++ * <cmd:1> <len:2> <payload>. Only memory writes (F1: address, data) occur in
++ * it; they build one RAM image whose vector table comes first.
++ */
++static int hub_download(struct bcm4775x *priv, u32 *entry)
++{
++	struct device *dev = &priv->spi->dev;
++	const struct firmware *fw;
++	const u8 *p, *end;
++	unsigned int n;
++	bool first = true;
++	u8 hdr[6];
++	int ret;
++
++	ret = request_firmware(&fw, HUB_FIRMWARE, dev);
++	if (ret)
++		return ret;
++
++	p = fw->data;
++	end = p + fw->size;
++	while (p < end) {
++		if (end - p < 3) {
++			ret = -EINVAL;
++			break;
++		}
++		n = get_unaligned_le16(p + 1);
++		if (p[0] != PATCH_CMD_WRITE || n < 5 || n > TL_MAX_PAYLOAD - 16 ||
++		    end - p < 3 + n) {
++			dev_err(dev, "firmware: unsupported command %#x at %#zx\n",
++				p[0], p - fw->data);
++			ret = -EINVAL;
++			break;
++		}
++		p += 3;
++		if (first) {
++			if (n < 12) {
++				ret = -EINVAL;
++				break;
++			}
++			*entry = get_unaligned_le32(p + 8);	/* reset vector */
++			first = false;
++		}
++		memcpy(hdr, p, 4);			/* address */
++		put_unaligned_le16(n - 4, hdr + 4);
++		ret = hub_rpc(priv, RPC_MEMORY_WRITE, hdr, 6, p + 4, n - 4, true);
++		if (ret)
++			break;
++		p += n;
++	}
++	if (!ret && first)
++		ret = -EINVAL;
++	release_firmware(fw);
++	return ret;
++}
++
++static int hub_ssp_wait(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++
++	if (!wait_for_completion_timeout(&hub->ssp_done, HZ)) {
++		hub->ssp_waiting = false;
++		return -ETIMEDOUT;
++	}
++	return 0;
++}
++
++static int hub_ssp_header(struct bcm4775x *priv, u8 cmd, u16 len, u16 opts)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	u8 msg[2 + 9] = { 9, 0, cmd };
++
++	put_unaligned_le16(len, msg + 3);
++	put_unaligned_le16(opts, msg + 5);
++	reinit_completion(&hub->ssp_done);
++	hub->ssp_want = opts;
++	hub->ssp_waiting = true;
++	return hub_rpc(priv, RPC_SENSOR_REQUEST, msg, sizeof(msg), NULL, 0, true);
++}
++
++static int hub_ssp_read(struct bcm4775x *priv, u8 cmd, u8 *buf, unsigned int len)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	int ret;
++
++	ret = hub_ssp_header(priv, cmd, len, SSP_AP2HUB_READ);
++	if (!ret)
++		ret = hub_ssp_wait(priv);
++	if (ret)
++		return ret;
++	if (hub->ssp_rsp_len < len)
++		return -EIO;
++	memcpy(buf, hub->ssp_rsp, len);
++	return 0;
++}
++
++static int hub_ssp_write(struct bcm4775x *priv, u8 cmd, const u8 *buf,
++			 unsigned int len)
++{
++	u8 size[2];
++	int ret;
++
++	ret = hub_ssp_header(priv, cmd, len, SSP_AP2HUB_WRITE);
++	if (!ret)
++		ret = hub_ssp_wait(priv);
++	if (ret)
++		return ret;
++	put_unaligned_le16(len, size);
++	return hub_rpc(priv, RPC_SENSOR_REQUEST, size, 2, buf, len, true);
++}
++
++static void hub_stop(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	int i;
++
++	if (!priv->hub_active)
++		return;
++	mutex_lock(&priv->lock);
++	bcm4775x_power_off(priv);
++	priv->hub_active = false;
++	priv->opened = false;
++	mutex_unlock(&priv->lock);
++	hub->running = false;
++	for (i = 0; i < HUB_NUM_SENSORS; i++) {
++		hub->sensor[i].on = false;
++		hub->sensor[i].filt_valid = false;
++	}
++}
++
++static bool hub_kept(struct bcm4775x_hub *hub)
++{
++	int i;
++
++	for (i = 0; i < HUB_NUM_SENSORS; i++)
++		if (hub->sensor[i].keep)
++			return true;
++	return false;
++}
++
++/* The hub failed while running: stop it, start it again later if needed */
++static void hub_stop_failed(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++
++	hub_stop(priv);
++	if (hub_kept(hub) && !hub->suspending)
++		schedule_delayed_work(&hub->restart_work,
++				      msecs_to_jiffies(HUB_RESTART_MS));
++}
++
++static int hub_start(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	struct device *dev = &priv->spi->dev;
++	/* SM-G975F: ap type 2 (beyond2), board revision 26 */
++	u8 ap_info[2] = { 2, 26 };
++	/* accelerometer, gyroscope and magnetometer mounting (downstream DT) */
++	u8 position[3] = { 4, 4, 7 };
++	/*
++	 * Proximity thresholds, big endian: high 2400, low 1600, detect high
++	 * 16368, detect low 250 (vendor defaults). Without them the proximity
++	 * sensor does not sample.
++	 */
++	u8 prox[8] = { HUB_PROX_NEAR >> 8, HUB_PROX_NEAR & 0xff,
++		       HUB_PROX_FAR >> 8, HUB_PROX_FAR & 0xff,
++		       0x3f, 0xf0, 0x00, 0xfa };
++	u8 buf[8];
++	u32 entry = 0, rom;
++	int ret;
++
++	/* the character device and the hub exclude each other */
++	mutex_lock(&priv->lock);
++	if (priv->opened || priv->powered) {
++		mutex_unlock(&priv->lock);
++		return -EBUSY;
++	}
++	priv->opened = true;
++	priv->hub_active = true;
++	hub->ssp_len = 0;
++	hub->rx_state = 0;
++	ret = bcm4775x_power_on(priv);
++	mutex_unlock(&priv->lock);
++	if (ret) {
++		priv->hub_active = false;
++		priv->opened = false;
++		return ret;
++	}
++
++	gpiod_set_value_cansleep(priv->nstandby, 1);
++	msleep(200);
++
++	ret = hub_sync(priv, 4);
++	if (!ret)
++		ret = hub_get_version(priv);
++	if (ret) {
++		dev_err(dev, "boot ROM does not answer: %d\n", ret);
++		goto err;
++	}
++	rom = hub->version[1];
++
++	reinit_completion(&hub->init_done);
++	ret = hub_download(priv, &entry);
++	if (ret) {
++		dev_err(dev, "firmware download failed: %d\n", ret);
++		goto err;
++	}
++	put_unaligned_le32(entry, buf);
++	ret = hub_rpc(priv, RPC_START_SCRATCH_APP, buf, 4, NULL, 0, false);
++	if (ret)
++		goto err;
++	msleep(300);
++
++	ret = hub_sync(priv, 8);
++	if (!ret)
++		ret = hub_get_version(priv);
++	if (ret) {
++		dev_err(dev, "firmware does not answer: %d\n", ret);
++		goto err;
++	}
++	if (!wait_for_completion_timeout(&hub->init_done, 3 * HZ))
++		dev_warn(dev, "no init-done message from the hub\n");
++
++	ret = hub_ssp_read(priv, SSP_CMD_WHOAMI, buf, 1);
++	if (!ret && buf[0] != SSP_WHOAMI_ID)
++		ret = -ENODEV;
++	if (!ret)
++		ret = hub_ssp_write(priv, SSP_CMD_AP_INFORMATION, ap_info,
++				    sizeof(ap_info));
++	if (!ret)
++		ret = hub_ssp_write(priv, SSP_CMD_SENSOR_FORMATION, position,
++				    sizeof(position));
++	if (!ret)
++		ret = hub_ssp_write(priv, SSP_CMD_PROX_THRESHOLD, prox,
++				    sizeof(prox));
++	if (!ret)
++		ret = hub_ssp_read(priv, SSP_CMD_SENSOR_SCANNING, buf, 8);
++	if (!ret) {
++		hub->sensors = get_unaligned_le64(buf);
++		ret = hub_ssp_read(priv, SSP_CMD_FIRMWARE_REV, buf, 4);
++	}
++	if (ret) {
++		dev_err(dev, "sensor hub setup failed: %d\n", ret);
++		goto err;
++	}
++	hub->fw_rev = get_unaligned_le32(buf);
++	hub->running = true;
++	dev_info(dev,
++		 "sensor hub up: chip %#x, ROM %u, firmware %u (rev %u), sensors %#llx\n",
++		 hub->version[0], rom, hub->version[1], hub->fw_rev, hub->sensors);
++	return 0;
++
++err:
++	hub_stop(priv);
++	return ret;
++}
++
++static int hub_sensor_enable(struct bcm4775x *priv, struct hub_sensor *s,
++			     bool on)
++{
++	/* sensor type, s32 period in ms, s32 batch latency, s8 batch options */
++	u8 arg[10] = { s->desc->type };
++	u8 also[10] = { s->desc->companion };
++	bool has_also = s->desc->companion >= 0;
++	int ret = 0;
++
++	if (s->on == on)
++		return 0;
++	put_unaligned_le32(s->desc->period_ms, arg + 1);
++	put_unaligned_le32(s->desc->period_ms, also + 1);
++	if (on) {
++		s->filt_valid = false;
++		reinit_completion(&s->fresh);
++		if (has_also)
++			ret = hub_ssp_write(priv, SSP_CMD_SENSOR_ADD, also, 10);
++		if (!ret)
++			ret = hub_ssp_write(priv, SSP_CMD_SENSOR_ADD, arg, 10);
++		if (!ret && !wait_for_completion_timeout(&s->fresh, 2 * HZ))
++			ret = -ETIMEDOUT;
++		if (ret) {
++			hub_ssp_write(priv, SSP_CMD_SENSOR_REMOVE, arg, 5);
++			if (has_also)
++				hub_ssp_write(priv, SSP_CMD_SENSOR_REMOVE, also, 5);
++		}
++	} else {
++		ret = hub_ssp_write(priv, SSP_CMD_SENSOR_REMOVE, arg, 5);
++		if (!ret && has_also)
++			ret = hub_ssp_write(priv, SSP_CMD_SENSOR_REMOVE, also, 5);
++	}
++	if (!ret)
++		s->on = on;
++	return ret;
++}
++
++/* No reader for a while: stop the sensors, later power the hub off */
++static void hub_idle_work(struct work_struct *work)
++{
++	struct bcm4775x_hub *hub = container_of(to_delayed_work(work),
++						struct bcm4775x_hub, idle_work);
++	struct bcm4775x *priv = hub->priv;
++	unsigned long idle, min_idle = ULONG_MAX, next;
++	bool busy = false, kept = false;
++	int i;
++
++	mutex_lock(&hub->lock);
++	if (!hub->running)
++		goto out;
++
++	for (i = 0; i < HUB_NUM_SENSORS; i++) {
++		struct hub_sensor *s = &hub->sensor[i];
++
++		if (!s->on)
++			continue;
++		if (s->keep) {
++			kept = true;
++			continue;
++		}
++		idle = jiffies - s->last_read;
++		if (idle >= msecs_to_jiffies(HUB_SENSOR_IDLE_MS)) {
++			if (hub_sensor_enable(priv, s, false)) {
++				hub_stop_failed(priv);
++				goto out;
++			}
++		} else {
++			busy = true;
++			min_idle = min(min_idle, idle);
++		}
++	}
++
++	idle = jiffies - hub->last_read;
++	if (busy)
++		next = msecs_to_jiffies(HUB_SENSOR_IDLE_MS) - min_idle + 1;
++	else if (kept)
++		goto out;	/* hub_release() starts the timer again */
++	else if (idle >= HUB_OFF_DELAY * HZ) {
++		hub_stop(priv);
++		goto out;
++	} else {
++		next = HUB_OFF_DELAY * HZ - idle + 1;
++	}
++	schedule_delayed_work(&hub->idle_work, next);
++out:
++	mutex_unlock(&hub->lock);
++}
++
++/* Start the hub unless it runs; not more often than every 30 s if it fails */
++static int hub_ensure_running(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	int ret;
++
++	if (priv->suspended || hub->suspending)
++		return -EBUSY;
++	if (hub->running)
++		return 0;
++	if (hub->failed && time_before(jiffies, hub->retry_after))
++		return -EAGAIN;
++	ret = hub_start(priv);
++	hub->failed = ret;
++	hub->retry_after = jiffies + 30 * HZ;
++	return ret;
++}
++
++/* Start the hub if needed and every sensor somebody holds */
++static int hub_start_kept(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	int ret, i;
++
++	ret = hub_ensure_running(priv);
++	for (i = 0; !ret && i < HUB_NUM_SENSORS; i++)
++		if (hub->sensor[i].keep)
++			ret = hub_sensor_enable(priv, &hub->sensor[i], true);
++	if (ret && hub->running)
++		hub_stop(priv);
++	return ret;
++}
++
++/* Keep a sensor running without reads until hub_release() */
++static int hub_hold(struct bcm4775x *priv, const u8 *index, unsigned int n)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	unsigned int i;
++	int ret;
++
++	mutex_lock(&hub->lock);
++	for (i = 0; i < n; i++)
++		hub->sensor[index[i]].keep++;
++	ret = hub_start_kept(priv);
++	if (ret) {
++		for (i = 0; i < n; i++)
++			hub->sensor[index[i]].keep--;
++		/* other holders lost the hub as well */
++		if (!hub->running && hub_kept(hub))
++			schedule_delayed_work(&hub->restart_work,
++					      msecs_to_jiffies(HUB_RESTART_MS));
++	}
++	mutex_unlock(&hub->lock);
++	return ret;
++}
++
++static void hub_release(struct bcm4775x *priv, const u8 *index, unsigned int n)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	unsigned int i;
++
++	mutex_lock(&hub->lock);
++	for (i = 0; i < n; i++) {
++		struct hub_sensor *s = &hub->sensor[index[i]];
++
++		s->keep--;
++		s->last_read = jiffies;
++	}
++	hub->last_read = jiffies;
++	/* the usual idle handling takes the sensors and the hub down */
++	mod_delayed_work(system_wq, &hub->idle_work,
++			 msecs_to_jiffies(HUB_SENSOR_IDLE_MS));
++	mutex_unlock(&hub->lock);
++}
++
++/* After a failure or system sleep: bring held sensors back */
++static void hub_restart_work(struct work_struct *work)
++{
++	struct bcm4775x_hub *hub = container_of(to_delayed_work(work),
++						struct bcm4775x_hub,
++						restart_work);
++
++	mutex_lock(&hub->lock);
++	if (!hub->suspending && hub_kept(hub) && hub_start_kept(hub->priv))
++		schedule_delayed_work(&hub->restart_work,
++				      msecs_to_jiffies(HUB_RESTART_MS));
++	mutex_unlock(&hub->lock);
++}
++
++/* Start the hub and the sensor if needed and return its latest value */
++static int hub_sensor_read(struct bcm4775x *priv, struct hub_sensor *s,
++			   unsigned int index, int *val)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	int ret;
++
++	mutex_lock(&hub->lock);
++	ret = hub_ensure_running(priv);
++	if (!ret) {
++		ret = hub_sensor_enable(priv, s, true);
++		if (ret == -ETIMEDOUT && hub->running && !priv->link_error) {
++			/* the hub works, this sensor just has nothing to say */
++			mutex_unlock(&hub->lock);
++			return -ENODATA;
++		}
++		if (ret && hub->running)
++			hub_stop_failed(priv);
++	}
++	if (!ret) {
++		*val = s->val[index];
++		s->last_read = hub->last_read = jiffies;
++		schedule_delayed_work(&hub->idle_work,
++				      msecs_to_jiffies(HUB_SENSOR_IDLE_MS));
++	}
++	mutex_unlock(&hub->lock);
++	return ret;
++}
++
++/* atan2(y, x) in millidegrees, -180000 < result <= 180000 (CORDIC) */
++static int hub_atan2_mdeg(s64 y, s64 x)
++{
++	/* atan(2^-i) in microdegrees */
++	static const s32 step[] = {
++		45000000, 26565051, 14036243, 7125016, 3576334, 1789911,
++		895174, 447614, 223811, 111906, 55953, 27976, 13988, 6994,
++		3497, 1749, 874, 437,
++	};
++	s64 angle = 0, t;
++	int i;
++
++	if (!x && !y)
++		return 0;
++	/* room for the CORDIC gain and for 18 bits of shift */
++	while (abs(x) >= (1LL << 40) || abs(y) >= (1LL << 40)) {
++		x /= 2;
++		y /= 2;
++	}
++	while (abs(x) < (1LL << 24) && abs(y) < (1LL << 24)) {
++		x *= 2;
++		y *= 2;
++	}
++	if (x < 0) {		/* turn by 180 degrees into the right half */
++		x = -x;
++		y = -y;
++		angle = y > 0 ? -180000000 : 180000000;
++	}
++	for (i = 0; i < ARRAY_SIZE(step); i++) {
++		t = x;
++		if (y > 0) {
++			x += y >> i;
++			y -= t >> i;
++			angle += step[i];
++		} else {
++			x -= y >> i;
++			y += t >> i;
++			angle -= step[i];
++		}
++	}
++	return div_s64(angle + (angle >= 0 ? 500 : -500), 1000);
++}
++
++/*
++ * Compass heading in millidegrees, 0 .. 359999: the angle from magnetic north
++ * to the top edge of the phone, clockwise seen from above, whatever the tilt.
++ *
++ * Both sensors report in the hub's (Android) axes; the accelerometer reads
++ * "up" at rest. With E the field and A up: H = E x A points east, M = A x H
++ * north, both horizontal, and the heading of the y axis is
++ * atan2(H.y / |H|, M.y / |M|) with |M| = |A| |H|.
++ */
++static int hub_heading(struct bcm4775x_hub *hub)
++{
++	const struct hub_sensor *acc = &hub->sensor[HUB_ACCEL];
++	const struct hub_sensor *mag = &hub->sensor[HUB_MAGN];
++	s64 a[3], e[3], d[3], hx, hy, hz, my;
++	int i, heading;
++
++	if (!acc->filt_valid || !mag->filt_valid)
++		return 0;
++	for (i = 0; i < 3; i++) {
++		a[i] = acc->filt[i];
++		d[i] = mag->filt[i] - magn_hard_iron[i] * (1 << HUB_FILTER_SHIFT);
++	}
++	for (i = 0; i < 3; i++)
++		e[i] = div_s64(magn_soft_iron[3 * i] * d[0] +
++			       magn_soft_iron[3 * i + 1] * d[1] +
++			       magn_soft_iron[3 * i + 2] * d[2], 1000);
++
++	/* 16 bit values with 4 fraction bits: |H| < 2^41, |M| < 2^62 */
++	hx = e[1] * a[2] - e[2] * a[1];
++	hy = e[2] * a[0] - e[0] * a[2];
++	hz = e[0] * a[1] - e[1] * a[0];
++	my = a[2] * hx - a[0] * hz;
++	hy *= int_sqrt64(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
++
++	heading = hub_atan2_mdeg(hy, my);
++	return heading < 0 ? heading + 360000 : heading;
++}
++
++static int hub_read_raw(struct iio_dev *indio, struct iio_chan_spec const *chan,
++			int *val, int *val2, long mask)
++{
++	struct hub_iio *hi = iio_priv(indio);
++	struct bcm4775x_hub *hub = hi->priv->hub;
++	struct hub_sensor *s = &hub->sensor[hi->index];
++	int ret;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++	case IIO_CHAN_INFO_PROCESSED:
++		if (chan->type == IIO_ROT) {
++			/* needs the accelerometer as well */
++			ret = hub_sensor_read(hi->priv, &hub->sensor[HUB_ACCEL],
++					      0, val);
++			if (!ret)
++				ret = hub_sensor_read(hi->priv, s, 0, val);
++			if (ret)
++				return ret;
++			*val = hub_heading(hub);
++			return IIO_VAL_INT;
++		}
++		ret = hub_sensor_read(hi->priv, s, chan->address, val);
++		return ret ? ret : IIO_VAL_INT;
++	case IIO_CHAN_INFO_SCALE:
++		switch (chan->type) {
++		case IIO_ROT:		/* millidegrees, in degrees */
++			*val = 0;
++			*val2 = 1000;
++			return IIO_VAL_INT_PLUS_MICRO;
++		case IIO_ACCEL:		/* 4096 LSB/g */
++			*val = 0;
++			*val2 = 2394202;
++			return IIO_VAL_INT_PLUS_NANO;
++		case IIO_ANGL_VEL:
++			/*
++			 * 1000 units per LSB of the LSM6DSO at 35 mdps/LSB:
++			 * 6.109e-7 rad/s. Measured with 90 degree turns
++			 * against gravity: 6.05e-7 .. 6.14e-7.
++			 */
++			*val = 0;
++			*val2 = 611;
++			return IIO_VAL_INT_PLUS_NANO;
++		case IIO_MAGN:
++			/*
++			 * AK09918 raw counts, 0.15 uT = 0.0015 G per LSB (a
++			 * sphere fit of the earth's field gave 316 LSB =
++			 * 47 uT).
++			 */
++			*val = 0;
++			*val2 = 1500;
++			return IIO_VAL_INT_PLUS_MICRO;
++		case IIO_PRESSURE:	/* 4096 LSB/hPa, in kPa */
++			*val = 0;
++			*val2 = 24414;
++			return IIO_VAL_INT_PLUS_NANO;
++		case IIO_TEMP:		/* 0.01 degrees C, in milli degrees */
++			*val = 10;
++			return IIO_VAL_INT;
++		default:
++			return -EINVAL;
++		}
++	case IIO_CHAN_INFO_OFFSET:
++		/* hard iron: (raw + offset) * scale is the ambient field */
++		if (chan->type != IIO_MAGN || chan->address >= 3)
++			return -EINVAL;
++		*val = -magn_hard_iron[chan->address];
++		return IIO_VAL_INT;
++	case IIO_CHAN_INFO_SAMP_FREQ:
++		*val = 1000 / s->desc->period_ms;
++		return IIO_VAL_INT;
++	}
++	return -EINVAL;
++}
++
++/* iio-sensor-proxy reads this: readings above it mean "near" */
++static ssize_t hub_prox_nearlevel(struct iio_dev *indio, uintptr_t priv,
++				  const struct iio_chan_spec *chan, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", HUB_PROX_NEAR);
++}
++
++static const struct iio_chan_spec_ext_info hub_prox_ext_info[] = {
++	{
++		.name = "nearlevel",
++		.shared = IIO_SEPARATE,
++		.read = hub_prox_nearlevel,
++	},
++	{ }
++};
++
++static const struct iio_mount_matrix *
++hub_get_mount_matrix(const struct iio_dev *indio,
++		     const struct iio_chan_spec *chan)
++{
++	struct hub_iio *hi = iio_priv((struct iio_dev *)indio);
++
++	return &hi->priv->hub->orientation;
++}
++
++static const struct iio_chan_spec_ext_info hub_ext_info[] = {
++	IIO_MOUNT_MATRIX(IIO_SHARED_BY_DIR, hub_get_mount_matrix),
++	{ }
++};
++
++#define HUB_3AXIS_CHANNEL(_type, axis, index) {				\
++	.type = _type,							\
++	.modified = 1,							\
++	.channel2 = IIO_MOD_##axis,					\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),			\
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |		\
++				    BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
++	.address = index,						\
++	.scan_index = index,						\
++	.ext_info = hub_ext_info,					\
++}
++
++static const struct iio_chan_spec hub_accel_channels[] = {
++	HUB_3AXIS_CHANNEL(IIO_ACCEL, X, 0),
++	HUB_3AXIS_CHANNEL(IIO_ACCEL, Y, 1),
++	HUB_3AXIS_CHANNEL(IIO_ACCEL, Z, 2),
++};
++
++static const struct iio_chan_spec hub_gyro_channels[] = {
++	HUB_3AXIS_CHANNEL(IIO_ANGL_VEL, X, 0),
++	HUB_3AXIS_CHANNEL(IIO_ANGL_VEL, Y, 1),
++	HUB_3AXIS_CHANNEL(IIO_ANGL_VEL, Z, 2),
++};
++
++#define HUB_MAGN_CHANNEL(axis, index) {					\
++	.type = IIO_MAGN,						\
++	.modified = 1,							\
++	.channel2 = IIO_MOD_##axis,					\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |			\
++			      BIT(IIO_CHAN_INFO_OFFSET),		\
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |		\
++				    BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
++	.address = index,						\
++	.scan_index = index,						\
++	.scan_type = {							\
++		.sign = 's',						\
++		.realbits = 16,						\
++		.storagebits = 16,					\
++		.endianness = IIO_CPU,					\
++	},								\
++	.ext_info = hub_ext_info,					\
++}
++
++/*
++ * The heading channel is what iio-sensor-proxy takes as a compass; like the
++ * HID sensor hubs' magnetometer it sits next to the raw axes.
++ */
++static const struct iio_chan_spec hub_magn_channels[] = {
++	HUB_MAGN_CHANNEL(X, 0),
++	HUB_MAGN_CHANNEL(Y, 1),
++	HUB_MAGN_CHANNEL(Z, 2),
++	{
++		.type = IIO_ROT,
++		.modified = 1,
++		.channel2 = IIO_MOD_NORTH_MAGN_TILT_COMP,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
++				      BIT(IIO_CHAN_INFO_SCALE),
++		.address = 3,
++		.scan_index = 3,
++		.scan_type = {
++			.sign = 's',
++			.realbits = 32,
++			.storagebits = 32,
++			.endianness = IIO_CPU,
++		},
++	},
++	IIO_CHAN_SOFT_TIMESTAMP(4),
++};
++
++/* always the whole scan, the IIO core picks what the reader enabled */
++static const unsigned long hub_magn_scan_masks[] = { GENMASK(3, 0), 0 };
++
++static const struct iio_chan_spec hub_pressure_channels[] = {
++	{
++		.type = IIO_PRESSURE,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
++				      BIT(IIO_CHAN_INFO_SCALE),
++		.address = 0,
++	}, {
++		.type = IIO_TEMP,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
++				      BIT(IIO_CHAN_INFO_SCALE),
++		.address = 1,
++	},
++};
++
++/* lux as computed by the hub, plus the raw colour counts */
++#define HUB_INTENSITY_CHANNEL(mod, index) {				\
++	.type = IIO_INTENSITY,						\
++	.modified = 1,							\
++	.channel2 = IIO_MOD_LIGHT_##mod,				\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),			\
++	.address = index,						\
++}
++
++static const struct iio_chan_spec hub_light_channels[] = {
++	{
++		.type = IIO_LIGHT,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
++		.address = 0,
++	},
++	HUB_INTENSITY_CHANNEL(RED, 1),
++	HUB_INTENSITY_CHANNEL(GREEN, 2),
++	HUB_INTENSITY_CHANNEL(BLUE, 3),
++	HUB_INTENSITY_CHANNEL(CLEAR, 4),
++};
++
++/*
++ * raw: the sensor's ADC count, larger = closer. About 1500 with nothing in
++ * front; a palm on the glass gives 2900..3600, a finger on the sensor 4000.
++ */
++static const struct iio_chan_spec hub_prox_channels[] = {
++	{
++		.type = IIO_PROXIMITY,
++		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
++		.address = 0,
++		.ext_info = hub_prox_ext_info,
++	},
++};
++
++static bool hub_decode_3x16(struct hub_sensor *s, const u8 *d)
++{
++	s->val[0] = (s16)get_unaligned_le16(d);
++	s->val[1] = (s16)get_unaligned_le16(d + 2);
++	s->val[2] = (s16)get_unaligned_le16(d + 4);
++	return true;
++}
++
++static bool hub_decode_3x32(struct hub_sensor *s, const u8 *d)
++{
++	s->val[0] = (s32)get_unaligned_le32(d);
++	s->val[1] = (s32)get_unaligned_le32(d + 4);
++	s->val[2] = (s32)get_unaligned_le32(d + 8);
++	return true;
++}
++
++/* s32 pressure, s16 temperature */
++static bool hub_decode_pressure(struct hub_sensor *s, const u8 *d)
++{
++	s->val[0] = (s32)get_unaligned_le32(d);
++	s->val[1] = (s16)get_unaligned_le16(d + 4);
++	return true;
++}
++
++/* u32 lux, s32 cct, u16 r, g, b, w, gain, integration time, u8 brightness */
++static bool hub_decode_light(struct hub_sensor *s, const u8 *d)
++{
++	s->val[0] = get_unaligned_le32(d);
++	s->val[1] = get_unaligned_le16(d + 8);
++	s->val[2] = get_unaligned_le16(d + 10);
++	s->val[3] = get_unaligned_le16(d + 12);
++	s->val[4] = get_unaligned_le16(d + 14);
++	return true;
++}
++
++/* raw proximity: u16 ADC count; 0xffff until the first conversion is done */
++static bool hub_decode_prox(struct hub_sensor *s, const u8 *d)
++{
++	if (get_unaligned_le16(d) == 0xffff)
++		return false;
++	s->val[0] = get_unaligned_le16(d);
++	return true;
++}
++
++static const struct hub_sensor_desc hub_sensors[HUB_NUM_SENSORS] = {
++	{ "bcm4775x-accel", 0, -1, 6, 50, hub_decode_3x16,
++	  hub_accel_channels, ARRAY_SIZE(hub_accel_channels) },
++	{ "bcm4775x-gyro", 1, -1, 12, 50, hub_decode_3x32,
++	  hub_gyro_channels, ARRAY_SIZE(hub_gyro_channels) },
++	/*
++	 * Raw magnetometer. The hub's calibrated type 4 is the raw value
++	 * times 2.5 until its own calibration has run, and reads zero once
++	 * the vendor's "PDC" matrix has been set, so it is not used.
++	 */
++	{ "bcm4775x-magn", 3, -1, 6, 100, hub_decode_3x16,
++	  hub_magn_channels, ARRAY_SIZE(hub_magn_channels) },
++	{ "bcm4775x-pressure", 5, -1, 6, 200, hub_decode_pressure,
++	  hub_pressure_channels, ARRAY_SIZE(hub_pressure_channels) },
++	/* the hub reports light only when the values change */
++	{ "bcm4775x-light", 9, -1, 21, 200, hub_decode_light,
++	  hub_light_channels, ARRAY_SIZE(hub_light_channels) },
++	/*
++	 * The proximity sensor proper (type 7) only sends near/far events;
++	 * while it runs, the raw type 10 delivers the ADC count continuously.
++	 */
++	{ "bcm4775x-proximity", 10, 7, 2, 100, hub_decode_prox,
++	  hub_prox_channels, ARRAY_SIZE(hub_prox_channels) },
++};
++
++/* Payload sizes of bypass data the hub may send that we do not expose */
++static unsigned int hub_bypass_size(u8 type)
++{
++	int i;
++
++	for (i = 0; i < HUB_NUM_SENSORS; i++)
++		if (hub_sensors[i].type == type)
++			return hub_sensors[i].size;
++	switch (type) {
++	case 2:		/* uncalibrated magnetometer */
++		return 13;
++	case 4:		/* calibrated magnetometer */
++		return 8;
++	case 7:		/* proximity event: state, ADC count, 4 more bytes */
++		return 7;
++	}
++	return 0;
++}
++
++/* Low pass for the heading: 1/4 of each new sample (0.35 s at 10 Hz) */
++static void hub_filter(struct hub_sensor *s)
++{
++	int i, v;
++
++	for (i = 0; i < 3; i++) {
++		v = s->val[i] * (1 << HUB_FILTER_SHIFT);
++		if (s->filt_valid)
++			s->filt[i] += (v - s->filt[i]) / 4;
++		else
++			s->filt[i] = v;
++	}
++	s->filt_valid = true;
++}
++
++static void hub_magn_push(struct bcm4775x_hub *hub, struct hub_sensor *s)
++{
++	hub->scan.magn[0] = s->val[0];
++	hub->scan.magn[1] = s->val[1];
++	hub->scan.magn[2] = s->val[2];
++	hub->scan.heading = hub_heading(hub);
++	iio_push_to_buffers_with_ts(s->indio, &hub->scan, sizeof(hub->scan),
++				    iio_get_time_ns(s->indio));
++}
++
++static void hub_bypass_data(struct bcm4775x_hub *hub, u8 type, const u8 *d)
++{
++	int i;
++
++	for (i = 0; i < HUB_NUM_SENSORS; i++) {
++		struct hub_sensor *s = &hub->sensor[i];
++
++		if (hub_sensors[i].type != type)
++			continue;
++		if (!hub_sensors[i].decode(s, d))
++			continue;
++		if (i == HUB_ACCEL || i == HUB_MAGN)
++			hub_filter(s);
++		if (i == HUB_MAGN && iio_buffer_enabled(s->indio))
++			hub_magn_push(hub, s);
++		complete(&s->fresh);
++	}
++}
++
++/* The magnetometer buffer holds the heading too: that needs the accelerometer */
++static const u8 hub_magn_buffer_sensors[] = { HUB_ACCEL, HUB_MAGN };
++
++static int hub_magn_postenable(struct iio_dev *indio)
++{
++	struct hub_iio *hi = iio_priv(indio);
++
++	return hub_hold(hi->priv, hub_magn_buffer_sensors,
++			ARRAY_SIZE(hub_magn_buffer_sensors));
++}
++
++static int hub_magn_predisable(struct iio_dev *indio)
++{
++	struct hub_iio *hi = iio_priv(indio);
++
++	hub_release(hi->priv, hub_magn_buffer_sensors,
++		    ARRAY_SIZE(hub_magn_buffer_sensors));
++	return 0;
++}
++
++static const struct iio_buffer_setup_ops hub_magn_buffer_ops = {
++	.postenable = hub_magn_postenable,
++	.predisable = hub_magn_predisable,
++};
++
++static const struct iio_info hub_iio_info = {
++	.read_raw = hub_read_raw,
++};
++
++static int bcm4775x_hub_probe(struct bcm4775x *priv)
++{
++	struct device *dev = &priv->spi->dev;
++	struct bcm4775x_hub *hub;
++	struct hub_iio *hi;
++	int ret, i;
++
++	hub = devm_kzalloc(dev, sizeof(*hub), GFP_KERNEL);
++	if (!hub)
++		return -ENOMEM;
++	hub->priv = priv;
++	mutex_init(&hub->lock);
++	mutex_init(&hub->tl_lock);
++	init_completion(&hub->rel_done);
++	init_completion(&hub->sync_done);
++	init_completion(&hub->version_done);
++	init_completion(&hub->ssp_done);
++	init_completion(&hub->init_done);
++	INIT_DELAYED_WORK(&hub->idle_work, hub_idle_work);
++	INIT_DELAYED_WORK(&hub->restart_work, hub_restart_work);
++
++	/*
++	 * The hub reports Android axes (upright portrait: +y, face up: +z).
++	 * IIO user space (iio-sensor-proxy) wants x and y the other way round,
++	 * so without a mount-matrix in the DT rotate by 180 degrees around z.
++	 */
++	if (device_property_present(dev, "mount-matrix")) {
++		ret = iio_read_mount_matrix(dev, &hub->orientation);
++		if (ret)
++			return ret;
++	} else {
++		static const char * const rot180[9] = {
++			"-1", "0", "0", "0", "-1", "0", "0", "0", "1"
++		};
++
++		memcpy(hub->orientation.rotation, rot180, sizeof(rot180));
++	}
++	priv->hub = hub;
++
++	for (i = 0; i < HUB_NUM_SENSORS; i++) {
++		struct hub_sensor *s = &hub->sensor[i];
++
++		s->desc = &hub_sensors[i];
++		init_completion(&s->fresh);
++		s->indio = devm_iio_device_alloc(dev, sizeof(*hi));
++		if (!s->indio) {
++			ret = -ENOMEM;
++			goto err;
++		}
++		hi = iio_priv(s->indio);
++		hi->priv = priv;
++		hi->index = i;
++		s->indio->name = s->desc->name;
++		s->indio->info = &hub_iio_info;
++		s->indio->modes = INDIO_DIRECT_MODE;
++		s->indio->channels = s->desc->channels;
++		s->indio->num_channels = s->desc->num_channels;
++		if (i == HUB_MAGN) {
++			s->indio->available_scan_masks = hub_magn_scan_masks;
++			ret = devm_iio_kfifo_buffer_setup(dev, s->indio,
++							  &hub_magn_buffer_ops);
++			if (ret)
++				goto err;
++		}
++		ret = iio_device_register(s->indio);
++		if (ret)
++			goto err;
++	}
++	return 0;
++
++err:
++	while (--i >= 0)
++		iio_device_unregister(hub->sensor[i].indio);
++	return ret;
++}
++
++static void bcm4775x_hub_remove(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++	int i;
++
++	for (i = 0; i < HUB_NUM_SENSORS; i++)
++		iio_device_unregister(hub->sensor[i].indio);
++	mutex_lock(&hub->lock);
++	hub->suspending = true;		/* no restart from here on */
++	mutex_unlock(&hub->lock);
++	cancel_delayed_work_sync(&hub->restart_work);
++	cancel_delayed_work_sync(&hub->idle_work);
++	mutex_lock(&hub->lock);
++	hub_stop(priv);
++	mutex_unlock(&hub->lock);
++}
++
++/*
++ * System sleep: the hub loses power and is started again by the next reader,
++ * or after resume if a buffer is enabled.
++ */
++static void bcm4775x_hub_suspend(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++
++	mutex_lock(&hub->lock);
++	hub->suspending = true;
++	mutex_unlock(&hub->lock);
++	cancel_delayed_work_sync(&hub->restart_work);
++	cancel_delayed_work_sync(&hub->idle_work);
++	mutex_lock(&hub->lock);
++	hub_stop(priv);
++	mutex_unlock(&hub->lock);
++}
++
++static void bcm4775x_hub_resume(struct bcm4775x *priv)
++{
++	struct bcm4775x_hub *hub = priv->hub;
++
++	mutex_lock(&hub->lock);
++	hub->suspending = false;
++	if (hub_kept(hub))
++		schedule_delayed_work(&hub->restart_work, HZ / 2);
++	mutex_unlock(&hub->lock);
++}
++
++/* --- character device --------------------------------------------------- */
++
++static struct bcm4775x *to_bcm4775x(struct file *file)
++{
++	return container_of(file->private_data, struct bcm4775x, misc);
++}
++
++static int bcm4775x_open(struct inode *inode, struct file *file)
++{
++	struct bcm4775x *priv = to_bcm4775x(file);
++	int ret = 0;
++
++	mutex_lock(&priv->lock);
++	if (priv->opened) {
++		ret = -EBUSY;
++	} else {
++		priv->opened = true;
++		bcm4775x_irq_enable(priv, true);
++	}
++	mutex_unlock(&priv->lock);
++	return ret ? ret : nonseekable_open(inode, file);
++}
++
++static int bcm4775x_release(struct inode *inode, struct file *file)
++{
++	struct bcm4775x *priv = to_bcm4775x(file);
++
++	mutex_lock(&priv->lock);
++	bcm4775x_irq_enable(priv, false);
++	priv->opened = false;
++	mutex_unlock(&priv->lock);
++	return 0;
++}
++
++static ssize_t bcm4775x_read(struct file *file, char __user *buf, size_t count,
++			     loff_t *ppos)
++{
++	struct bcm4775x *priv = to_bcm4775x(file);
++	unsigned int copied = 0;
++	bool was_full;
++	int ret;
++
++	if (!count)
++		return 0;
++
++	while (kfifo_is_empty(&priv->rx_fifo)) {
++		if (!priv->powered)
++			return -ENODEV;
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		ret = wait_event_interruptible(priv->wait,
++					       !kfifo_is_empty(&priv->rx_fifo) ||
++					       !priv->powered);
++		if (ret)
++			return ret;
++	}
++
++	ret = mutex_lock_interruptible(&priv->rx_lock);
++	if (ret)
++		return ret;
++	was_full = kfifo_avail(&priv->rx_fifo) < SSI_MIN_FRAME;
++	ret = kfifo_to_user(&priv->rx_fifo, buf, count, &copied);
++	mutex_unlock(&priv->rx_lock);
++	if (ret)
++		return ret;
++
++	/* the work stopped receiving while the buffer was full */
++	if (was_full && priv->powered)
++		bcm4775x_kick(priv);
++	return copied;
++}
++
++static ssize_t bcm4775x_write(struct file *file, const char __user *buf,
++			      size_t count, loff_t *ppos)
++{
++	struct bcm4775x *priv = to_bcm4775x(file);
++	unsigned int copied = 0;
++	size_t done = 0;
++	int ret;
++
++	ret = mutex_lock_interruptible(&priv->tx_lock);
++	if (ret)
++		return ret;
++
++	while (done < count) {
++		if (!priv->powered) {
++			ret = -ENODEV;
++			break;
++		}
++		if (kfifo_is_full(&priv->tx_fifo)) {
++			if (file->f_flags & O_NONBLOCK) {
++				ret = -EAGAIN;
++				break;
++			}
++			ret = wait_event_interruptible(priv->wait,
++						       !kfifo_is_full(&priv->tx_fifo) ||
++						       !priv->powered);
++			if (ret)
++				break;
++			continue;
++		}
++		ret = kfifo_from_user(&priv->tx_fifo, buf + done, count - done,
++				      &copied);
++		if (ret)
++			break;
++		done += copied;
++		bcm4775x_kick(priv);
++	}
++	mutex_unlock(&priv->tx_lock);
++
++	return done ? done : ret;
++}
++
++static __poll_t bcm4775x_poll(struct file *file, poll_table *wait)
++{
++	struct bcm4775x *priv = to_bcm4775x(file);
++	__poll_t mask = 0;
++
++	poll_wait(file, &priv->wait, wait);
++	if (!kfifo_is_empty(&priv->rx_fifo))
++		mask |= EPOLLIN | EPOLLRDNORM;
++	if (!kfifo_is_full(&priv->tx_fifo))
++		mask |= EPOLLOUT | EPOLLWRNORM;
++	if (!priv->powered)
++		mask |= EPOLLHUP;
++	if (priv->link_error)
++		mask |= EPOLLERR;
++	return mask;
++}
++
++static const struct file_operations bcm4775x_fops = {
++	.owner		= THIS_MODULE,
++	.open		= bcm4775x_open,
++	.release	= bcm4775x_release,
++	.read		= bcm4775x_read,
++	.write		= bcm4775x_write,
++	.poll		= bcm4775x_poll,
++};
++
++/* --- sysfs --------------------------------------------------------------- */
++
++static ssize_t chip_power_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", priv->powered);
++}
++
++static ssize_t chip_power_store(struct device *dev, struct device_attribute *attr,
++			   const char *buf, size_t count)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++	bool on;
++	int ret;
++
++	ret = kstrtobool(buf, &on);
++	if (ret)
++		return ret;
++
++	mutex_lock(&priv->lock);
++	if (on)
++		ret = bcm4775x_power_on(priv);
++	else
++		bcm4775x_power_off(priv);
++	mutex_unlock(&priv->lock);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_RW(chip_power);
++
++static ssize_t bcm4775x_gpio_show(struct bcm4775x *priv, struct gpio_desc *gpio,
++				  char *buf)
++{
++	return sysfs_emit(buf, "%d\n", gpiod_get_value_cansleep(gpio));
++}
++
++static ssize_t bcm4775x_gpio_store(struct bcm4775x *priv,
++				   struct gpio_desc *gpio, const char *buf,
++				   size_t count)
++{
++	bool on;
++	int ret;
++
++	ret = kstrtobool(buf, &on);
++	if (ret)
++		return ret;
++
++	mutex_lock(&priv->lock);
++	if (priv->powered) {
++		mutex_lock(&priv->io_lock);
++		gpiod_set_value_cansleep(gpio, on);
++		mutex_unlock(&priv->io_lock);
++	} else {
++		ret = -ENODEV;
++	}
++	mutex_unlock(&priv->lock);
++	return ret ? ret : count;
++}
++
++static ssize_t nstandby_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	return bcm4775x_gpio_show(priv, priv->nstandby, buf);
++}
++
++static ssize_t nstandby_store(struct device *dev, struct device_attribute *attr,
++			      const char *buf, size_t count)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	return bcm4775x_gpio_store(priv, priv->nstandby, buf, count);
++}
++static DEVICE_ATTR_RW(nstandby);
++
++static ssize_t mcu_req_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	return bcm4775x_gpio_show(priv, priv->mcu_req, buf);
++}
++
++static ssize_t mcu_req_store(struct device *dev, struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	return bcm4775x_gpio_store(priv, priv->mcu_req, buf, count);
++}
++static DEVICE_ATTR_RW(mcu_req);
++
++static ssize_t mcu_resp_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	return bcm4775x_gpio_show(priv, priv->mcu_resp, buf);
++}
++static DEVICE_ATTR_RO(mcu_resp);
++
++static ssize_t host_req_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	return bcm4775x_gpio_show(priv, priv->host_req, buf);
++}
++static DEVICE_ATTR_RO(host_req);
++
++/* MCU_REQ/MCU_RESP handshake only, no SPI traffic */
++static ssize_t hello_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++	int ret;
++
++	mutex_lock(&priv->lock);
++	if (!priv->powered) {
++		mutex_unlock(&priv->lock);
++		return -ENODEV;
++	}
++	mutex_lock(&priv->io_lock);
++	ret = bcm4775x_hello(priv);
++	bcm4775x_bye(priv);
++	mutex_unlock(&priv->io_lock);
++	mutex_unlock(&priv->lock);
++
++	if (ret < 0)
++		return sysfs_emit(buf, "timeout\n");
++	return sysfs_emit(buf, "ok %d ms\n", ret);
++}
++static DEVICE_ATTR_RO(hello);
++
++static const unsigned int ssi_blk_size[] = { 32, 256, 2048, 16384 };
++
++static ssize_t stats_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf,
++			  "tx_bytes %lu\nrx_bytes %lu\ntx_frames %lu\nrx_frames %lu\n"
++			  "fc_retries %lu\nfc_errors %lu\nhello_fail %lu\n"
++			  "spi_errors %lu\nrx_dropped %lu\nparity_errors %lu\n"
++			  "last_status 0x%02x\nrx_room %u\nlink_error %d\n",
++			  priv->tx_bytes, priv->rx_bytes, priv->tx_frames,
++			  priv->rx_frames, priv->fc_retries, priv->fc_errors,
++			  priv->hello_fail, priv->spi_errors, priv->rx_dropped,
++			  priv->parity_errors, priv->last_status,
++			  ssi_blk_size[(priv->last_status & SSI_STAT_SZE_MASK) >>
++				       SSI_STAT_SZE_SHIFT] *
++				(priv->last_status & SSI_STAT_CNT_MASK),
++			  priv->link_error);
++}
++static DEVICE_ATTR_RO(stats);
++
++static struct attribute *bcm4775x_attrs[] = {
++	&dev_attr_chip_power.attr,
++	&dev_attr_nstandby.attr,
++	&dev_attr_mcu_req.attr,
++	&dev_attr_mcu_resp.attr,
++	&dev_attr_host_req.attr,
++	&dev_attr_hello.attr,
++	&dev_attr_stats.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(bcm4775x);
++
++/* --- driver -------------------------------------------------------------- */
++
++static int bcm4775x_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct bcm4775x *priv;
++	int ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++	priv->spi = spi;
++	mutex_init(&priv->lock);
++	mutex_init(&priv->io_lock);
++	mutex_init(&priv->rx_lock);
++	mutex_init(&priv->tx_lock);
++	init_waitqueue_head(&priv->wait);
++	spin_lock_init(&priv->irq_lock);
++	INIT_WORK(&priv->work, bcm4775x_work);
++
++	priv->tx_buf = devm_kmalloc(dev, SSI_MAX_FRAME + 8, GFP_KERNEL);
++	priv->rx_buf = devm_kmalloc(dev, SSI_MAX_FRAME + 8, GFP_KERNEL);
++	if (!priv->tx_buf || !priv->rx_buf)
++		return -ENOMEM;
++
++	priv->vdd = devm_regulator_get(dev, "vdd");
++	if (IS_ERR(priv->vdd))
++		return dev_err_probe(dev, PTR_ERR(priv->vdd), "vdd supply\n");
++
++	/* everything low or high-Z until the chip is powered */
++	priv->nstandby = devm_gpiod_get(dev, "nstandby", GPIOD_OUT_LOW);
++	if (IS_ERR(priv->nstandby))
++		return dev_err_probe(dev, PTR_ERR(priv->nstandby), "nstandby gpio\n");
++	priv->mcu_req = devm_gpiod_get(dev, "mcu-req", GPIOD_OUT_LOW);
++	if (IS_ERR(priv->mcu_req))
++		return dev_err_probe(dev, PTR_ERR(priv->mcu_req), "mcu-req gpio\n");
++	priv->mcu_resp = devm_gpiod_get(dev, "mcu-resp", GPIOD_IN);
++	if (IS_ERR(priv->mcu_resp))
++		return dev_err_probe(dev, PTR_ERR(priv->mcu_resp), "mcu-resp gpio\n");
++	priv->host_req = devm_gpiod_get(dev, "host-req", GPIOD_IN);
++	if (IS_ERR(priv->host_req))
++		return dev_err_probe(dev, PTR_ERR(priv->host_req), "host-req gpio\n");
++	priv->cs = devm_gpiod_get(dev, "ssi-cs", GPIOD_IN);
++	if (IS_ERR(priv->cs))
++		return dev_err_probe(dev, PTR_ERR(priv->cs), "ssi-cs gpio\n");
++
++	priv->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(priv->pinctrl))
++		return dev_err_probe(dev, PTR_ERR(priv->pinctrl), "pinctrl\n");
++	priv->pins_idle = pinctrl_lookup_state(priv->pinctrl, PINCTRL_STATE_DEFAULT);
++	if (IS_ERR(priv->pins_idle))
++		return dev_err_probe(dev, PTR_ERR(priv->pins_idle), "default pins\n");
++	priv->pins_active = pinctrl_lookup_state(priv->pinctrl, "active");
++	if (IS_ERR(priv->pins_active))
++		return dev_err_probe(dev, PTR_ERR(priv->pins_active), "active pins\n");
++
++	ret = kfifo_alloc(&priv->rx_fifo, BCM4775X_RX_FIFO, GFP_KERNEL);
++	if (ret)
++		return ret;
++	ret = kfifo_alloc(&priv->tx_fifo, BCM4775X_TX_FIFO, GFP_KERNEL);
++	if (ret)
++		goto err_rx_fifo;
++
++	priv->wq = alloc_ordered_workqueue("bcm4775x", WQ_HIGHPRI | WQ_MEM_RECLAIM);
++	if (!priv->wq) {
++		ret = -ENOMEM;
++		goto err_tx_fifo;
++	}
++
++	priv->irq = gpiod_to_irq(priv->host_req);
++	if (priv->irq < 0) {
++		ret = dev_err_probe(dev, priv->irq, "host-req irq\n");
++		goto err_wq;
++	}
++	ret = request_irq(priv->irq, bcm4775x_irq,
++			  IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN, "bcm4775x", priv);
++	if (ret) {
++		dev_err_probe(dev, ret, "request irq\n");
++		goto err_wq;
++	}
++
++	spi_set_drvdata(spi, priv);
++
++	priv->misc.minor = MISC_DYNAMIC_MINOR;
++	priv->misc.name = "bcm4775x";
++	priv->misc.fops = &bcm4775x_fops;
++	priv->misc.parent = dev;
++	ret = misc_register(&priv->misc);
++	if (ret)
++		goto err_irq;
++
++	ret = bcm4775x_hub_probe(priv);
++	if (ret) {
++		misc_deregister(&priv->misc);
++		goto err_irq;
++	}
++
++	dev_info(dev, "BCM4775x SSI link, chip unpowered until 'chip_power' is set\n");
++	return 0;
++
++err_irq:
++	free_irq(priv->irq, priv);
++err_wq:
++	destroy_workqueue(priv->wq);
++err_tx_fifo:
++	kfifo_free(&priv->tx_fifo);
++err_rx_fifo:
++	kfifo_free(&priv->rx_fifo);
++	return ret;
++}
++
++static void bcm4775x_remove(struct spi_device *spi)
++{
++	struct bcm4775x *priv = spi_get_drvdata(spi);
++
++	bcm4775x_hub_remove(priv);
++	misc_deregister(&priv->misc);
++	mutex_lock(&priv->lock);
++	bcm4775x_power_off(priv);
++	mutex_unlock(&priv->lock);
++	free_irq(priv->irq, priv);
++	destroy_workqueue(priv->wq);
++	kfifo_free(&priv->tx_fifo);
++	kfifo_free(&priv->rx_fifo);
++}
++
++static void bcm4775x_shutdown(struct spi_device *spi)
++{
++	struct bcm4775x *priv = spi_get_drvdata(spi);
++
++	mutex_lock(&priv->lock);
++	bcm4775x_power_off(priv);
++	mutex_unlock(&priv->lock);
++}
++
++static int bcm4775x_suspend(struct device *dev)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	bcm4775x_hub_suspend(priv);
++	mutex_lock(&priv->lock);
++	bcm4775x_irq_enable(priv, false);
++	mutex_lock(&priv->io_lock);
++	priv->suspended = true;
++	mutex_unlock(&priv->io_lock);
++	mutex_unlock(&priv->lock);
++	flush_work(&priv->work);
++	return 0;
++}
++
++static int bcm4775x_resume(struct device *dev)
++{
++	struct bcm4775x *priv = dev_get_drvdata(dev);
++
++	mutex_lock(&priv->lock);
++	mutex_lock(&priv->io_lock);
++	priv->suspended = false;
++	mutex_unlock(&priv->io_lock);
++	bcm4775x_irq_enable(priv, true);
++	mutex_unlock(&priv->lock);
++	bcm4775x_hub_resume(priv);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(bcm4775x_pm_ops, bcm4775x_suspend,
++				bcm4775x_resume);
++
++static const struct of_device_id bcm4775x_of_match[] = {
++	{ .compatible = "brcm,bcm47752" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, bcm4775x_of_match);
++
++static const struct spi_device_id bcm4775x_spi_id[] = {
++	{ "bcm47752" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, bcm4775x_spi_id);
++
++static struct spi_driver bcm4775x_driver = {
++	.driver = {
++		.name = "bcm4775x",
++		.of_match_table = bcm4775x_of_match,
++		.pm = pm_sleep_ptr(&bcm4775x_pm_ops),
++		.dev_groups = bcm4775x_groups,
++	},
++	.probe = bcm4775x_probe,
++	.remove = bcm4775x_remove,
++	.shutdown = bcm4775x_shutdown,
++	.id_table = bcm4775x_spi_id,
++};
++module_spi_driver(bcm4775x_driver);
++
++MODULE_FIRMWARE(HUB_FIRMWARE);
++MODULE_DESCRIPTION("Broadcom BCM4775x GNSS/sensor hub driver");
++MODULE_LICENSE("GPL");

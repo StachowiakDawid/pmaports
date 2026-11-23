@@ -1,0 +1,42 @@
+From 8b81f6ce964d0690ba6a9942b17a5e8a852e941c Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] soc: samsung: exynos-pmu: undo the C2 programming on
+ CPU_PM_ENTER_FAILED
+
+The CPU PM notifier runs first (INT_MAX) and programs the CPU_INFORM C2
+hint and the wakeup routing on CPU_PM_ENTER. If a later notifier refuses
+the transition, cpu_pm_enter() rolls back with CPU_PM_ENTER_FAILED, which
+was ignored: the hint stayed set while the CPU went back to the idle
+loop, so the next plain WFI looked like a C2 request to the power
+management firmware, which then powers the core off without its context
+saved.
+
+Treat CPU_PM_ENTER_FAILED like CPU_PM_EXIT.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/soc/samsung/exynos-pmu.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/soc/samsung/exynos-pmu.c b/drivers/soc/samsung/exynos-pmu.c
+index 9ec2caafd5..13919ae319 100644
+--- a/drivers/soc/samsung/exynos-pmu.c
++++ b/drivers/soc/samsung/exynos-pmu.c
+@@ -324,6 +324,14 @@ static int exynos_cpu_pm_notify_callback(struct notifier_block *self,
+ 	case CPU_PM_ENTER:
+ 		return exynos_cpu_pmu_offline();
+ 
++	/*
++	 * A notifier after us refused CPU_PM_ENTER: the CPU is not going to
++	 * be powered down after all, so undo the C2 hint and the wakeup
++	 * routing. Otherwise the CPU_INFORM C2 hint stays set and the next
++	 * plain WFI of this CPU looks like a C2 request to the firmware, which
++	 * then powers the core off without its context being saved.
++	 */
++	case CPU_PM_ENTER_FAILED:
+ 	case CPU_PM_EXIT:
+ 		return exynos_cpu_pmu_online();
+ 	}

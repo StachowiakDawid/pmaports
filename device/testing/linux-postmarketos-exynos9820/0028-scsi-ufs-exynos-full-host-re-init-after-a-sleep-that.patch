@@ -1,0 +1,217 @@
+From 6fb57536c56a12e561c59af34fea02881ac566b6 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] scsi: ufs: exynos: full host re-init after a sleep that lost
+ the UFS block
+
+On the Exynos 9820 a SoC sleep resets the UFS host controller, UniPro,
+the M-PHY and the FSYS1 sysreg IO-coherency (shareability) bits while
+ufshcd still believes the link is in hibern8. The hibern8 exit then
+times out, and the link recovery that follows does not re-run
+drv_init(), so the shareability bits stay 0 and the host's descriptor
+writes bypass the CPU caches: I/O is dead.
+
+Detect the lost state in the vendor resume callback (shareability bits
+not as programmed, HCE off with the link in hibern8, or a SoC suspend
+driver setting exynos_ufs_soc_power_lost), re-run drv_init() and mark
+the link off, so that ufshcd goes through reset and restore right
+away. Without a loss the checks are two register reads.
+
+exynos_ufs_resume_hook lets a SoC suspend driver record the re-init
+steps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/ufs/host/ufs-exynos.c | 112 +++++++++++++++++++++++++++++++++-
+ drivers/ufs/host/ufs-exynos.h |   1 +
+ 2 files changed, 112 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+index 0563e53ad5..50564bcc54 100644
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -230,6 +230,27 @@ static int exynos_ufs_shareability(struct exynos_ufs *ufs)
+ 	return 0;
+ }
+ 
++/* Set by a SoC suspend driver after a sleep that powered the UFS block off. */
++bool exynos_ufs_soc_power_lost;
++EXPORT_SYMBOL_GPL(exynos_ufs_soc_power_lost);
++
++/* Optional progress hook for a SoC suspend driver (persistent breadcrumbs). */
++void (*exynos_ufs_resume_hook)(unsigned int step, u32 a0, u32 a1);
++EXPORT_SYMBOL_GPL(exynos_ufs_resume_hook);
++
++#define EXYNOS_UFS_LOST_IOCC	BIT(0)	/* shareability bits not as programmed */
++#define EXYNOS_UFS_LOST_HCE	BIT(1)	/* HCE off although the link is in hibern8 */
++#define EXYNOS_UFS_LOST_SOC	BIT(2)	/* the SoC suspend driver says so */
++
++static void exynos_ufs_resume_step(unsigned int step, u32 a0, u32 a1)
++{
++	void (*hook)(unsigned int step, u32 a0, u32 a1) =
++		READ_ONCE(exynos_ufs_resume_hook);
++
++	if (hook)
++		hook(step, a0, a1);
++}
++
+ static void exynos_ufs_set_hwacg_control(struct exynos_ufs *ufs, bool en)
+ {
+ 	u32 reg;
+@@ -1935,12 +1956,16 @@ static int exynos_ufs_hce_enable_notify(struct ufs_hba *hba,
+ 				return ret;
+ 		}
+ 
++		if (ufs->reinit_trace)
++			exynos_ufs_resume_step(2, 0, 0);
+ 		ret = exynos_ufs_host_reset(hba);
+ 		if (ret)
+ 			return ret;
+ 		exynos_ufs_dev_hw_reset(hba);
+ 		break;
+ 	case POST_CHANGE:
++		if (ufs->reinit_trace)
++			exynos_ufs_resume_step(3, 0, 0);
+ 		exynos_ufs_calc_pwm_clk_div(ufs);
+ 		if (!(ufs->opts & EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL))
+ 			exynos_ufs_enable_auto_ctrl_hcc(ufs);
+@@ -1957,13 +1982,18 @@ static int exynos_ufs_hce_enable_notify(struct ufs_hba *hba,
+ static int exynos_ufs_link_startup_notify(struct ufs_hba *hba,
+ 					  enum ufs_notify_change_status status)
+ {
++	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+ 	int ret = 0;
+ 
+ 	switch (status) {
+ 	case PRE_CHANGE:
++		if (ufs->reinit_trace)
++			exynos_ufs_resume_step(4, 0, 0);
+ 		ret = exynos_ufs_pre_link(hba);
+ 		break;
+ 	case POST_CHANGE:
++		if (ufs->reinit_trace)
++			exynos_ufs_resume_step(5, 0, 0);
+ 		ret = exynos_ufs_post_link(hba);
+ 		break;
+ 	}
+@@ -1990,6 +2020,7 @@ static int exynos_ufs_pwr_change_notify(struct ufs_hba *hba,
+ 				enum ufs_notify_change_status status,
+ 				struct ufs_pa_layer_attr *dev_req_params)
+ {
++	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+ 	int ret = 0;
+ 
+ 	switch (status) {
+@@ -2000,6 +2031,13 @@ static int exynos_ufs_pwr_change_notify(struct ufs_hba *hba,
+ 		/* NULL when the gear switch failed: nothing to apply */
+ 		if (dev_req_params)
+ 			ret = exynos_ufs_post_pwr_mode(hba, dev_req_params);
++		if (ufs->reinit_trace && dev_req_params) {
++			/* next: NOP OUT and device init in ufshcd core */
++			ufs->reinit_trace = false;
++			exynos_ufs_resume_step(6, dev_req_params->gear_rx, ret);
++			dev_info(hba->dev, "resume: re-init: link up, gear %u, ret %d\n",
++				 dev_req_params->gear_rx, ret);
++		}
+ 		break;
+ 	}
+ 
+@@ -2043,12 +2081,84 @@ static int exynos_ufs_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op,
+ 	return 0;
+ }
+ 
++/*
++ * A system sleep state that powers the UFS block down (Exynos 9820 SoC
++ * SLEEP: everything but the alive domain loses power) resets the host
++ * controller, UniPro, M-PHY and the sysreg IO-coherency (shareability)
++ * bits behind the driver's back. ufshcd then tries a hibern8 exit on a
++ * host that is not enabled (UIC timeout) and falls back to a host reset,
++ * which re-runs link startup and the PHY calibration but not drv_init():
++ * with the shareability bits cleared the host's descriptor writes bypass
++ * the CPU caches and every command reads back OCS 0xf.
++ *
++ * Detect the loss on resume and redo what probe did: drv_init() (vendor
++ * HCI setup + shareability), then report the link as off so that ufshcd
++ * does a full device reset, link startup and device init instead of a
++ * hibern8 exit. Downstream (ufs-exynos.c __exynos_ufs_resume) rewrites the
++ * shareability bits on every resume for the same reason.
++ */
++static u32 exynos_ufs_state_lost(struct ufs_hba *hba, enum ufs_pm_op pm_op,
++				 u32 *iocc, u32 *hce)
++{
++	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
++	u32 lost = 0;
++
++	*iocc = 0;
++	*hce = ufshcd_readl(hba, REG_CONTROLLER_ENABLE);
++
++	if (ufs->sysreg && ufs->iocc_val &&
++	    !regmap_read(ufs->sysreg, ufs->iocc_offset, iocc) &&
++	    (*iocc & ufs->iocc_mask) != ufs->iocc_val)
++		lost |= EXYNOS_UFS_LOST_IOCC;
++	if (ufshcd_is_link_hibern8(hba) && !(*hce & CONTROLLER_ENABLE))
++		lost |= EXYNOS_UFS_LOST_HCE;
++	if (READ_ONCE(exynos_ufs_soc_power_lost)) {
++		WRITE_ONCE(exynos_ufs_soc_power_lost, false);
++		lost |= EXYNOS_UFS_LOST_SOC;
++	}
++
++	return lost;
++}
++
+ static int exynos_ufs_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
+ {
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
++	u32 lost = 0, iocc = 0, hce = 0;
++	int ret;
+ 
+-	if (!ufshcd_is_link_active(hba))
++	ufs->reinit_trace = false;
++	if (!ufshcd_is_link_active(hba)) {
++		lost = exynos_ufs_state_lost(hba, pm_op, &iocc, &hce);
++		if (pm_op == UFS_SYSTEM_PM)
++			exynos_ufs_resume_step(0, lost, hba->uic_link_state);
+ 		phy_power_on(ufs->phy);
++	}
++
++	if (lost) {
++		dev_info(hba->dev,
++			 "resume: host state lost (%#x: iocc %#x, HCE %#x, link %d, dev %d): full re-init\n",
++			 lost, iocc, hce, hba->uic_link_state,
++			 hba->curr_dev_pwr_mode);
++		if (ufs->drv_data->drv_init) {
++			ret = ufs->drv_data->drv_init(ufs);
++			if (ret)
++				dev_err(hba->dev, "resume: drv_init failed: %d\n",
++					ret);
++		}
++		if (ufs->sysreg && ufs->iocc_val &&
++		    !regmap_read(ufs->sysreg, ufs->iocc_offset, &iocc))
++			dev_info(hba->dev, "resume: iocc now %#x\n", iocc);
++		/*
++		 * The link (and the device, if its power went too) is gone:
++		 * make __ufshcd_wl_resume() take the link-off path, i.e.
++		 * ufshcd_reset_and_restore(): HCE with device reset, link
++		 * startup with PHY calibration, NOP OUT, device init.
++		 */
++		ufshcd_set_link_off(hba);
++		ufs->reinit_trace = true;
++		exynos_ufs_resume_step(1, lost,
++				       (iocc & ufs->iocc_mask) == ufs->iocc_val);
++	}
+ 
+ 	exynos_ufs_config_smu(ufs);
+ 	exynos_ufs_fmp_resume(hba);
+diff --git a/drivers/ufs/host/ufs-exynos.h b/drivers/ufs/host/ufs-exynos.h
+index a7d262d46a..6f8d41b335 100644
+--- a/drivers/ufs/host/ufs-exynos.h
++++ b/drivers/ufs/host/ufs-exynos.h
+@@ -235,6 +235,7 @@ struct exynos_ufs {
+ 	u32 iocc_offset;
+ 	u32 iocc_mask;
+ 	u32 iocc_val;
++	bool reinit_trace;	/* resume re-init in progress: report steps */
+ 
+ 	u32 opts;
+ #define EXYNOS_UFS_OPT_HAS_APB_CLK_CTRL		BIT(0)

@@ -1,0 +1,68 @@
+From dee3966b7e9d64ae07cb03363a06bd4fb55b33b9 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] soc: samsung: exynos-usi: allow I2C-only blocks without
+ SW_CONF
+
+The I2C_CAM blocks of the Exynos 9820 have the USI wrapper registers
+(USI_CON, USI_OPTION) and come out of reset with USI_RESET set, but
+they have no protocol switch and so no SW_CONF register in the system
+controller. Make samsung,sysreg optional for I2C mode, so that a USI
+node can release the reset; without it the controller never starts a
+transfer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/soc/samsung/exynos-usi.c | 31 ++++++++++++++++++++++---------
+ 1 file changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/soc/samsung/exynos-usi.c b/drivers/soc/samsung/exynos-usi.c
+index dd05c80762..bf89cd351b 100644
+--- a/drivers/soc/samsung/exynos-usi.c
++++ b/drivers/soc/samsung/exynos-usi.c
+@@ -146,11 +146,14 @@ static int exynos_usi_set_sw_conf(struct exynos_usi *usi, size_t mode)
+ 	if (mode < usi->data->min_mode || mode > usi->data->max_mode)
+ 		return -EINVAL;
+ 
+-	val = exynos_usi_modes[usi->data->ver][mode].val;
+-	ret = regmap_update_bits(usi->sysreg, usi->sw_conf,
+-				 usi->data->sw_conf_mask, val);
+-	if (ret)
+-		return ret;
++	/* Single-protocol blocks have no SW_CONF register (no samsung,sysreg) */
++	if (usi->sysreg) {
++		val = exynos_usi_modes[usi->data->ver][mode].val;
++		ret = regmap_update_bits(usi->sysreg, usi->sw_conf,
++					 usi->data->sw_conf_mask, val);
++		if (ret)
++			return ret;
++	}
+ 
+ 	usi->mode = mode;
+ 	dev_dbg(usi->dev, "protocol: %s\n",
+@@ -256,10 +259,20 @@ static int exynos_usi_parse_dt(struct device_node *np, struct exynos_usi *usi)
+ 		return -EINVAL;
+ 	usi->mode = mode;
+ 
+-	usi->sysreg = syscon_regmap_lookup_by_phandle_args(np, "samsung,sysreg",
+-							   1, &usi->sw_conf);
+-	if (IS_ERR(usi->sysreg))
+-		return PTR_ERR(usi->sysreg);
++	/*
++	 * I2C-only blocks without a protocol switch (e.g. I2C_CAM0..3 of the
++	 * Exynos 9820) still have USI_CON and come up in reset, but there is
++	 * no SW_CONF register in the system controller for them.
++	 */
++	if (of_property_present(np, "samsung,sysreg")) {
++		usi->sysreg = syscon_regmap_lookup_by_phandle_args(np,
++							"samsung,sysreg", 1,
++							&usi->sw_conf);
++		if (IS_ERR(usi->sysreg))
++			return PTR_ERR(usi->sysreg);
++	} else if (mode != USI_MODE_I2C) {
++		return -EINVAL;
++	}
+ 
+ 	usi->clkreq_on = of_property_read_bool(np, "samsung,clkreq-on");
+ 

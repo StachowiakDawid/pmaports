@@ -1,0 +1,146 @@
+From 25f3d772e4cc698630c2bd6696e4ec5105d4cbfe Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] Bluetooth: hci_bcm: BCM4375 support, bdaddr parameter,
+ address in auto-off
+
+Bluetooth part of the BCM4375 Wi-Fi/BT combo of the Galaxy S10 family
+(4-wire UART with BT_REG_ON, BT_WAKE and BT_HOST_WAKE):
+
+ - hci_bcm: "brcm,bcm4375-bt" compatible, with its binding entry.
+ - hci_bcm: hci_uart.bdaddr=XX:XX:XX:XX:XX:XX. The controller has no
+   address of its own (it reports the firmware default) and the
+   bootloader cannot fill local-bd-address; the address lives in a
+   vendor partition only userspace can read. When the parameter is
+   set, bcm_setup() programs it with the vendor Write_BD_ADDR command
+   right after the firmware patch was loaded. Invalid, group and
+   all-zero addresses are ignored with a warning.
+ - hci_core: MGMT_OP_SET_PUBLIC_ADDRESS is accepted while the
+   controller is still up in the HCI_AUTO_OFF window after setup, but
+   hci_power_on() then took the "already up" shortcut: set_bdaddr()
+   never ran and HCI_CONFIG was never cleared, so the index
+   disappeared from mgmt. Close the controller first when HCI_CONFIG
+   is set and it is still up, and keep HCI_AUTO_OFF.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ .../net/bluetooth/brcm,bluetooth.yaml         |  1 +
+ drivers/bluetooth/hci_bcm.c                   | 44 +++++++++++++++++++
+ net/bluetooth/hci_core.c                      | 21 +++++++++
+ 3 files changed, 66 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/net/bluetooth/brcm,bluetooth.yaml b/Documentation/devicetree/bindings/net/bluetooth/brcm,bluetooth.yaml
+index 612d21123a..095aabc7b9 100644
+--- a/Documentation/devicetree/bindings/net/bluetooth/brcm,bluetooth.yaml
++++ b/Documentation/devicetree/bindings/net/bluetooth/brcm,bluetooth.yaml
+@@ -32,6 +32,7 @@ properties:
+           - brcm,bcm4335a0
+           - brcm,bcm4349-bt
+           - brcm,bcm4384-bt
++          - brcm,bcm4375-bt
+           - cypress,cyw4373a0-bt
+           - infineon,cyw55572-bt
+ 
+diff --git a/drivers/bluetooth/hci_bcm.c b/drivers/bluetooth/hci_bcm.c
+index 83091e5c57..491a9e4503 100644
+--- a/drivers/bluetooth/hci_bcm.c
++++ b/drivers/bluetooth/hci_bcm.c
+@@ -167,6 +167,37 @@ static int irq_polarity = -1;
+ module_param(irq_polarity, int, 0444);
+ MODULE_PARM_DESC(irq_polarity, "IRQ polarity 0: active-high 1: active-low");
+ 
++/* Boards whose controller has no address of its own (it reports the
++ * firmware default) but whose address can't be put into the device tree by
++ * the bootloader: userspace passes it in, e.g. "options hci_uart
++ * bdaddr=XX:XX:XX:XX:XX:XX" in modprobe.d. It is programmed with the vendor
++ * Write_BD_ADDR command once the firmware patch is loaded, before the core
++ * reads the address back.
++ */
++static char *bdaddr;
++module_param(bdaddr, charp, 0444);
++MODULE_PARM_DESC(bdaddr, "Public address XX:XX:XX:XX:XX:XX to program after the firmware download (default: keep the controller's)");
++
++static int bcm_parse_bdaddr(const char *str, bdaddr_t *ba)
++{
++	u8 b[6];
++	int i;
++
++	if (!str || strlen(str) != 17 ||
++	    sscanf(str, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx",
++		   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
++		return -EINVAL;
++
++	/* group (multicast) bit set, or all zeroes */
++	if ((b[0] & 0x01) || !memchr_inv(b, 0, sizeof(b)))
++		return -EINVAL;
++
++	for (i = 0; i < 6; i++)
++		ba->b[i] = b[5 - i];
++
++	return 0;
++}
++
+ static inline void host_set_baudrate(struct hci_uart *hu, unsigned int speed)
+ {
+ 	if (hu->serdev)
+@@ -639,6 +670,18 @@ static int bcm_setup(struct hci_uart *hu)
+ 	if (err)
+ 		return err;
+ 
++	if (bdaddr && *bdaddr) {
++		bdaddr_t ba;
++
++		if (bcm_parse_bdaddr(bdaddr, &ba)) {
++			bt_dev_warn(hu->hdev, "BCM: ignoring invalid bdaddr=%s", bdaddr);
++		} else if (!btbcm_set_bdaddr(hu->hdev, &ba)) {
++			bt_dev_info(hu->hdev, "BCM: using address %pMR (bdaddr parameter)", &ba);
++			/* the address is valid now, don't start unconfigured */
++			hci_clear_quirk(hu->hdev, HCI_QUIRK_INVALID_BDADDR);
++		}
++	}
++
+ 	/* Some devices ship with the controller default address.
+ 	 * Allow the bootloader to set a valid address through the
+ 	 * device tree.
+@@ -1591,6 +1634,7 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
+ 	{ .compatible = "brcm,bcm43430a1-bt" },
+ 	{ .compatible = "brcm,bcm43438-bt", .data = &bcm43438_device_data },
+ 	{ .compatible = "brcm,bcm4349-bt", .data = &bcm43438_device_data },
++	{ .compatible = "brcm,bcm4375-bt" },
+ 	{ .compatible = "brcm,bcm43540-bt", .data = &bcm4354_device_data },
+ 	{ .compatible = "brcm,bcm4335a0" },
+ 	{ .compatible = "brcm,bcm4384-bt" },
+diff --git a/net/bluetooth/hci_core.c b/net/bluetooth/hci_core.c
+index c97aec3cab..99c769f5e4 100644
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -911,6 +911,27 @@ static void hci_power_on(struct work_struct *work)
+ 
+ 	BT_DBG("%s", hdev->name);
+ 
++	/* MGMT_OP_SET_PUBLIC_ADDRESS sets HCI_CONFIG and queues this work.
++	 * The new address is only programmed by hci_dev_init_sync(), i.e. on
++	 * a real open. If the command arrived while the controller was still
++	 * up in the HCI_AUTO_OFF grace period after setup (hdev_is_powered()
++	 * is false then, so the command is accepted), the shortcut below
++	 * would just power it "on" again: set_bdaddr is never called and
++	 * HCI_CONFIG is never cleared, which hides the index from mgmt for
++	 * good. Close the controller first so the open path runs (closing
++	 * clears HCI_AUTO_OFF; restore it so the controller is switched off
++	 * again after the configuration like on the normal path).
++	 */
++	if (test_bit(HCI_UP, &hdev->flags) &&
++	    hci_dev_test_flag(hdev, HCI_CONFIG)) {
++		bool auto_off = hci_dev_test_flag(hdev, HCI_AUTO_OFF);
++
++		cancel_delayed_work(&hdev->power_off);
++		hci_dev_do_close(hdev);
++		if (auto_off)
++			hci_dev_set_flag(hdev, HCI_AUTO_OFF);
++	}
++
+ 	if (test_bit(HCI_UP, &hdev->flags) &&
+ 	    hci_dev_test_flag(hdev, HCI_MGMT) &&
+ 	    hci_dev_test_and_clear_flag(hdev, HCI_AUTO_OFF)) {

@@ -1,0 +1,62 @@
+From c26a337385a5575c1e7ddbde8966dae82edd7bc5 Mon Sep 17 00:00:00 2001
+From: Alexey Klimov <alexey.klimov@linaro.org>
+Date: Fri, 5 Jun 2026 21:18:50 +0100
+Subject: [PATCH 13/46] soc: samsung: exynos-pmu: use target cpu ID in hotplug
+ callbacks
+
+The CPU hotplug state callbacks __gs101_cpu_pmu_online() and
+__gs101_cpu_pmu_offline() currently partially use smp_processor_id() to
+determine the target register offset for the CPU inform hints. This may
+be fine for cpuidle flow but broken for cpu hotplug where the target
+cpu is passed as an argument and could be different from cpu where
+that is executing (e.g. CPU 0 offlining CPU 1), meaning that
+smp_processor_id() returns the id of local CPU but hotplug flow
+deals with another CPU core undergoing the transition.
+
+This causes the pmu driver to write power down and power on configuration
+hints to the wrong hardware registers, messing up the power state of active
+cores and failing to configure the target core. Fix this by removing the
+cpuhint variable entirely and utilizing the target 'cpu' argument passed
+to the callbacks by the hotplug core infrastructure.
+
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://sashiko.dev/#/patchset/20260513-exynos850-cpuhotplug-v4-0-54fec5f65362@linaro.org?part=3
+Fixes: 598995027b91 ("soc: samsung: exynos-pmu: enable CPU hotplug support for gs101")
+Cc: stable@vger.kernel.org
+Signed-off-by: Alexey Klimov <alexey.klimov@linaro.org>
+(cherry picked from commit bfab8153f87c2b3837c313674d973ae5c8259999)
+---
+ drivers/soc/samsung/exynos-pmu.c | 7 ++-----
+ 1 file changed, 2 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/soc/samsung/exynos-pmu.c b/drivers/soc/samsung/exynos-pmu.c
+index b4324c4685..cd5112b63d 100644
+--- a/drivers/soc/samsung/exynos-pmu.c
++++ b/drivers/soc/samsung/exynos-pmu.c
+@@ -240,11 +240,10 @@ EXPORT_SYMBOL_GPL(exynos_get_pmu_regmap_by_phandle);
+ static int __gs101_cpu_pmu_online(unsigned int cpu)
+ 	__must_hold(&pmu_context->cpupm_lock)
+ {
+-	unsigned int cpuhint = smp_processor_id();
+ 	u32 reg, mask;
+ 
+ 	/* clear cpu inform hint */
+-	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(cpuhint),
++	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(cpu),
+ 		     CPU_INFORM_CLEAR);
+ 
+ 	mask = BIT(cpu);
+@@ -301,12 +300,10 @@ static int gs101_cpuhp_pmu_online(unsigned int cpu)
+ static int __gs101_cpu_pmu_offline(unsigned int cpu)
+ 	__must_hold(&pmu_context->cpupm_lock)
+ {
+-	unsigned int cpuhint = smp_processor_id();
+ 	u32 reg, mask;
+ 
+ 	/* set cpu inform hint */
+-	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(cpuhint),
+-		     CPU_INFORM_C2);
++	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(cpu), CPU_INFORM_C2);
+ 
+ 	mask = BIT(cpu);
+ 	regmap_update_bits(pmu_context->pmuintrgen, GS101_GRP2_INTR_BID_ENABLE,

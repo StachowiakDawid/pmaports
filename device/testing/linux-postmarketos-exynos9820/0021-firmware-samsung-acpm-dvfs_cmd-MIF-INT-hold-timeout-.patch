@@ -1,0 +1,1198 @@
+From b38308b9deed8ecc0623d03471ec10d720f2acec Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] firmware: samsung: acpm: dvfs_cmd, MIF/INT hold, timeout
+ dump, atomic xfer
+
+Exynos 9820 additions to the ACPM protocol driver:
+
+ - dvfs_cmd (/sys/module/acpm_protocol/parameters/dvfs_cmd,
+   write-only): "<domain> <kHz>" sets the level of a DVFS domain,
+   "<domain> get" queries it and "<domain> raw <cmd2> <cmd1> <cmd3>"
+   sends any DVFS-type message. Nothing in the kernel scales the
+   memory (MIF), internal bus (INT) and display domains on this SoC;
+   userspace lowers them through this interface while the screen is
+   off. Domains: 0 MIF, 1 INT, 2 CPUCL0, 3 CPUCL1, 4 CPUCL2, 10 G3D.
+ - exynos_acpm_dvfs_hold(): an in-kernel user (the camera interface)
+   holds MIF and INT at their boot levels while it runs. Lower
+   dvfs_cmd requests are remembered and sent when the last hold is
+   released; the held levels are always sent, as the firmware changes
+   the levels on its own over system sleep and for the CP.
+ - Every channel descriptor is validated at probe (non-zero offsets
+   inside the SRAM mapping, sane qlen/mlen); channels without a usable
+   queue are refused with -ENODEV. On the first transfer timeouts every
+   channel's queue pointers, the init data words and the newest
+   entries of the APM firmware's log ring are printed.
+ - mbox_fixup (default off): mask the APM->AP mailbox interrupts of
+   the polled channels and clear their pending bits after the RX queue
+   was drained, as the vendor kernel does.
+ - Atomic transfers: an "atomic" flag in struct acpm_xfer for use with
+   IRQs off (try-locks instead of mutex waits, udelay-counted bounded
+   waits), and exynos_acpm_pmic_dbg_bulk_read()/_write() on top of it.
+   The suspend code uses them to leave progress codes in the PMIC,
+   the only place that survives a forced reset.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/firmware/samsung/exynos-acpm-dvfs.c   | 230 ++++++++-
+ drivers/firmware/samsung/exynos-acpm-pmic.c   |  76 ++-
+ drivers/firmware/samsung/exynos-acpm.c        | 455 +++++++++++++++---
+ drivers/firmware/samsung/exynos-acpm.h        |   2 +
+ .../firmware/samsung/exynos-acpm-protocol.h   |  38 ++
+ 5 files changed, 727 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/firmware/samsung/exynos-acpm-dvfs.c b/drivers/firmware/samsung/exynos-acpm-dvfs.c
+index 7266312ef5..e5bf614b3a 100644
+--- a/drivers/firmware/samsung/exynos-acpm-dvfs.c
++++ b/drivers/firmware/samsung/exynos-acpm-dvfs.c
+@@ -8,7 +8,14 @@
+ #include <linux/array_size.h>
+ #include <linux/bitfield.h>
+ #include <linux/firmware/samsung/exynos-acpm-protocol.h>
++#include <linux/kernel.h>
+ #include <linux/ktime.h>
++#include <linux/export.h>
++#include <linux/moduleparam.h>
++#include <linux/mutex.h>
++#include <linux/printk.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
+ #include <linux/types.h>
+ #include <linux/units.h>
+ 
+@@ -21,48 +28,251 @@
+ #define ACPM_DVFS_FREQ_REQ		0
+ #define ACPM_DVFS_FREQ_GET		1
+ 
++/*
++ * Request interface (Exynos 9820). It lives in the acpm_protocol module, so
++ * with the driver built in it is /sys/module/acpm_protocol/parameters/dvfs_cmd.
++ *
++ * dvfs_cmd (write-only): send a request by hand, bypassing the clk
++ *	framework's rate cache: "<domain> <kHz>" sets a rate, "<domain> get"
++ *	queries it, "<domain> raw <cmd2> <cmd1> <cmd3>" sends any DVFS-type
++ *	message on the last used channel. Exynos 9820 domains: 0 MIF, 1 INT,
++ *	2 CPUCL0, 3 CPUCL1, 4 CPUCL2, 10 G3D.
++ */
++/* Last handle/channel used, for dvfs_cmd. */
++static struct acpm_handle *acpm_dvfs_handle;
++static unsigned int acpm_dvfs_chan;
++
++static u32 acpm_dvfs_cmd3(void)
++{
++	return ktime_to_ms(ktime_get());
++}
++
++static int acpm_dvfs_xfer(struct acpm_handle *handle, unsigned int acpm_chan_id,
++			  u32 cmd[4], bool response, const char *what)
++{
++	struct acpm_xfer xfer = {0};
++
++	acpm_set_xfer(&xfer, cmd, 4, acpm_chan_id, response);
++	return acpm_do_xfer(handle, &xfer);
++}
++
+ static void acpm_dvfs_init_set_rate_cmd(u32 cmd[4], unsigned int clk_id,
+ 					unsigned long rate)
+ {
+ 	cmd[0] = FIELD_PREP(ACPM_DVFS_ID, clk_id);
+ 	cmd[1] = rate / HZ_PER_KHZ;
+ 	cmd[2] = FIELD_PREP(ACPM_DVFS_REQ_TYPE, ACPM_DVFS_FREQ_REQ);
+-	cmd[3] = ktime_to_ms(ktime_get());
++	cmd[3] = acpm_dvfs_cmd3();
+ }
+ 
+ int acpm_dvfs_set_rate(struct acpm_handle *handle,
+ 		       unsigned int acpm_chan_id, unsigned int clk_id,
+ 		       unsigned long rate)
+ {
+-	struct acpm_xfer xfer = {0};
+ 	u32 cmd[4];
+ 
++	acpm_dvfs_handle = handle;
++	acpm_dvfs_chan = acpm_chan_id;
++
+ 	acpm_dvfs_init_set_rate_cmd(cmd, clk_id, rate);
+-	acpm_set_xfer(&xfer, cmd, ARRAY_SIZE(cmd), acpm_chan_id, false);
+ 
+-	return acpm_do_xfer(handle, &xfer);
++	return acpm_dvfs_xfer(handle, acpm_chan_id, cmd, false, "set");
+ }
+ 
+ static void acpm_dvfs_init_get_rate_cmd(u32 cmd[4], unsigned int clk_id)
+ {
+ 	cmd[0] = FIELD_PREP(ACPM_DVFS_ID, clk_id);
+ 	cmd[2] = FIELD_PREP(ACPM_DVFS_REQ_TYPE, ACPM_DVFS_FREQ_GET);
+-	cmd[3] = ktime_to_ms(ktime_get());
++	cmd[3] = acpm_dvfs_cmd3();
+ }
+ 
+ unsigned long acpm_dvfs_get_rate(struct acpm_handle *handle,
+ 				 unsigned int acpm_chan_id, unsigned int clk_id)
+ {
+-	struct acpm_xfer xfer;
+ 	unsigned int cmd[4] = {0};
+ 	int ret;
+ 
+-	acpm_dvfs_init_get_rate_cmd(cmd, clk_id);
+-	acpm_set_xfer(&xfer, cmd, ARRAY_SIZE(cmd), acpm_chan_id, true);
++	acpm_dvfs_handle = handle;
++	acpm_dvfs_chan = acpm_chan_id;
+ 
+-	ret = acpm_do_xfer(handle, &xfer);
++	acpm_dvfs_init_get_rate_cmd(cmd, clk_id);
++	ret = acpm_dvfs_xfer(handle, acpm_chan_id, cmd, true, "get");
+ 	if (ret)
+ 		return 0;
+ 
+-	return xfer.rxd[1] * HZ_PER_KHZ;
++	return cmd[1] * HZ_PER_KHZ;
+ }
++
++/*
++ * Bus/memory level hold for in-kernel users (Exynos 9820).
++ *
++ * Nothing in the kernel scales MIF (memory) and INT (internal bus) on this
++ * SoC; user space lowers them through dvfs_cmd while the screen is off. A
++ * block that needs the full bus clock and voltage (the camera interface)
++ * holds both domains at the acpm_dvfs_hold_khz[] levels while it runs:
++ * requests from dvfs_cmd below the hold are remembered, answered with
++ * success and sent when the last hold is dropped. 0 = do not hold that
++ * domain.
++ */
++#define ACPM_DVFS_MIF		0
++#define ACPM_DVFS_INT		1
++
++/* MIF and INT level in kHz while an in-kernel user holds the bus levels */
++static const unsigned int acpm_dvfs_hold_khz[2] = { 2093000, 534000 };
++
++static DEFINE_MUTEX(acpm_dvfs_hold_lock);
++static unsigned int acpm_dvfs_holders;
++static unsigned int acpm_dvfs_held_khz[2];	/* sent for the current hold */
++static unsigned int acpm_dvfs_user_khz[2];	/* last dvfs_cmd request */
++
++/* Call with acpm_dvfs_hold_lock held. */
++static int acpm_dvfs_send_khz(unsigned int id, unsigned int khz,
++			      const char *what)
++{
++	u32 cmd[4];
++	int ret;
++
++	cmd[0] = FIELD_PREP(ACPM_DVFS_ID, id);
++	cmd[1] = khz;
++	cmd[2] = FIELD_PREP(ACPM_DVFS_REQ_TYPE, ACPM_DVFS_FREQ_REQ);
++	cmd[3] = acpm_dvfs_cmd3();
++	ret = acpm_dvfs_xfer(acpm_dvfs_handle, acpm_dvfs_chan, cmd, true, what);
++	/* same line as the other dvfs_cmd requests */
++	pr_info("acpm-dvfs: %s \"%u %u\" ret %d rx %08x %08x %08x %08x\n",
++		what, id, khz, ret, cmd[0], cmd[1], cmd[2], cmd[3]);
++	return ret;
++}
++
++/**
++ * exynos_acpm_dvfs_hold() - hold or release the MIF/INT levels
++ * @on: true to hold (counted), false to release
++ *
++ * Returns 0 or a negative error if the levels could not be raised; a failed
++ * hold is not counted.
++ */
++int exynos_acpm_dvfs_hold(bool on)
++{
++	/* up: bus first, then memory; down: the other way round */
++	static const u8 up[] = { ACPM_DVFS_INT, ACPM_DVFS_MIF };
++	static const u8 down[] = { ACPM_DVFS_MIF, ACPM_DVFS_INT };
++	unsigned int i, id;
++	int ret = 0;
++
++	mutex_lock(&acpm_dvfs_hold_lock);
++	if (!acpm_dvfs_handle) {
++		/* no DVFS client yet: nothing can have lowered the levels */
++		pr_info_once("acpm-dvfs: hold without a DVFS channel, levels left alone\n");
++		goto out;
++	}
++
++	if (on) {
++		if (acpm_dvfs_holders++)
++			goto out;
++		for (i = 0; i < ARRAY_SIZE(up); i++) {
++			id = up[i];
++			acpm_dvfs_held_khz[id] = acpm_dvfs_hold_khz[id];
++			if (!acpm_dvfs_held_khz[id])
++				continue;
++			/*
++			 * Always send, even when the last user request was as
++			 * high: that cache does not follow what the firmware
++			 * does on its own (system sleep and resume, CP DVFS);
++			 * a camera stream at its 400 MHz bus clock on a lower
++			 * INT level is the suspected cause of a stalled camera
++			 * DMA after many suspend cycles.
++			 */
++			ret = acpm_dvfs_send_khz(id, acpm_dvfs_held_khz[id],
++						 "hold");
++			if (ret)
++				break;
++		}
++		if (!ret) {
++			pr_info("acpm-dvfs: hold MIF %u INT %u kHz (user MIF %u INT %u)\n",
++				acpm_dvfs_held_khz[ACPM_DVFS_MIF],
++				acpm_dvfs_held_khz[ACPM_DVFS_INT],
++				acpm_dvfs_user_khz[ACPM_DVFS_MIF],
++				acpm_dvfs_user_khz[ACPM_DVFS_INT]);
++			goto out;
++		}
++		/* failed: undo below */
++	} else if (!acpm_dvfs_holders || --acpm_dvfs_holders) {
++		goto out;
++	}
++
++	if (on)
++		acpm_dvfs_holders--;
++	for (i = 0; i < ARRAY_SIZE(down); i++) {
++		id = down[i];
++		if (acpm_dvfs_held_khz[id] && acpm_dvfs_user_khz[id] &&
++		    acpm_dvfs_user_khz[id] < acpm_dvfs_held_khz[id])
++			acpm_dvfs_send_khz(id, acpm_dvfs_user_khz[id],
++					   "release");
++		acpm_dvfs_held_khz[id] = 0;
++	}
++	if (!on)
++		pr_info("acpm-dvfs: hold released (user MIF %u INT %u kHz)\n",
++			acpm_dvfs_user_khz[ACPM_DVFS_MIF],
++			acpm_dvfs_user_khz[ACPM_DVFS_INT]);
++out:
++	mutex_unlock(&acpm_dvfs_hold_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(exynos_acpm_dvfs_hold);
++
++static int acpm_dvfs_cmd_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int id, a = 0, b = 0, c = 0;
++	char word[8] = "";
++	u32 cmd[4] = {0};
++	int n, ret;
++
++	if (!acpm_dvfs_handle)
++		return -ENODEV;
++
++	n = sscanf(val, "%u %7s %u %u %u", &id, word, &a, &b, &c);
++	if (n < 2)
++		return -EINVAL;
++
++	cmd[0] = FIELD_PREP(ACPM_DVFS_ID, id);
++	if (!strcmp(word, "get")) {
++		cmd[2] = FIELD_PREP(ACPM_DVFS_REQ_TYPE, ACPM_DVFS_FREQ_GET);
++		cmd[3] = acpm_dvfs_cmd3();
++	} else if (!strcmp(word, "raw")) {
++		if (n < 3)
++			return -EINVAL;
++		cmd[2] = a;
++		cmd[1] = b;
++		cmd[3] = c;
++	} else {
++		if (kstrtouint(word, 0, &a))
++			return -EINVAL;
++		if (id <= ACPM_DVFS_INT) {
++			/* MIF/INT: remember, and keep a hold in force */
++			mutex_lock(&acpm_dvfs_hold_lock);
++			acpm_dvfs_user_khz[id] = a;
++			if (a < acpm_dvfs_held_khz[id]) {
++				mutex_unlock(&acpm_dvfs_hold_lock);
++				return 0;
++			}
++			ret = acpm_dvfs_send_khz(id, a, "cmd");
++			mutex_unlock(&acpm_dvfs_hold_lock);
++			return ret;
++		}
++		cmd[1] = a;
++		cmd[2] = FIELD_PREP(ACPM_DVFS_REQ_TYPE, ACPM_DVFS_FREQ_REQ);
++		cmd[3] = acpm_dvfs_cmd3();
++	}
++
++	ret = acpm_dvfs_xfer(acpm_dvfs_handle, acpm_dvfs_chan, cmd, true, "cmd");
++	pr_info("acpm-dvfs: cmd \"%s\" ret %d rx %08x %08x %08x %08x\n",
++		word, ret, cmd[0], cmd[1], cmd[2], cmd[3]);
++
++	return ret;
++}
++
++static const struct kernel_param_ops acpm_dvfs_cmd_ops = {
++	.set = acpm_dvfs_cmd_set,
++};
++module_param_cb(dvfs_cmd, &acpm_dvfs_cmd_ops, NULL, 0200);
++MODULE_PARM_DESC(dvfs_cmd,
++		 "\"<domain> <kHz>\", \"<domain> get\" or \"<domain> raw <type> <arg> <cmd3>\"");
+diff --git a/drivers/firmware/samsung/exynos-acpm-pmic.c b/drivers/firmware/samsung/exynos-acpm-pmic.c
+index f032f2c696..650dcf241f 100644
+--- a/drivers/firmware/samsung/exynos-acpm-pmic.c
++++ b/drivers/firmware/samsung/exynos-acpm-pmic.c
+@@ -7,6 +7,9 @@
+ #include <linux/array_size.h>
+ #include <linux/bitfield.h>
+ #include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/irqflags.h>
++#include <linux/bug.h>
+ #include <linux/firmware/samsung/exynos-acpm-protocol.h>
+ #include <linux/ktime.h>
+ #include <linux/types.h>
+@@ -97,9 +100,9 @@ static void acpm_pmic_init_bulk_read_cmd(u32 cmd[4], u8 type, u8 reg, u8 chan,
+ 		 FIELD_PREP(ACPM_PMIC_VALUE, count);
+ }
+ 
+-int acpm_pmic_bulk_read(struct acpm_handle *handle,
+-			unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
+-			u8 count, u8 *buf)
++static int __acpm_pmic_bulk_read(struct acpm_handle *handle,
++				 unsigned int acpm_chan_id, u8 type, u8 reg,
++				 u8 chan, u8 count, u8 *buf, bool atomic)
+ {
+ 	struct acpm_xfer xfer;
+ 	u32 cmd[4] = {0};
+@@ -110,6 +113,7 @@ int acpm_pmic_bulk_read(struct acpm_handle *handle,
+ 
+ 	acpm_pmic_init_bulk_read_cmd(cmd, type, reg, chan, count);
+ 	acpm_set_xfer(&xfer, cmd, ARRAY_SIZE(cmd), acpm_chan_id, true);
++	xfer.atomic = atomic;
+ 
+ 	ret = acpm_do_xfer(handle, &xfer);
+ 	if (ret)
+@@ -129,6 +133,14 @@ int acpm_pmic_bulk_read(struct acpm_handle *handle,
+ 	return 0;
+ }
+ 
++int acpm_pmic_bulk_read(struct acpm_handle *handle,
++			unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			u8 count, u8 *buf)
++{
++	return __acpm_pmic_bulk_read(handle, acpm_chan_id, type, reg, chan,
++				     count, buf, false);
++}
++
+ static void acpm_pmic_init_write_cmd(u32 cmd[4], u8 type, u8 reg, u8 chan,
+ 				     u8 value)
+ {
+@@ -177,9 +189,9 @@ static void acpm_pmic_init_bulk_write_cmd(u32 cmd[4], u8 type, u8 reg, u8 chan,
+ 	}
+ }
+ 
+-int acpm_pmic_bulk_write(struct acpm_handle *handle,
+-			 unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
+-			 u8 count, const u8 *buf)
++static int __acpm_pmic_bulk_write(struct acpm_handle *handle,
++				  unsigned int acpm_chan_id, u8 type, u8 reg,
++				  u8 chan, u8 count, const u8 *buf, bool atomic)
+ {
+ 	struct acpm_xfer xfer;
+ 	u32 cmd[4] = {0};
+@@ -190,6 +202,7 @@ int acpm_pmic_bulk_write(struct acpm_handle *handle,
+ 
+ 	acpm_pmic_init_bulk_write_cmd(cmd, type, reg, chan, count, buf);
+ 	acpm_set_xfer(&xfer, cmd, ARRAY_SIZE(cmd), acpm_chan_id, true);
++	xfer.atomic = atomic;
+ 
+ 	ret = acpm_do_xfer(handle, &xfer);
+ 	if (ret)
+@@ -198,6 +211,14 @@ int acpm_pmic_bulk_write(struct acpm_handle *handle,
+ 	return acpm_pmic_to_linux_err(FIELD_GET(ACPM_PMIC_RETURN, xfer.rxd[1]));
+ }
+ 
++int acpm_pmic_bulk_write(struct acpm_handle *handle,
++			 unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			 u8 count, const u8 *buf)
++{
++	return __acpm_pmic_bulk_write(handle, acpm_chan_id, type, reg, chan,
++				      count, buf, false);
++}
++
+ static void acpm_pmic_init_update_cmd(u32 cmd[4], u8 type, u8 reg, u8 chan,
+ 				      u8 value, u8 mask)
+ {
+@@ -227,3 +248,46 @@ int acpm_pmic_update_reg(struct acpm_handle *handle,
+ 
+ 	return acpm_pmic_to_linux_err(FIELD_GET(ACPM_PMIC_RETURN, xfer.rxd[1]));
+ }
++
++/*
++ * Debug PMIC access for the system sleep breadcrumbs, with the
++ * ACPM instance the driver probed (one per SoC).
++ *
++ * atomic = false: an ordinary transfer (sleeping locks, ktime timeouts);
++ * use it from process context.
++ * atomic = true: only for the IRQs-off, single-CPU part of system suspend
++ * (syscore, suspend_ops->enter, possibly with timekeeping suspended). The
++ * channel locks are only try-locked, so if a normal transfer holds the
++ * channel the call fails at once with -EBUSY instead of waiting for a
++ * thread that cannot run; all waits are udelay()-counted and bounded
++ * (about 10 ms for the TX queue, 20 ms for the response). Only bulk
++ * commands are used: their request words carry no ktime stamp.
++ */
++int exynos_acpm_pmic_dbg_bulk_read(unsigned int acpm_chan_id, u8 type, u8 reg,
++				   u8 chan, u8 count, u8 *buf, bool atomic)
++{
++	struct acpm_handle *handle = acpm_dbg_get_handle();
++
++	if (!handle)
++		return -ENODEV;
++	if (atomic && WARN_ON_ONCE(!irqs_disabled()))
++		return -EINVAL;
++	return __acpm_pmic_bulk_read(handle, acpm_chan_id, type, reg, chan,
++				     count, buf, atomic);
++}
++EXPORT_SYMBOL_GPL(exynos_acpm_pmic_dbg_bulk_read);
++
++int exynos_acpm_pmic_dbg_bulk_write(unsigned int acpm_chan_id, u8 type, u8 reg,
++				    u8 chan, u8 count, const u8 *buf,
++				    bool atomic)
++{
++	struct acpm_handle *handle = acpm_dbg_get_handle();
++
++	if (!handle)
++		return -ENODEV;
++	if (atomic && WARN_ON_ONCE(!irqs_disabled()))
++		return -EINVAL;
++	return __acpm_pmic_bulk_write(handle, acpm_chan_id, type, reg, chan,
++				      count, buf, atomic);
++}
++EXPORT_SYMBOL_GPL(exynos_acpm_pmic_dbg_bulk_write);
+diff --git a/drivers/firmware/samsung/exynos-acpm.c b/drivers/firmware/samsung/exynos-acpm.c
+index 09012b9946..321fc7d0c8 100644
+--- a/drivers/firmware/samsung/exynos-acpm.c
++++ b/drivers/firmware/samsung/exynos-acpm.c
+@@ -26,8 +26,10 @@
+ #include <linux/of_address.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
++#include <linux/sizes.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
++#include <linux/workqueue.h>
+ 
+ #include "exynos-acpm.h"
+ #include "exynos-acpm-dvfs.h"
+@@ -38,6 +40,9 @@
+ 
+ #define ACPM_POLL_TIMEOUT_US		(100 * USEC_PER_MSEC)
+ #define ACPM_TX_TIMEOUT_US		500000
++/* IRQs-off transfers (suspend breadcrumbs): keep the worst case short */
++#define ACPM_ATOMIC_TX_TIMEOUT_US	10000
++#define ACPM_ATOMIC_POLL_LOOPS		(20 * USEC_PER_MSEC / 20)
+ 
+ #define ACPM_GS101_INITDATA_BASE	0xa000
+ #define ACPM_EXYNOS9820_INITDATA_BASE	0x7000
+@@ -140,6 +145,10 @@ struct acpm_rx_data {
+  * @id:		channel ID.
+  * @poll_completion:	indicates if the transfer needs to be polled for
+  *			completion or interrupt mode is used.
++ * @shmem_ok:	the SRAM descriptor points at a usable queue pair (non-zero
++ *		offsets inside the SRAM, non-zero qlen/mlen). Unused channel
++ *		descriptors are zero-filled, and SRAM offset 0 is not readable
++ *		by the AP (synchronous external abort on Exynos 9820).
+  * @bitmap_seqnum: bitmap that tracks the messages on the TX/RX queues.
+  * @rx_data:	internal buffer used to drain the RX queue.
+  */
+@@ -157,6 +166,7 @@ struct acpm_chan {
+ 	u8 seqnum;
+ 	u8 id;
+ 	bool poll_completion;
++	bool shmem_ok;
+ 
+ 	DECLARE_BITMAP(bitmap_seqnum, ACPM_SEQNUM_MAX - 1);
+ 	struct acpm_rx_data rx_data[ACPM_SEQNUM_MAX];
+@@ -170,6 +180,8 @@ struct acpm_chan {
+  * @dev:	pointer to the exynos-acpm device.
+  * @handle:	instance of acpm_handle to send to clients.
+  * @num_chans:	number of channels available for this controller.
++ * @sram_size:	size of the SRAM mapping.
++ * @mbox:	second mapping of the AP2APM mailbox (debug knobs), or NULL.
+  */
+ struct acpm_info {
+ 	struct acpm_shmem __iomem *shmem;
+@@ -178,21 +190,205 @@ struct acpm_info {
+ 	struct device *dev;
+ 	struct acpm_handle handle;
+ 	u32 num_chans;
++	resource_size_t sram_size;
++	void __iomem *mbox;
+ };
+ 
+ /**
+  * struct acpm_match_data - of_device_id data.
+  * @initdata_base:	offset in SRAM where the channels configuration resides.
+  * @acpm_clk_dev_name:	base name for the ACPM clocks device that we're registering.
++ * @mbox:	physical address of the AP2APM mailbox (0: none), for the debug knobs.
+  */
+ struct acpm_match_data {
+ 	loff_t initdata_base;
+ 	const char *acpm_clk_dev_name;
++	phys_addr_t mbox;
+ };
+ 
+ #define client_to_acpm_chan(c) container_of(c, struct acpm_chan, cl)
+ #define handle_to_acpm_info(h) container_of(h, struct acpm_info, handle)
+ 
++/*
++ * Exynos 9820 "downstream parity" knob, default off:
++ * /sys/module/acpm_protocol/parameters/mbox_fixup (the driver is built in).
++ *
++ * mbox_fixup:	mask the APM->AP mailbox interrupts of the polled channels
++ *		(INTMR1) and clear their pending bits (INTCR1) after the RX queue
++ *		was drained, as the Samsung kernel does (acpm_ipc.c channel_init(),
++ *		check_response()). Mainline never touches INTMR1/INTCR1, so the
++ *		APM2AP interrupt (also a PMU wakeup source) stays asserted.
++ *
++ * On the first ACPM_DBG_MAX_DUMPS timeouts every channel's queue pointers,
++ * the init data words and the firmware log are printed.
++ */
++#define ACPM_INIT_LOG_REAR		0x34
++#define ACPM_INIT_LOG_FRONT		0x38
++#define ACPM_INIT_LOG_DATA		0x3c
++#define ACPM_INIT_LOG_ESIZE		0x40
++#define ACPM_INIT_LOG_ELEN		0x44
++#define ACPM_INIT_DUMP_WORDS		48
++
++#define ACPM_MBOX_INTMR0		0x10
++#define ACPM_MBOX_INTSR0		0x14
++#define ACPM_MBOX_INTGR1		0x1c
++#define ACPM_MBOX_INTCR1		0x20
++#define ACPM_MBOX_INTMR1		0x24
++#define ACPM_MBOX_INTSR1		0x28
++
++#define ACPM_DBG_MAX_DUMPS		3
++
++static struct acpm_info *acpm_dbg;
++static bool acpm_mbox_fixup;
++static atomic_t acpm_dumps = ATOMIC_INIT(0);
++
++/*
++ * Offset 0 is rejected as well: it is what an unused (zero-filled) descriptor
++ * holds, and reading the start of the APM SRAM takes a synchronous external
++ * abort on Exynos 9820.
++ */
++static bool acpm_sram_ok(struct acpm_info *acpm, u32 off, u32 len)
++{
++	return off && off < acpm->sram_size && len <= acpm->sram_size - off;
++}
++
++/* One firmware log entry (esize bytes: header, string, value). */
++static void acpm_fw_log_print(struct acpm_info *acpm, void __iomem *e,
++			      u32 esize, bool err, const char *tag, u32 slot)
++{
++	u32 hdr = readl(e), val = readl(e + esize - 4);
++	unsigned int i, slen = esize - 8;
++	char str[64 + 1];
++
++	__ioread32_copy(str, e + 4, slen / 4);
++	str[slen] = '\0';
++	for (i = 0; i < slen && str[i]; i++)
++		if (str[i] < 0x20 || str[i] > 0x7e)
++			str[i] = '.';
++
++	dev_printk(err ? KERN_ERR : KERN_INFO, acpm->dev,
++		   "%s [%u] id:%lu lvl:%lu ts:%lu cnt:%lu %s %#x\n", tag, slot,
++		   FIELD_GET(GENMASK(31, 28), hdr), FIELD_GET(BIT(19), hdr),
++		   FIELD_GET(GENMASK(24, 20), hdr),
++		   FIELD_GET(GENMASK(15, 0), hdr), str, val);
++}
++
++/*
++ * Print the @n newest entries of the firmware log ring (the ones right
++ * before the firmware's write pointer), without consuming anything. The
++ * firmware overwrites old entries when the AP does not drain the ring, so
++ * the oldest unread entries can be minutes old; the newest ones show what
++ * the APM did last.
++ */
++static void acpm_fw_log_tail(struct acpm_info *acpm, unsigned int n)
++{
++	void __iomem *init = (void __iomem *)acpm->shmem;
++	void __iomem *sram = acpm->sram_base;
++	u32 rear_off, front_off, data_off, esize, elen, rear, front, i, slot;
++
++	rear_off = readl(init + ACPM_INIT_LOG_REAR);
++	front_off = readl(init + ACPM_INIT_LOG_FRONT);
++	data_off = readl(init + ACPM_INIT_LOG_DATA);
++	esize = readl(init + ACPM_INIT_LOG_ESIZE);
++	elen = readl(init + ACPM_INIT_LOG_ELEN);
++
++	if (esize < 12 || esize > 64 + 8 || esize % 4 || !elen ||
++	    elen > 4096 || !acpm_sram_ok(acpm, rear_off, 4) ||
++	    !acpm_sram_ok(acpm, front_off, 4) ||
++	    !acpm_sram_ok(acpm, data_off, esize * elen))
++		return;
++
++	rear = readl(sram + rear_off);
++	front = readl(sram + front_off);
++	if (front >= elen)
++		return;
++	n = min(n, elen - 1);
++	dev_err(acpm->dev, "fw log tail: rear %u front %u, the %u newest entries:\n",
++		rear, front, n);
++	for (i = n; i; i--) {
++		slot = (front + elen - i) % elen;
++		acpm_fw_log_print(acpm, sram + data_off + esize * slot, esize,
++				  true, "[ACPM_FW tail]", slot);
++	}
++}
++
++static void acpm_mbox_fixup_apply(struct acpm_info *acpm)
++{
++	u32 mask = 0;
++	int i;
++
++	if (!acpm->mbox)
++		return;
++
++	for (i = 0; i < acpm->num_chans; i++)
++		if (acpm->chans[i].poll_completion && acpm->chans[i].id < 32)
++			mask |= BIT(acpm->chans[i].id);
++
++	dev_info(acpm->dev, "mbox_fixup: INTMR1 %#x -> %#x, INTSR1 %#x\n",
++		 readl(acpm->mbox + ACPM_MBOX_INTMR1), mask,
++		 readl(acpm->mbox + ACPM_MBOX_INTSR1));
++	writel(mask, acpm->mbox + ACPM_MBOX_INTMR1);
++	writel(mask, acpm->mbox + ACPM_MBOX_INTCR1);
++}
++
++static int acpm_mbox_fixup_set(const char *val, const struct kernel_param *kp)
++{
++	int ret = param_set_bool(val, kp);
++
++	if (!ret && acpm_dbg && acpm_mbox_fixup)
++		acpm_mbox_fixup_apply(acpm_dbg);
++
++	return ret;
++}
++
++static const struct kernel_param_ops acpm_mbox_fixup_ops = {
++	.set = acpm_mbox_fixup_set,
++	.get = param_get_bool,
++};
++module_param_cb(mbox_fixup, &acpm_mbox_fixup_ops, &acpm_mbox_fixup, 0644);
++MODULE_PARM_DESC(mbox_fixup, "Mask/clear the APM->AP mailbox irqs of polled channels like the Samsung kernel");
++
++static void acpm_dbg_dump(struct acpm_info *acpm, const char *why)
++{
++	void __iomem *init = (void __iomem *)acpm->shmem;
++	u32 w[8];
++	int i, j;
++
++	dev_err(acpm->dev, "dbg dump (%s):\n", why);
++	for (i = 0; i < acpm->num_chans; i++) {
++		struct acpm_chan *c = &acpm->chans[i];
++
++		/* Only touch the queue pointers of channels with a real queue. */
++		if (!c->shmem_ok)
++			continue;
++
++		dev_err(acpm->dev,
++			"  ch%u poll %d qlen %u: AP->APM front %u rear %u, APM->AP front %u rear %u, bitmap %lx\n",
++			c->id, c->poll_completion, c->qlen,
++			readl(c->tx.front), readl(c->tx.rear),
++			readl(c->rx.front), readl(c->rx.rear),
++			c->bitmap_seqnum[0]);
++	}
++	for (i = 0; i < ACPM_INIT_DUMP_WORDS; i += 8) {
++		for (j = 0; j < 8; j++)
++			w[j] = readl(init + (i + j) * 4);
++		dev_err(acpm->dev, "  init+%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			i * 4, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++	}
++	acpm_fw_log_tail(acpm, 48);
++}
++
++static void acpm_dbg_timeout(struct acpm_info *acpm, unsigned int ch)
++{
++	char why[24];
++
++	if (atomic_inc_return(&acpm_dumps) > ACPM_DBG_MAX_DUMPS)
++		return;
++
++	snprintf(why, sizeof(why), "timeout on ch%u", ch);
++	acpm_dbg_dump(acpm, why);
++}
++
+ /**
+  * acpm_get_saved_rx() - get the response if it was already saved.
+  * @achan:	ACPM channel info.
+@@ -214,27 +410,15 @@ static void acpm_get_saved_rx(struct acpm_chan *achan,
+ 		memcpy(xfer->rxd, rx_data->cmd, xfer->rxcnt * sizeof(*xfer->rxd));
+ }
+ 
+-/**
+- * acpm_get_rx() - get response from RX queue.
+- * @achan:	ACPM channel info.
+- * @xfer:	reference to the transfer to get response for.
+- * @native_match: pointer to a boolean set to true if the thread natively
+- *                processed its own sequence number during this call.
+- *
+- * Return: 0 on success, -errno otherwise.
+- */
+-static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
+-		       bool *native_match)
++/* acpm_get_rx() body, called with achan->rx_lock held. */
++static int __acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
++			 bool *native_match)
+ {
+ 	u32 rx_front, rx_seqnum, tx_seqnum, seqnum;
+ 	const void __iomem *base, *addr;
+ 	struct acpm_rx_data *rx_data;
+ 	u32 i, val, mlen;
+ 
+-	*native_match = false;
+-
+-	guard(mutex)(&achan->rx_lock);
+-
+ 	rx_front = readl(achan->rx.front);
+ 	i = readl(achan->rx.rear);
+ 
+@@ -304,9 +488,46 @@ static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
+ 	/* We saved all responses, mark RX empty. */
+ 	writel(rx_front, achan->rx.rear);
+ 
++	/* Samsung kernel: clear the APM->AP doorbell once RX is empty. */
++	if (READ_ONCE(acpm_mbox_fixup) && achan->acpm->mbox && achan->id < 32)
++		writel(BIT(achan->id), achan->acpm->mbox + ACPM_MBOX_INTCR1);
++
+ 	return 0;
+ }
+ 
++/**
++ * acpm_get_rx() - get response from RX queue.
++ * @achan:	ACPM channel info.
++ * @xfer:	reference to the transfer to get response for.
++ * @native_match: pointer to a boolean set to true if the thread natively
++ *                processed its own sequence number during this call.
++ *
++ * Return: 0 on success, -EAGAIN if an atomic transfer found the RX lock
++ * taken, -errno otherwise.
++ */
++static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
++		       bool *native_match)
++{
++	int ret;
++
++	*native_match = false;
++
++	/*
++	 * An atomic transfer (IRQs off, e.g. a suspend breadcrumb) must not
++	 * sleep on the lock: report "busy" and let the caller poll again.
++	 */
++	if (xfer->atomic) {
++		if (!mutex_trylock(&achan->rx_lock))
++			return -EAGAIN;
++	} else {
++		mutex_lock(&achan->rx_lock);
++	}
++	ret = __acpm_get_rx(achan, xfer, native_match);
++	mutex_unlock(&achan->rx_lock);
++
++	return ret;
++}
++
+ /**
+  * acpm_dequeue_by_polling() - RX dequeue by polling.
+  * @achan:	ACPM channel info.
+@@ -318,16 +539,29 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
+ 				   const struct acpm_xfer *xfer)
+ {
+ 	struct device *dev = achan->acpm->dev;
++	unsigned int loops = ACPM_ATOMIC_POLL_LOOPS;
+ 	bool native_match;
+-	ktime_t timeout;
++	ktime_t timeout = 0;
+ 	u32 seqnum;
+ 	int ret;
+ 
+ 	seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->txd[0]);
+ 
+-	timeout = ktime_add_us(ktime_get(), ACPM_POLL_TIMEOUT_US);
++	/*
++	 * Atomic transfers count udelay() steps instead: they may run while
++	 * timekeeping is suspended (syscore / suspend_ops->enter), where
++	 * ktime_get() warns and does not advance.
++	 */
++	if (!xfer->atomic)
++		timeout = ktime_add_us(ktime_get(), ACPM_POLL_TIMEOUT_US);
+ 	do {
+ 		ret = acpm_get_rx(achan, xfer, &native_match);
++		/*
++		 * Atomic: the RX lock is held by another thread. It may have
++		 * drained our response for us, so still check completion.
++		 */
++		if (ret == -EAGAIN && xfer->atomic)
++			ret = 0;
+ 		if (ret)
+ 			return ret;
+ 
+@@ -349,10 +583,12 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
+ 
+ 		/* Determined experimentally. */
+ 		udelay(20);
+-	} while (ktime_before(ktime_get(), timeout));
++	} while (xfer->atomic ? --loops : ktime_before(ktime_get(), timeout));
+ 
+ 	dev_err(dev, "Timeout! ch:%u s:%u bitmap:%lx.\n",
+ 		achan->id, seqnum, achan->bitmap_seqnum[0]);
++	if (!xfer->atomic)
++		acpm_dbg_timeout(achan->acpm, achan->id);
+ 
+ 	return -ETIME;
+ }
+@@ -362,10 +598,12 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
+  *
+  * @achan:		ACPM channel info.
+  * @next_tx_front:	next front index of the TX queue.
++ * @atomic:		poll with udelay() steps (IRQs off, no ktime).
+  *
+  * Return: 0 on success, -errno otherwise.
+  */
+-static int acpm_wait_for_queue_slots(struct acpm_chan *achan, u32 next_tx_front)
++static int acpm_wait_for_queue_slots(struct acpm_chan *achan, u32 next_tx_front,
++				     bool atomic)
+ {
+ 	u32 val, ret;
+ 
+@@ -373,15 +611,29 @@ static int acpm_wait_for_queue_slots(struct acpm_chan *achan, u32 next_tx_front)
+ 	 * Wait for RX front to keep up with TX front. Make sure there's at
+ 	 * least one element between them.
+ 	 */
+-	ret = readl_poll_timeout(achan->rx.front, val, next_tx_front != val, 0,
+-				 ACPM_TX_TIMEOUT_US);
++	if (atomic)
++		ret = readl_poll_timeout_atomic(achan->rx.front, val,
++						next_tx_front != val, 1,
++						ACPM_ATOMIC_TX_TIMEOUT_US);
++	else
++		ret = readl_poll_timeout(achan->rx.front, val,
++					 next_tx_front != val, 0,
++					 ACPM_TX_TIMEOUT_US);
+ 	if (ret) {
+ 		dev_err(achan->acpm->dev, "RX front can not keep up with TX front.\n");
++		if (!atomic)
++			acpm_dbg_timeout(achan->acpm, achan->id);
+ 		return ret;
+ 	}
+ 
+-	ret = readl_poll_timeout(achan->tx.rear, val, next_tx_front != val, 0,
+-				 ACPM_TX_TIMEOUT_US);
++	if (atomic)
++		ret = readl_poll_timeout_atomic(achan->tx.rear, val,
++						next_tx_front != val, 1,
++						ACPM_ATOMIC_TX_TIMEOUT_US);
++	else
++		ret = readl_poll_timeout(achan->tx.rear, val,
++					 next_tx_front != val, 0,
++					 ACPM_TX_TIMEOUT_US);
+ 	if (ret)
+ 		dev_err(achan->acpm->dev, "TX queue is full.\n");
+ 
+@@ -453,6 +705,41 @@ static int acpm_wait_for_message_response(struct acpm_chan *achan,
+ 	return acpm_dequeue_by_polling(achan, xfer);
+ }
+ 
++/* acpm_do_xfer() TX half, called with achan->tx_lock held. */
++static int acpm_send_locked(struct acpm_chan *achan,
++			    const struct acpm_xfer *xfer,
++			    struct exynos_mbox_msg *msg)
++{
++	u32 idx, tx_front;
++	int ret;
++
++	tx_front = readl(achan->tx.front);
++	idx = (tx_front + 1) % achan->qlen;
++
++	ret = acpm_wait_for_queue_slots(achan, idx, xfer->atomic);
++	if (ret)
++		return ret;
++
++	ret = acpm_prepare_xfer(achan, xfer);
++	if (ret)
++		return ret;
++
++	/* Write TX command. */
++	__iowrite32_copy(achan->tx.base + achan->mlen * tx_front,
++			 xfer->txd, xfer->txcnt);
++
++	/* Advance TX front. */
++	writel(idx, achan->tx.front);
++
++	ret = mbox_send_message(achan->chan, (void *)msg);
++	if (ret < 0)
++		return ret;
++
++	mbox_client_txdone(achan->chan, 0);
++
++	return 0;
++}
++
+ /**
+  * acpm_do_xfer() - do one transfer.
+  * @handle:	pointer to the acpm handle.
+@@ -465,7 +752,6 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
+ 	struct acpm_info *acpm = handle_to_acpm_info(handle);
+ 	struct exynos_mbox_msg msg;
+ 	struct acpm_chan *achan;
+-	u32 idx, tx_front;
+ 	int ret;
+ 
+ 	if (xfer->acpm_chan_id >= acpm->num_chans)
+@@ -483,38 +769,45 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	if (!achan->shmem_ok) {
++		dev_err_ratelimited(achan->acpm->dev, "ch%u has no usable queue\n",
++				    achan->id);
++		return -ENODEV;
++	}
++
+ 	msg.chan_id = xfer->acpm_chan_id;
+ 	msg.chan_type = EXYNOS_MBOX_CHAN_TYPE_DOORBELL;
+ 
+-	scoped_guard(mutex, &achan->tx_lock) {
+-		tx_front = readl(achan->tx.front);
+-		idx = (tx_front + 1) % achan->qlen;
+-
+-		ret = acpm_wait_for_queue_slots(achan, idx);
+-		if (ret)
+-			return ret;
+-
+-		ret = acpm_prepare_xfer(achan, xfer);
+-		if (ret)
+-			return ret;
+-
+-		/* Write TX command. */
+-		__iowrite32_copy(achan->tx.base + achan->mlen * tx_front,
+-				 xfer->txd, xfer->txcnt);
+-
+-		/* Advance TX front. */
+-		writel(idx, achan->tx.front);
+-
+-		ret = mbox_send_message(achan->chan, (void *)&msg);
+-		if (ret < 0)
+-			return ret;
+-
+-		mbox_client_txdone(achan->chan, 0);
++	if (xfer->atomic) {
++		/* IRQs off: never sleep on the lock (see acpm_get_rx()) */
++		if (!mutex_trylock(&achan->tx_lock))
++			return -EBUSY;
++	} else {
++		mutex_lock(&achan->tx_lock);
+ 	}
++	ret = acpm_send_locked(achan, xfer, &msg);
++	mutex_unlock(&achan->tx_lock);
++	if (ret)
++		return ret;
+ 
+ 	return acpm_wait_for_message_response(achan, xfer);
+ }
+ 
++/**
++ * acpm_dbg_get_handle() - the ACPM instance, for IRQs-off debug users.
++ *
++ * Exynos SoCs have one ACPM. Debug code that has no device to look the
++ * handle up with (system sleep breadcrumbs) uses this one.
++ *
++ * Return: the handle, or NULL before the ACPM driver has probed.
++ */
++struct acpm_handle *acpm_dbg_get_handle(void)
++{
++	struct acpm_info *acpm = READ_ONCE(acpm_dbg);
++
++	return acpm && acpm->handle.ops ? &acpm->handle : NULL;
++}
++
+ /**
+  * acpm_set_xfer() - initialize an ACPM IPC transfer structure.
+  * @xfer:	pointer to the ACPM transfer structure that is being initialized.
+@@ -531,6 +824,7 @@ void acpm_set_xfer(struct acpm_xfer *xfer, u32 *cmd, size_t cmdcnt,
+ 	xfer->acpm_chan_id = acpm_chan_id;
+ 	xfer->txcnt = cmdcnt;
+ 	xfer->txd = cmd;
++	xfer->atomic = false;
+ 
+ 	if (response) {
+ 		xfer->rxcnt = cmdcnt;
+@@ -551,24 +845,45 @@ static void acpm_chan_shmem_get_params(struct acpm_chan *achan,
+ 				struct acpm_chan_shmem __iomem *chan_shmem)
+ {
+ 	void __iomem *base = achan->acpm->sram_base;
++	struct acpm_info *acpm = achan->acpm;
+ 	struct acpm_queue *rx = &achan->rx;
+ 	struct acpm_queue *tx = &achan->tx;
++	u32 tx_base, tx_rear, tx_front, rx_base, rx_rear, rx_front, qsize;
+ 
+ 	achan->mlen = readl(&chan_shmem->mlen);
+ 	achan->poll_completion = readl(&chan_shmem->poll_completion);
+ 	achan->id = readl(&chan_shmem->id);
+ 	achan->qlen = readl(&chan_shmem->qlen);
+ 
+-	tx->base = base + readl(&chan_shmem->rx_base);
+-	tx->rear = base + readl(&chan_shmem->rx_rear);
+-	tx->front = base + readl(&chan_shmem->rx_front);
+-
+-	rx->base = base + readl(&chan_shmem->tx_base);
+-	rx->rear = base + readl(&chan_shmem->tx_rear);
+-	rx->front = base + readl(&chan_shmem->tx_front);
+-
+-	dev_vdbg(achan->acpm->dev, "ID = %d poll = %d, mlen = %d, qlen = %d\n",
+-		 achan->id, achan->poll_completion, achan->mlen, achan->qlen);
++	tx_base = readl(&chan_shmem->rx_base);
++	tx_rear = readl(&chan_shmem->rx_rear);
++	tx_front = readl(&chan_shmem->rx_front);
++	rx_base = readl(&chan_shmem->tx_base);
++	rx_rear = readl(&chan_shmem->tx_rear);
++	rx_front = readl(&chan_shmem->tx_front);
++
++	tx->base = base + tx_base;
++	tx->rear = base + tx_rear;
++	tx->front = base + tx_front;
++
++	rx->base = base + rx_base;
++	rx->rear = base + rx_rear;
++	rx->front = base + rx_front;
++
++	qsize = achan->qlen * achan->mlen;
++	achan->shmem_ok = achan->qlen && achan->mlen &&
++			  achan->qlen <= ACPM_SEQNUM_MAX * 4 &&
++			  achan->mlen <= SZ_4K &&
++			  acpm_sram_ok(acpm, tx_rear, 4) &&
++			  acpm_sram_ok(acpm, tx_front, 4) &&
++			  acpm_sram_ok(acpm, rx_rear, 4) &&
++			  acpm_sram_ok(acpm, rx_front, 4) &&
++			  acpm_sram_ok(acpm, tx_base, qsize) &&
++			  acpm_sram_ok(acpm, rx_base, qsize);
++
++	dev_vdbg(acpm->dev, "ID = %d poll = %d, mlen = %d, qlen = %d%s\n",
++		 achan->id, achan->poll_completion, achan->mlen, achan->qlen,
++		 achan->shmem_ok ? "" : " (no usable queue)");
+ }
+ 
+ /**
+@@ -667,6 +982,14 @@ static int acpm_channels_init(struct acpm_info *acpm)
+ 	return 0;
+ }
+ 
++static void acpm_dbg_release(void *data)
++{
++	struct acpm_info *acpm = data;
++
++	if (acpm_dbg == acpm)
++		acpm_dbg = NULL;
++}
++
+ static void acpm_clk_pdev_unregister(void *data)
+ {
+ 	platform_device_unregister(data);
+@@ -732,12 +1055,27 @@ static int acpm_probe(struct platform_device *pdev)
+ 				     "Failed to get match data.\n");
+ 
+ 	acpm->shmem = acpm->sram_base + match_data->initdata_base;
++	acpm->sram_size = size;
+ 	acpm->dev = dev;
+ 
+ 	ret = acpm_channels_init(acpm);
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Debug knobs (see acpm_dbg_*). The mailbox belongs to the mailbox
++	 * driver; this is a second, unrequested mapping that is only used
++	 * when mbox_fixup is set or to print its status.
++	 */
++	ret = devm_add_action_or_reset(dev, acpm_dbg_release, acpm);
++	if (ret)
++		return ret;
++	if (match_data->mbox)
++		acpm->mbox = devm_ioremap(dev, match_data->mbox, SZ_4K);
++	acpm_dbg = acpm;
++	if (acpm_mbox_fixup)
++		acpm_mbox_fixup_apply(acpm);
++
+ 	acpm->handle.ops = &exynos_acpm_driver_ops;
+ 
+ 	platform_set_drvdata(pdev, acpm);
+@@ -884,6 +1222,7 @@ static const struct acpm_match_data acpm_gs101 = {
+ static const struct acpm_match_data acpm_exynos9820 = {
+ 	.initdata_base = ACPM_EXYNOS9820_INITDATA_BASE,
+ 	.acpm_clk_dev_name = "exynos9820-acpm-clk",
++	.mbox = 0x15900000,		/* AP2APM mailbox */
+ };
+ 
+ static const struct of_device_id acpm_match[] = {
+diff --git a/drivers/firmware/samsung/exynos-acpm.h b/drivers/firmware/samsung/exynos-acpm.h
+index 708f6b0102..ecd9565d5b 100644
+--- a/drivers/firmware/samsung/exynos-acpm.h
++++ b/drivers/firmware/samsung/exynos-acpm.h
+@@ -13,6 +13,7 @@ struct acpm_xfer {
+ 	size_t txcnt;
+ 	size_t rxcnt;
+ 	unsigned int acpm_chan_id;
++	bool atomic;
+ };
+ 
+ struct acpm_handle;
+@@ -21,5 +22,6 @@ void acpm_set_xfer(struct acpm_xfer *xfer, u32 *cmd, size_t cmdcnt,
+ 		   unsigned int acpm_chan_id, bool response);
+ int acpm_do_xfer(struct acpm_handle *handle,
+ 		 const struct acpm_xfer *xfer);
++struct acpm_handle *acpm_dbg_get_handle(void);
+ 
+ #endif /* __EXYNOS_ACPM_H__ */
+diff --git a/include/linux/firmware/samsung/exynos-acpm-protocol.h b/include/linux/firmware/samsung/exynos-acpm-protocol.h
+index c6b35c0ff3..c7b2810ca0 100644
+--- a/include/linux/firmware/samsung/exynos-acpm-protocol.h
++++ b/include/linux/firmware/samsung/exynos-acpm-protocol.h
+@@ -8,6 +8,7 @@
+ #ifndef __EXYNOS_ACPM_PROTOCOL_H
+ #define __EXYNOS_ACPM_PROTOCOL_H
+ 
++#include <linux/errno.h>
+ #include <linux/types.h>
+ 
+ struct acpm_handle;
+@@ -71,4 +72,41 @@ struct acpm_handle *devm_acpm_get_by_node(struct device *dev,
+ 					  struct device_node *np);
+ struct acpm_handle *devm_acpm_get_by_phandle(struct device *dev);
+ 
++/*
++ * Debug: PMIC register access for system sleep breadcrumbs. atomic=true
++ * only with IRQs off on the last CPU (syscore / suspend_ops->enter): it
++ * never waits for a lock (-EBUSY) and every wait is bounded.
++ *
++ * exynos_acpm_dvfs_hold(): keep the Exynos 9820 MIF/INT levels up while a
++ * block that needs the full bus clock runs (see exynos-acpm-dvfs.c).
++ */
++#if IS_REACHABLE(CONFIG_EXYNOS_ACPM_PROTOCOL)
++int exynos_acpm_dvfs_hold(bool on);
++int exynos_acpm_pmic_dbg_bulk_read(unsigned int acpm_chan_id, u8 type, u8 reg,
++				   u8 chan, u8 count, u8 *buf, bool atomic);
++int exynos_acpm_pmic_dbg_bulk_write(unsigned int acpm_chan_id, u8 type, u8 reg,
++				    u8 chan, u8 count, const u8 *buf,
++				    bool atomic);
++#else
++static inline int exynos_acpm_dvfs_hold(bool on)
++{
++	return 0;
++}
++
++static inline int exynos_acpm_pmic_dbg_bulk_read(unsigned int acpm_chan_id,
++						 u8 type, u8 reg, u8 chan,
++						 u8 count, u8 *buf, bool atomic)
++{
++	return -ENODEV;
++}
++
++static inline int exynos_acpm_pmic_dbg_bulk_write(unsigned int acpm_chan_id,
++						  u8 type, u8 reg, u8 chan,
++						  u8 count, const u8 *buf,
++						  bool atomic)
++{
++	return -ENODEV;
++}
++#endif
++
+ #endif /* __EXYNOS_ACPM_PROTOCOL_H */

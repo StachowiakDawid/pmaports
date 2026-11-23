@@ -1,0 +1,32 @@
+From 5a2a38a6a71f1f5f4f4ee9965692fbefbfcbcb0a Mon Sep 17 00:00:00 2001
+From: chiffathefox <chiffathefoxx@gmail.com>
+Date: Sat, 18 Jul 2026 22:46:42 +0300
+Subject: [PATCH 30/46] clk: exynos9820: refine FSYS0A block
+
+(cherry picked from commit c38133160a617c56ec918810503d98504ed1ab56)
+---
+ drivers/clk/samsung/clk-exynos9820.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/clk/samsung/clk-exynos9820.c b/drivers/clk/samsung/clk-exynos9820.c
+index aaee842143..1b6da91fa7 100644
+--- a/drivers/clk/samsung/clk-exynos9820.c
++++ b/drivers/clk/samsung/clk-exynos9820.c
+@@ -761,7 +761,7 @@ static const struct samsung_cmu_info peric0_cmu_info __initconst = {
+ };
+ 
+ /*
+- * Register offsets for CMU_FSYS0 (0x10a00000)
++ * Register offsets for CMU_FSYS0A (0x10a00000)
+  */
+ #define PLL_CON0_MUX_CLKCMU_FSYS0A_BUS_USER						0x0100
+ #define PLL_CON0_MUX_CLKCMU_FSYS0A_USB31DRD_USER					0x0120
+@@ -830,7 +830,7 @@ static const struct samsung_gate_clock fsys0a_gate_clks[] __initconst = {
+ 	GATE(CLK_GOUT_FSYS0A_BUS_CLK, "gout_fsys0a_bus_clk",
+ 	     "mout_fsys0a_bus_user",
+ 	     CLK_CON_GAT_GOUT_BLK_FSYS0A_UID_RSTNSYNC_CLK_FSYS0A_BUS_IPCLKPORT_CLK,
+-	     21, CLK_IS_CRITICAL, 0),
++	     21, 0, 0),
+ 	GATE(CLK_GOUT_FSYS0A_USB31DRD_ACLK_BUS, "gout_fsys0a_usb31drd_aclk_bus",
+ 	     "mout_fsys0a_bus_user",
+ 	     CLK_CON_GAT_GOUT_BLK_FSYS0A_UID_USB31DRD_IPCLKPORT_ACLK_BUS, 21,

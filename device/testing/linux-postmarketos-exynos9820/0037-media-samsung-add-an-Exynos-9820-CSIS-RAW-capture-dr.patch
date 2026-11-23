@@ -1,0 +1,1805 @@
+From 19317229d2fed6c8d42476fe35f44a9914a30f68 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] media: samsung: add an Exynos 9820 CSIS RAW capture driver
+
+V4L2 capture driver for the MIPI CSI-2 receivers of the Exynos 9820
+with their write DMA: RAW Bayer frames from the sensor straight to
+memory, one video node per receiver.
+
+ - D-PHY/C-PHY combo PHY setup with the vendor settle table; split PHY
+   for CSIS3_1.
+ - Works with the screen off: the MIF/INT DVFS levels are held while
+   streaming. Drives the MIPI switch; one stream at a time.
+ - Extra virtual channels; sub-device nodes are registered late.
+ - Robust stream stop: the write DMA is aborted on errors and at
+   stream stop, a wedged DMA is detected, the ISPPRE bus divider is
+   written at every stream start, and a block that is not fully
+   powered is never touched.
+ - cmu_option: bits set in the CMU_ISPPRE controller option register
+   at stream start (default none; the power domain driver restores
+   the register).
+ - The receiver state is logged at stream start and stop.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/media/platform/samsung/Kconfig        |    1 +
+ drivers/media/platform/samsung/Makefile       |    1 +
+ .../platform/samsung/exynos9820-csis/Kconfig  |   16 +
+ .../platform/samsung/exynos9820-csis/Makefile |    2 +
+ .../samsung/exynos9820-csis/exynos9820-csis.c | 1710 +++++++++++++++++
+ 5 files changed, 1730 insertions(+)
+ create mode 100644 drivers/media/platform/samsung/exynos9820-csis/Kconfig
+ create mode 100644 drivers/media/platform/samsung/exynos9820-csis/Makefile
+ create mode 100644 drivers/media/platform/samsung/exynos9820-csis/exynos9820-csis.c
+
+diff --git a/drivers/media/platform/samsung/Kconfig b/drivers/media/platform/samsung/Kconfig
+index 0e34c5fc1d..acb0e40569 100644
+--- a/drivers/media/platform/samsung/Kconfig
++++ b/drivers/media/platform/samsung/Kconfig
+@@ -4,6 +4,7 @@ comment "Samsung media platform drivers"
+ 
+ source "drivers/media/platform/samsung/exynos-gsc/Kconfig"
+ source "drivers/media/platform/samsung/exynos4-is/Kconfig"
++source "drivers/media/platform/samsung/exynos9820-csis/Kconfig"
+ source "drivers/media/platform/samsung/s3c-camif/Kconfig"
+ source "drivers/media/platform/samsung/s5p-g2d/Kconfig"
+ source "drivers/media/platform/samsung/s5p-jpeg/Kconfig"
+diff --git a/drivers/media/platform/samsung/Makefile b/drivers/media/platform/samsung/Makefile
+index 21fea3330e..2c4e131904 100644
+--- a/drivers/media/platform/samsung/Makefile
++++ b/drivers/media/platform/samsung/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ obj-y += exynos-gsc/
+ obj-y += exynos4-is/
++obj-y += exynos9820-csis/
+ obj-y += s3c-camif/
+ obj-y += s5p-g2d/
+ obj-y += s5p-jpeg/
+diff --git a/drivers/media/platform/samsung/exynos9820-csis/Kconfig b/drivers/media/platform/samsung/exynos9820-csis/Kconfig
+new file mode 100644
+index 0000000000..0d9fc76752
+--- /dev/null
++++ b/drivers/media/platform/samsung/exynos9820-csis/Kconfig
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_EXYNOS9820_CSIS
++	tristate "Samsung Exynos 9820 MIPI CSIS RAW capture"
++	depends on ARCH_EXYNOS || COMPILE_TEST
++	depends on VIDEO_DEV && OF && HAS_DMA
++	select MEDIA_CONTROLLER
++	select VIDEO_V4L2_SUBDEV_API
++	select V4L2_FWNODE
++	select VIDEOBUF2_DMA_CONTIG
++	help
++	  RAW Bayer capture through the MIPI CSI-2 receiver (CSIS v5.2), its
++	  D-PHY and the per-receiver write DMA of the Exynos 9820. The image
++	  signal processor is not used.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called exynos9820-csis.
+diff --git a/drivers/media/platform/samsung/exynos9820-csis/Makefile b/drivers/media/platform/samsung/exynos9820-csis/Makefile
+new file mode 100644
+index 0000000000..7f20540fc5
+--- /dev/null
++++ b/drivers/media/platform/samsung/exynos9820-csis/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_EXYNOS9820_CSIS) += exynos9820-csis.o
+diff --git a/drivers/media/platform/samsung/exynos9820-csis/exynos9820-csis.c b/drivers/media/platform/samsung/exynos9820-csis/exynos9820-csis.c
+new file mode 100644
+index 0000000000..761868de89
+--- /dev/null
++++ b/drivers/media/platform/samsung/exynos9820-csis/exynos9820-csis.c
+@@ -0,0 +1,1710 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Samsung Exynos 9820 MIPI CSIS (v5.2) RAW capture.
++ *
++ * One instance covers a CSI-2 receiver, its D-PHY and the write DMA that is
++ * hard-wired to it ("CSISX4_PDP_DMA"). Frames of virtual channel 0 are
++ * written to memory as unpacked 16-bit Bayer; the ISP blocks are not used.
++ *
++ * The register sequences follow the Samsung SM-G975F kernel
++ * (fimc-is2/sensor/csi2/fimc-is-hw-csi-v5_2.c, fimc-is-device-csi_v4.c,
++ * drivers/phy/samsung/phy-exynos-mipi.c). This is a bring-up driver:
++ * no IOMMU (the DMA gets bus addresses below 4 GiB), one virtual channel,
++ * D-PHY only, one receiver streaming at a time (the receivers share the DMA
++ * top, the bus clock mux and the PHY isolation bit).
++ *
++ * A receiver can have several sensors behind a MIPI switch ("mux" GPIO, the
++ * endpoint number is the switch position); the enabled media link selects
++ * the sensor.
++ *
++ * While streaming, the MIF/INT levels are held up through ACPM (the 400 MHz
++ * bus clock needs the full INT level, which user space lowers when the
++ * display is off), and system suspend is refused.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware/samsung/exynos-acpm-protocol.h>
++#include <linux/gpio/consumer.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/soc/samsung/exynos-pmu.h>
++#include <media/media-device.h>
++#include <media/v4l2-async.h>
++#include <media/v4l2-common.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mc.h>
++#include <media/v4l2-subdev.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-v4l2.h>
++
++/* CSIS core */
++#define CSIS_VERSION			0x0000
++#define CSIS_CMN_CTRL			0x0004
++#define CSIS_CMN_CTRL_PHY_SEL		BIT(21)
++#define CSIS_CMN_CTRL_QCHANNEL_EN	BIT(20)
++#define CSIS_CMN_CTRL_UPDATE_SHADOW	GENMASK(19, 16)
++#define CSIS_CMN_CTRL_INTERLEAVE	GENMASK(11, 10)
++#define CSIS_CMN_CTRL_LANE_NUMBER	GENMASK(9, 8)
++#define CSIS_CMN_CTRL_SW_RESET		BIT(1)
++#define CSIS_CMN_CTRL_CSI_EN		BIT(0)
++#define CSIS_INT_MSK0			0x0010
++#define CSIS_INT_SRC0			0x0014
++#define CSIS_INT0_FRAMESTART		GENMASK(27, 24)
++#define CSIS_INT0_FRAMEEND		GENMASK(23, 20)
++#define CSIS_INT0_ERRORS		0x000fff1f
++#define CSIS_INT0_ENABLE		0x011fff1f	/* FS/FE of VC0, errors */
++#define CSIS_INT_MSK1			0x0018
++#define CSIS_INT_SRC1			0x001c
++#define CSIS_INT1_ERRORS		0x0000fff0
++#define CSIS_ISP_CONFIG(ch)		(0x0040 + (ch) * 0x10)
++#define CSIS_ISP_CONFIG_PIXEL_MODE	GENMASK(13, 12)
++#define CSIS_PIXEL_MODE_DUAL		1
++#define CSIS_ISP_CONFIG_DATAFORMAT	GENMASK(7, 2)
++#define CSIS_ISP_CONFIG_VC		GENMASK(1, 0)
++#define CSIS_ISP_RESOL(ch)		(0x0044 + (ch) * 0x10)
++#define CSIS_FRM_CNT(ch)		(0x0100 + (ch) * 4)
++#define CSIS_DEBUG_OPTION_SUITE		0x0500
++#define CSIS_PHY_STATUS			0x0700
++#define CSIS_PHY_CMN_CTRL		0x0704
++#define CSIS_PHY_CMN_CTRL_ENABLE_DAT	GENMASK(4, 1)
++#define CSIS_PHY_CMN_CTRL_ENABLE_CLK	BIT(0)
++
++#define MIPI_DT_RAW10			0x2b
++#define MIPI_DT_UNUSED			0x3f
++
++/* Write DMA, per virtual channel */
++#define DMA_CTRL			0x0000
++#define DMA_CTRL_UPDT_FRAMEPTR		GENMASK(6, 2)
++#define DMA_CTRL_UPDT_PTR_EN		BIT(1)
++#define DMA_CTRL_ENABLE			BIT(0)
++#define DMA_FMT				0x0004
++#define DMA_ADDR1			0x0010
++#define DMA_ACT_CTRL			0x0090
++#define DMA_RESOL			0x00a4
++#define DMA_FCNTSEQ			0x00b0
++
++/* Write DMA, common */
++#define DMA_DATA_CTRL			0x0000
++#define DMA_INT_MASK			0x0004
++#define DMA_INT_SRC			0x0008
++#define DMA_INT_OTF_OVERLAP_VC0		BIT(20)
++#define DMA_INT_ABORT_DONE		BIT(16)
++#define DMA_INT_ERROR			BIT(12)
++#define DMA_INT_FRM_END_VC0		BIT(8)
++#define DMA_INT_FRM_START_VC0		BIT(4)
++#define DMA_INT_ENABLE	(DMA_INT_OTF_OVERLAP_VC0 | DMA_INT_ABORT_DONE | \
++			 DMA_INT_ERROR | DMA_INT_FRM_END_VC0 | \
++			 DMA_INT_FRM_START_VC0)
++#define DMA_CMN_CTRL			0x0014
++#define DMA_CMN_CTRL_ABORT_REQ		BIT(0)
++#define DMA_ERR_CODE			0x0018
++#define DMA_OTF_FORMAT			0x001c
++
++/* Write DMA, top (shared by the four DMAs) */
++#define DMATOP_ARB_PRI			0x0000
++#define DMATOP_CTRL			0x0008
++#define DMATOP_CTRL_Q_CHANNEL_EN		BIT(2)
++#define DMATOP_CTRL_IP_PROCESSING	BIT(1)
++#define DMATOP_CLK_CTRL			0x0014
++#define DMATOP_FIFO_CTRL		0x0018
++#define DMATOP_DBG_MON_HW(n)		(0x0104 + (n) * 4)
++#define DMATOP_SRAM_SPLIT		0x000c
++#define DMATOP_MATRIX			0x0010
++#define DMATOP_TP_ENABLE		0x0020
++#define DMATOP_TP_ENABLE_ON		BIT(31)
++#define DMATOP_TP_ENABLE_PPC		BIT(30)
++#define DMATOP_TP_CTRL			0x0024
++#define DMATOP_TP_RESOL			0x0028
++
++/* SYSREG_ISPPRE */
++#define SYSREG_SC_CON_DMA(n)		(0x040c + (n) * 4)	/* DMA input mux */
++#define SYSREG_PHY_RESET		0x0500
++
++/* CMU_ISPPRE */
++#define CMU_BUS_USER_MUX		0x0100
++#define CMU_BUS_USER_MUX_SEL		BIT(4)
++#define CMU_BUS_USER_MUX_BUSY		BIT(7)
++#define CMU_OPTION			0x0800
++#define CMU_OPTION_PWR_MANAGEMENT	BIT(29)
++#define CMU_QCH_CON(off)		(0x3000 + (off))
++#define CMU_QCH_DBG(off)		(0x7000 + (off))
++#define CMU_MAP_SIZE			0x8000
++
++#define PMU_MIPI_PHY_ISO_BYPASS		BIT(0)
++/* ISPPRE local power: CONFIGURATION, STATUS, STATES */
++#define PMU_ISPPRE_STATUS		0x2504
++#define PMU_ISPPRE_STATES		0x2508
++#define PMU_ISPPRE_STATES_ON		0x10
++
++#define CSIS_BUS_RATE			400000000UL
++#define CSIS_MIN_WIDTH			64
++#define CSIS_MAX_WIDTH			8192
++#define CSIS_MAX_SOURCES		2
++
++/*
++ * CMU_ISPPRE comes out of the power-up with its controller option register
++ * at 0; the vendor PMU code restores a saved value. Without "power
++ * management" (bit 29) the block does not follow the power-down request of
++ * the PMU (STATUS stays 1).
++ */
++static uint cmu_option;
++module_param(cmu_option, uint, 0644);
++MODULE_PARM_DESC(cmu_option, "Bits set in the CMU_ISPPRE controller option register at start (default: none, the power domain driver restores the register)");
++
++/* One sensor of a receiver; the endpoint number is the MIPI switch position. */
++struct e9820_csis_source {
++	struct v4l2_async_connection asc;	/* must be first */
++	struct v4l2_subdev *sd;
++	struct v4l2_mbus_config_mipi_csi2 bus;
++	u32 mux;
++};
++
++struct e9820_csis_buffer {
++	struct vb2_v4l2_buffer vb;
++	struct list_head list;
++};
++
++struct e9820_csis {
++	struct device *dev;
++	void __iomem *csis;
++	void __iomem *dma;
++	void __iomem *dma_cmn;
++	void __iomem *dma_top;
++	void __iomem *phy;
++	void __iomem *sysreg;
++	void __iomem *cmu;
++	void __iomem *sysmmu;
++	struct regmap *pmu;
++	u32 phy_iso_offset;
++	u32 phy_reset_bit;
++	u32 dma_index;
++	bool phy_combo;
++	bool phy_split;			/* half of a shared S4 block */
++	bool phy_iso_shared;		/* isolation also used by the display */
++	struct gpio_desc *mux_gpio;
++	struct clk *bus_clk;
++	int irq_csis;
++	int irq_dma;
++
++	struct v4l2_device v4l2_dev;
++	struct media_device mdev;
++	struct video_device vdev;
++	struct media_pad pad;
++	struct vb2_queue queue;
++	struct mutex lock;		/* video device and queue */
++	struct v4l2_async_notifier notifier;
++	struct e9820_csis_source *sources[CSIS_MAX_SOURCES];
++	unsigned int num_sources;
++	struct e9820_csis_source *source;	/* selected at stream start */
++	struct v4l2_subdev *sensor;
++	struct v4l2_mbus_config_mipi_csi2 bus;
++	u64 link_freq;
++
++	struct v4l2_pix_format fmt;
++
++	spinlock_t slock;		/* buffer state below, DMA registers */
++	struct list_head queued;
++	struct e9820_csis_buffer *cur;	/* being written */
++	struct e9820_csis_buffer *next;	/* programmed for the next frame */
++	bool streaming;
++	bool pd_stuck;			/* a power-off did not complete */
++	bool held;			/* MIF/INT hold taken */
++	u32 sequence;
++	u32 n_fs, n_fe, n_err, n_dma_start, n_dma_end, n_dma_err;
++	u32 err0, err1;			/* error bits seen in this stream */
++	bool abort_frame;		/* DMA abort requested in this frame */
++	unsigned int n_abort;		/* DMA aborts requested in this stream */
++	/*
++	 * Further virtual channels the sensor sends (phase detection data):
++	 * data type and size from its frame descriptor. They are received
++	 * and dropped; left unconfigured every line raised ERR_ID.
++	 */
++	u8 vc_dt[4];
++	u32 vc_resol[4];
++};
++
++struct e9820_csis_format {
++	u32 mbus;
++	u32 fourcc;
++};
++
++static const struct e9820_csis_format e9820_csis_formats[] = {
++	{ MEDIA_BUS_FMT_SGRBG10_1X10, V4L2_PIX_FMT_SGRBG10 },
++	{ MEDIA_BUS_FMT_SRGGB10_1X10, V4L2_PIX_FMT_SRGGB10 },
++	{ MEDIA_BUS_FMT_SBGGR10_1X10, V4L2_PIX_FMT_SBGGR10 },
++	{ MEDIA_BUS_FMT_SGBRG10_1X10, V4L2_PIX_FMT_SGBRG10 },
++};
++
++static const struct e9820_csis_format *e9820_csis_find_fourcc(u32 fourcc)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(e9820_csis_formats); i++)
++		if (e9820_csis_formats[i].fourcc == fourcc)
++			return &e9820_csis_formats[i];
++	return NULL;
++}
++
++/* The receiver that is streaming (they share parts of the block). */
++static struct e9820_csis *e9820_csis_active;
++
++/*
++ * "Wedge": a stream whose DMA started frames but never ended one (CSIS OVER
++ * on every line). Seen after a stream full of errors and after many
++ * suspend/resume cycles; until reboot every receiver then behaves the same.
++ * The state is shared (one DMA top, one bus path), so it is global.
++ */
++static bool e9820_csis_wedged;
++static unsigned int e9820_csis_wedges;
++
++/* CMU_TOP (always on) ISPPRE bus clock registers, read-only for the log */
++static void __iomem *e9820_cmu_top;
++#define CMU_TOP_MUX_ISPPRE_BUS		0x1094
++#define CMU_TOP_DIV_ISPPRE_BUS		0x1884
++#define CMU_TOP_GATE_ISPPRE_BUS		0x20a0
++
++/* SysMMU ISPPRE (in the CSIS DMA path, never enabled by us) */
++#define SYSMMU_ISPPRE_BASE		0x17210000
++#define SYSMMU_ISPPRE_SIZE		0x1100
++
++static void e9820_rmw(void __iomem *reg, u32 mask, u32 val)
++{
++	writel((readl(reg) & ~mask) | val, reg);
++}
++
++/* -------------------------------------------------------------------------
++ * Hardware
++ */
++
++/*
++ * D-PHY HS settle values of the vendor driver (fimc-is-hw-settle-8nm-lpp.h),
++ * as { lowest lane rate in Mbit/s, value }, descending. The value drops back
++ * below 1500 Mbit/s because the PHY then uses the other settle clock.
++ */
++static const struct { u16 mbps; u8 settle; } e9820_csis_settle[] = {
++	{ 6410, 37 }, { 6240, 36 }, { 6080, 35 }, { 5910, 34 }, { 5740, 33 },
++	{ 5580, 32 }, { 5410, 31 }, { 5250, 30 }, { 5080, 29 }, { 4910, 28 },
++	{ 4750, 27 }, { 4580, 26 }, { 4410, 25 }, { 4250, 24 }, { 4080, 23 },
++	{ 3910, 22 }, { 3750, 21 }, { 3580, 20 }, { 3420, 19 }, { 3250, 18 },
++	{ 3080, 17 }, { 2920, 16 }, { 2750, 15 }, { 2580, 14 }, { 2420, 13 },
++	{ 2250, 12 }, { 2080, 11 }, { 1920, 10 }, { 1750, 9 }, { 1590, 8 },
++	{ 1500, 7 }, { 1480, 73 }, { 1460, 72 }, { 1440, 71 }, { 1420, 70 },
++	{ 1400, 69 }, { 1380, 68 }, { 1360, 67 }, { 1340, 66 }, { 1320, 65 },
++	{ 1290, 64 }, { 1270, 63 }, { 1250, 62 }, { 1230, 61 }, { 1210, 60 },
++	{ 1190, 59 }, { 1170, 58 }, { 1150, 57 }, { 1130, 56 }, { 1110, 55 },
++	{ 1090, 54 }, { 1070, 53 }, { 1040, 52 }, { 1020, 51 }, { 1000, 50 },
++	{ 980, 49 }, { 960, 48 }, { 940, 47 }, { 920, 46 }, { 900, 45 },
++	{ 880, 44 }, { 860, 43 }, { 840, 42 }, { 820, 41 }, { 800, 40 },
++	{ 770, 39 }, { 750, 38 }, { 730, 37 }, { 710, 36 }, { 690, 35 },
++	{ 670, 34 }, { 650, 33 }, { 630, 32 }, { 610, 31 }, { 590, 30 },
++	{ 570, 29 }, { 550, 28 }, { 520, 27 }, { 500, 26 }, { 480, 25 },
++	{ 460, 24 }, { 440, 23 }, { 420, 22 }, { 400, 21 }, { 380, 20 },
++	{ 360, 19 }, { 340, 18 }, { 320, 17 }, { 300, 16 }, { 280, 15 },
++	{ 250, 14 }, { 230, 13 }, { 210, 12 }, { 190, 11 }, { 170, 10 }, { 150, 9 },
++	{ 130, 8 }, { 110, 7 }, { 90, 6 }, { 80, 5 },
++};
++
++static u32 e9820_csis_find_settle(u32 mbps)
++{
++	unsigned int i;
++
++	/* the vendor code rounds the rate up to a multiple of 10 first */
++	mbps = roundup(mbps, 10);
++	for (i = 0; i < ARRAY_SIZE(e9820_csis_settle); i++)
++		if (mbps >= e9820_csis_settle[i].mbps)
++			return e9820_csis_settle[i].settle;
++	return e9820_csis_settle[i - 1].settle;
++}
++
++/*
++ * __set_phy_cfg_0502_0002_dphy() of the vendor PHY driver. Type 0xD is a
++ * plain D-PHY, 0xDC a D/C-PHY combo used as D-PHY (CSIS0 and CSIS2), which
++ * has one more register in its first three lanes.
++ *
++ * CSIS3_1 has the two upper data lanes of an S4 block that it shares with
++ * CSIS3 (__set_phy_cfg_0502_0003_dphy()): its data lanes start at offset 0
++ * of its register range, the clock lane block is at 0x500, and two more
++ * bits are set in SD_ANA_CON2 (RESETN_CFG_SEL, RXDDRCLKHS_SEL). With the
++ * plain layout the clock lane was never configured and no frame arrived.
++ */
++static void e9820_csis_phy_config(struct e9820_csis *csis, u32 mbps)
++{
++	void __iomem *regs = csis->phy + (csis->phy_split ? 0x500 : 0);
++	void __iomem *lanes = csis->phy + (csis->phy_split ? 0 : 0x100);
++	u32 ana_con2 = csis->phy_split ? BIT(15) | BIT(7) : 0;
++	u32 settle_clk_sel = 1, skew_cal_en = 0, skew_delay_sel = 0;
++	u32 clk_div, hs_settle = e9820_csis_find_settle(mbps);
++	unsigned int i;
++
++	if (mbps >= 1500) {
++		settle_clk_sel = 0;
++		skew_cal_en = 1;
++		if (mbps >= 4000)
++			skew_delay_sel = 0;
++		else if (mbps >= 3000)
++			skew_delay_sel = 1;
++		else if (mbps >= 2000)
++			skew_delay_sel = 2;
++		else
++			skew_delay_sel = 3;
++	}
++	clk_div = max(0, 5 - (int)DIV_ROUND_UP((2 * mbps) >> 2, 26));
++
++	writel(0x00000001, regs + 0x0000);	/* SC_GNR_CON0 */
++	writel(0x00001450, regs + 0x0004);	/* SC_GNR_CON1 */
++	writel(0x00000004, regs + 0x0008);	/* SC_ANA_CON0 */
++	writel(0x00009000, regs + 0x000c);	/* SC_ANA_CON1 */
++	writel(0x00000005 | (clk_div & 3) << 8, regs + 0x0010); /* SC_ANA_CON2 */
++	writel(0x00000600, regs + 0x0014);	/* SC_ANA_CON3 */
++	writel(0x00000301, regs + 0x0030);	/* SC_TIME_CON0 */
++
++	for (i = 0; i < csis->bus.num_data_lanes; i++) {
++		void __iomem *l = lanes + i * 0x100;
++
++		writel(0x00000001, l + 0x00);	/* SD_GNR_CON0 */
++		writel(0x00001450, l + 0x04);	/* SD_GNR_CON1 */
++		writel(0x00000004, l + 0x08);	/* SD_ANA_CON0 */
++		writel(0x00009000, l + 0x0c);	/* SD_ANA_CON1 */
++		writel(0x00000005 | skew_delay_sel << 8 | ana_con2,
++		       l + 0x10);		/* SD_ANA_CON2 */
++		writel(0x00000600, l + 0x14);	/* SD_ANA_CON3 */
++		if (csis->phy_combo && i < 3)
++			writel(0x00000040, l + 0x24);	/* SD_ANA_CON7 */
++		e9820_rmw(l + 0x30, 0x1ff, (hs_settle & 0xff) | settle_clk_sel << 8);
++		writel(0x00000003, l + 0x34);	/* SD_TIME_CON1 */
++		e9820_rmw(l + 0x40, 1, skew_cal_en);	/* SD_DESKEW_CON0 */
++		writel(0x0000081a, l + 0x50);	/* SD_DESKEW_CON4 */
++	}
++}
++
++static int e9820_csis_phy_power(struct e9820_csis *csis, bool on)
++{
++	int ret;
++
++	if (on) {
++		ret = regmap_update_bits(csis->pmu, csis->phy_iso_offset,
++					 PMU_MIPI_PHY_ISO_BYPASS,
++					 PMU_MIPI_PHY_ISO_BYPASS);
++		if (ret)
++			return ret;
++	}
++
++	/* assert, then release for "on" */
++	e9820_rmw(csis->sysreg + SYSREG_PHY_RESET, BIT(csis->phy_reset_bit), 0);
++	if (on) {
++		e9820_rmw(csis->sysreg + SYSREG_PHY_RESET,
++			  BIT(csis->phy_reset_bit), BIT(csis->phy_reset_bit));
++		return 0;
++	}
++
++	/*
++	 * The isolation bit is shared by the PHYs of CSIS1/2/3/3_1; only one
++	 * receiver streams at a time, so it can be dropped here. The one of
++	 * CSIS0 belongs to the display PHY as well and is left alone.
++	 */
++	if (csis->phy_iso_shared)
++		return 0;
++	return regmap_update_bits(csis->pmu, csis->phy_iso_offset,
++				  PMU_MIPI_PHY_ISO_BYPASS, 0);
++}
++
++static int e9820_csis_sw_reset(struct e9820_csis *csis)
++{
++	u32 val;
++
++	e9820_rmw(csis->csis + CSIS_CMN_CTRL, CSIS_CMN_CTRL_SW_RESET,
++		  CSIS_CMN_CTRL_SW_RESET);
++	return readl_poll_timeout(csis->csis + CSIS_CMN_CTRL, val,
++				  !(val & CSIS_CMN_CTRL_SW_RESET), 10, 1000);
++}
++
++/* Call with slock held. */
++static void e9820_csis_dma_arm(struct e9820_csis *csis,
++			       struct e9820_csis_buffer *buf)
++{
++	u32 val;
++
++	if (!buf) {
++		writel(0, csis->dma + DMA_CTRL);
++		return;
++	}
++
++	writel(lower_32_bits(vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0)),
++	       csis->dma + DMA_ADDR1);
++	val = readl(csis->dma + DMA_FCNTSEQ);
++	writel(val | BIT(0), csis->dma + DMA_FCNTSEQ);
++	/* frame pointer 0, pointer update, enable */
++	writel(DMA_CTRL_UPDT_PTR_EN | DMA_CTRL_ENABLE, csis->dma + DMA_CTRL);
++}
++
++static struct e9820_csis_buffer *e9820_csis_next_queued(struct e9820_csis *csis)
++{
++	struct e9820_csis_buffer *buf;
++
++	buf = list_first_entry_or_null(&csis->queued, struct e9820_csis_buffer,
++				       list);
++	if (buf)
++		list_del(&buf->list);
++	return buf;
++}
++
++static void e9820_csis_buf_done(struct e9820_csis *csis,
++				struct e9820_csis_buffer *buf,
++				enum vb2_buffer_state state)
++{
++	buf->vb.vb2_buf.timestamp = ktime_get_ns();
++	buf->vb.sequence = csis->sequence++;
++	buf->vb.field = V4L2_FIELD_NONE;
++	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, csis->fmt.sizeimage);
++	vb2_buffer_done(&buf->vb.vb2_buf, state);
++}
++
++/*
++ * Vendor csi_err_check(): on the first receiver or DMA error of a frame the
++ * write DMA is told to abort that frame (DMA_CMN_CTRL ABORT_REQ) instead of
++ * being left in the middle of it. Without this, one stream full of errors
++ * (s5k4ha 2744x2056, CSIS OVER + DMA errors on every line) left the write
++ * path stuck for every receiver until reboot ("DMA start N end 0").
++ * Called with slock held.
++ */
++static void e9820_csis_dma_abort_frame(struct e9820_csis *csis)
++{
++	if (csis->abort_frame)
++		return;
++	csis->abort_frame = true;
++	csis->n_abort++;
++	e9820_rmw(csis->dma_cmn + DMA_CMN_CTRL, DMA_CMN_CTRL_ABORT_REQ,
++		  DMA_CMN_CTRL_ABORT_REQ);
++}
++
++/* Abort whatever the write DMA still has in flight and wait for it. */
++static void e9820_csis_dma_abort_sync(struct e9820_csis *csis)
++{
++	u32 val;
++	int ret;
++
++	e9820_rmw(csis->dma_cmn + DMA_CMN_CTRL, DMA_CMN_CTRL_ABORT_REQ,
++		  DMA_CMN_CTRL_ABORT_REQ);
++	ret = readl_poll_timeout_atomic(csis->dma_cmn + DMA_INT_SRC, val,
++					val & DMA_INT_ABORT_DONE, 10, 20000);
++	writel(DMA_INT_ABORT_DONE, csis->dma_cmn + DMA_INT_SRC);
++	e9820_rmw(csis->dma_cmn + DMA_CMN_CTRL, DMA_CMN_CTRL_ABORT_REQ, 0);
++	if (ret)
++		dev_dbg(csis->dev, "DMA abort at stop: no abort-done (idle DMA)\n");
++}
++
++static irqreturn_t e9820_csis_dma_irq(int irq, void *data)
++{
++	struct e9820_csis *csis = data;
++	u32 status;
++
++	status = readl(csis->dma_cmn + DMA_INT_SRC);
++	writel(status, csis->dma_cmn + DMA_INT_SRC);
++
++	spin_lock(&csis->slock);
++
++	if (status & DMA_INT_ABORT_DONE)
++		e9820_rmw(csis->dma_cmn + DMA_CMN_CTRL, DMA_CMN_CTRL_ABORT_REQ, 0);
++
++	if (status & (DMA_INT_ERROR | DMA_INT_OTF_OVERLAP_VC0)) {
++		csis->n_dma_err++;
++		e9820_csis_dma_abort_frame(csis);
++		dev_warn_ratelimited(csis->dev, "DMA error 0x%08x code 0x%x\n",
++				     status, readl(csis->dma_cmn + DMA_ERR_CODE));
++	}
++
++	/*
++	 * A frame end and the next frame start can be reported together:
++	 * finish the old frame first.
++	 */
++	if (status & DMA_INT_FRM_END_VC0) {
++		csis->n_dma_end++;
++		if (csis->cur) {
++			e9820_csis_buf_done(csis, csis->cur, VB2_BUF_STATE_DONE);
++			csis->cur = NULL;
++		}
++	}
++
++	if (status & DMA_INT_FRM_START_VC0) {
++		csis->n_dma_start++;
++		/* an abort applies to one frame; never let it stick */
++		if (csis->abort_frame)
++			e9820_rmw(csis->dma_cmn + DMA_CMN_CTRL,
++				  DMA_CMN_CTRL_ABORT_REQ, 0);
++		csis->abort_frame = false;
++		if (csis->cur)	/* missed frame end */
++			e9820_csis_buf_done(csis, csis->cur, VB2_BUF_STATE_ERROR);
++		/* The frame that just started goes to the buffer set before. */
++		csis->cur = csis->next;
++		csis->next = csis->streaming ? e9820_csis_next_queued(csis) : NULL;
++		e9820_csis_dma_arm(csis, csis->next);
++	}
++	spin_unlock(&csis->slock);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t e9820_csis_irq(int irq, void *data)
++{
++	struct e9820_csis *csis = data;
++	u32 src0, src1;
++
++	src0 = readl(csis->csis + CSIS_INT_SRC0);
++	src1 = readl(csis->csis + CSIS_INT_SRC1);
++	writel(src0, csis->csis + CSIS_INT_SRC0);
++	writel(src1, csis->csis + CSIS_INT_SRC1);
++
++	spin_lock(&csis->slock);
++	if (src0 & CSIS_INT0_FRAMESTART)
++		csis->n_fs++;
++	if (src0 & CSIS_INT0_FRAMEEND)
++		csis->n_fe++;
++	if ((src0 & CSIS_INT0_ERRORS) || (src1 & CSIS_INT1_ERRORS)) {
++		csis->n_err++;
++		e9820_csis_dma_abort_frame(csis);
++		csis->err0 |= src0 & CSIS_INT0_ERRORS;
++		csis->err1 |= src1 & CSIS_INT1_ERRORS;
++		dev_warn_ratelimited(csis->dev, "CSIS error 0x%08x 0x%08x\n",
++				     src0 & CSIS_INT0_ERRORS,
++				     src1 & CSIS_INT1_ERRORS);
++	}
++	spin_unlock(&csis->slock);
++
++	return IRQ_HANDLED;
++}
++
++/*
++ * The block may only be touched when the domain is fully up. After a
++ * power-down that did not complete (STATUS still 1, STATES in the middle of
++ * the sequence) the power domain driver withdraws the request, but the block
++ * is not usable: an access then reset the phone. Refuse instead.
++ */
++static int e9820_csis_check_power(struct e9820_csis *csis, const char *when)
++{
++	u32 status = 0, states = 0;
++
++	regmap_read(csis->pmu, PMU_ISPPRE_STATUS, &status);
++	regmap_read(csis->pmu, PMU_ISPPRE_STATES, &states);
++	if ((status & 1) && states == PMU_ISPPRE_STATES_ON)
++		return 0;
++
++	dev_err(csis->dev, "%s: ISPPRE not fully up (STATUS 0x%x STATES 0x%x), refusing to touch it\n",
++		when, status, states);
++	return -EIO;
++}
++
++/* State of the powered block, for the kernel log (named registers only). */
++static void e9820_csis_dump(struct e9820_csis *csis, const char *when)
++{
++	dev_info(csis->dev, "%s: CSIS CMN_CTRL 0x%08x CLK_CTRL 0x%08x INT_SRC 0x%08x 0x%08x MSK 0x%08x 0x%08x PHY_STATUS 0x%03x PHY_CMN 0x%02x\n",
++		 when, readl(csis->csis + CSIS_CMN_CTRL), readl(csis->csis + 0x0008),
++		 readl(csis->csis + CSIS_INT_SRC0), readl(csis->csis + CSIS_INT_SRC1),
++		 readl(csis->csis + CSIS_INT_MSK0), readl(csis->csis + CSIS_INT_MSK1),
++		 readl(csis->csis + CSIS_PHY_STATUS),
++		 readl(csis->csis + CSIS_PHY_CMN_CTRL));
++	dev_info(csis->dev, "%s: CSIS CH0 CONFIG 0x%08x RESOL 0x%08x shadow 0x%08x 0x%08x FRM_CNT %u\n",
++		 when, readl(csis->csis + CSIS_ISP_CONFIG(0)),
++		 readl(csis->csis + CSIS_ISP_RESOL(0)),
++		 readl(csis->csis + 0x0080), readl(csis->csis + 0x0084),
++		 readl(csis->csis + CSIS_FRM_CNT(0)));
++	dev_info(csis->dev, "%s: DMA CTRL 0x%08x FMT 0x%08x ADDR1 0x%08x RESOL 0x%08x FCNTSEQ 0x%08x ACT_CTRL 0x%08x ACT_FCNTSEQ 0x%08x ACT_FMT 0x%08x FCNT_STAT 0x%08x\n",
++		 when, readl(csis->dma + DMA_CTRL), readl(csis->dma + DMA_FMT),
++		 readl(csis->dma + DMA_ADDR1), readl(csis->dma + DMA_RESOL),
++		 readl(csis->dma + DMA_FCNTSEQ), readl(csis->dma + DMA_ACT_CTRL),
++		 readl(csis->dma + 0x0094), readl(csis->dma + 0x0098),
++		 readl(csis->dma + 0x00b4));
++	dev_info(csis->dev, "%s: DMA common DATA_CTRL 0x%08x INT_MASK 0x%08x INT_SRC 0x%08x CMN_CTRL 0x%08x ERR 0x%08x OTF_FORMAT 0x%08x\n",
++		 when, readl(csis->dma_cmn + DMA_DATA_CTRL),
++		 readl(csis->dma_cmn + DMA_INT_MASK),
++		 readl(csis->dma_cmn + DMA_INT_SRC), readl(csis->dma_cmn + 0x0014),
++		 readl(csis->dma_cmn + DMA_ERR_CODE),
++		 readl(csis->dma_cmn + DMA_OTF_FORMAT));
++	dev_info(csis->dev, "%s: DMA top ARB 0x%08x CTRL 0x%08x SRAM 0x%08x MATRIX 0x%08x CLK_CTRL 0x%08x FIFO_CTRL 0x%08x TP 0x%08x 0x%08x 0x%08x MON 0x%08x 0x%08x 0x%08x 0x%08x\n",
++		 when, readl(csis->dma_top + DMATOP_ARB_PRI),
++		 readl(csis->dma_top + DMATOP_CTRL),
++		 readl(csis->dma_top + DMATOP_SRAM_SPLIT),
++		 readl(csis->dma_top + DMATOP_MATRIX),
++		 readl(csis->dma_top + DMATOP_CLK_CTRL),
++		 readl(csis->dma_top + DMATOP_FIFO_CTRL),
++		 readl(csis->dma_top + DMATOP_TP_ENABLE),
++		 readl(csis->dma_top + DMATOP_TP_CTRL),
++		 readl(csis->dma_top + DMATOP_TP_RESOL),
++		 readl(csis->dma_top + DMATOP_DBG_MON_HW(0)),
++		 readl(csis->dma_top + DMATOP_DBG_MON_HW(1)),
++		 readl(csis->dma_top + DMATOP_DBG_MON_HW(2)),
++		 readl(csis->dma_top + DMATOP_DBG_MON_HW(3)));
++	dev_info(csis->dev, "%s: SYSREG DMA mux 0x%08x PHY reset 0x%08x, CMU user mux 0x%08x option 0x%08x\n",
++		 when, readl(csis->sysreg + SYSREG_SC_CON_DMA(csis->dma_index)),
++		 readl(csis->sysreg + SYSREG_PHY_RESET),
++		 readl(csis->cmu + CMU_BUS_USER_MUX),
++		 readl(csis->cmu + CMU_OPTION));
++	/* Q-channel control / status: CMU, CSIS1, CSISX4_PDP_DMA, SYSREG, AXI_D, AXI_P */
++	dev_info(csis->dev, "%s: QCH_CON cmu 0x%08x csis1 0x%08x dma 0x%08x sysreg 0x%08x axi_d 0x%08x axi_p 0x%08x\n",
++		 when, readl(csis->cmu + CMU_QCH_CON(0x30)),
++		 readl(csis->cmu + CMU_QCH_CON(0x50)),
++		 readl(csis->cmu + CMU_QCH_CON(0x5c)),
++		 readl(csis->cmu + CMU_QCH_CON(0xbc)),
++		 readl(csis->cmu + CMU_QCH_CON(0xb8)),
++		 readl(csis->cmu + CMU_QCH_CON(0xa4)));
++	dev_info(csis->dev, "%s: QCH dbg cmu 0x%08x csis1 0x%08x dma 0x%08x sysreg 0x%08x axi_d 0x%08x axi_p 0x%08x\n",
++		 when, readl(csis->cmu + CMU_QCH_DBG(0x30)),
++		 readl(csis->cmu + CMU_QCH_DBG(0x50)),
++		 readl(csis->cmu + CMU_QCH_DBG(0x5c)),
++		 readl(csis->cmu + CMU_QCH_DBG(0xbc)),
++		 readl(csis->cmu + CMU_QCH_DBG(0xb8)),
++		 readl(csis->cmu + CMU_QCH_DBG(0xa4)));
++}
++
++static void e9820_csis_bus_log(struct e9820_csis *csis, const char *when)
++{
++	if (!e9820_cmu_top)
++		return;
++	dev_info(csis->dev, "%s: CMU_TOP ISPPRE_BUS mux 0x%08x div 0x%08x gate 0x%08x, bus clock %lu Hz (clk framework)\n",
++		 when, readl(e9820_cmu_top + CMU_TOP_MUX_ISPPRE_BUS),
++		 readl(e9820_cmu_top + CMU_TOP_DIV_ISPPRE_BUS),
++		 readl(e9820_cmu_top + CMU_TOP_GATE_ISPPRE_BUS),
++		 clk_get_rate(csis->bus_clk));
++}
++
++/* Everything of the shared path while the block is powered */
++static void e9820_csis_wedge_dump(struct e9820_csis *csis, const char *when)
++{
++	e9820_csis_dump(csis, when);
++	e9820_csis_bus_log(csis, when);
++	dev_info(csis->dev, "%s: DMA top MON 4-7 0x%08x 0x%08x 0x%08x 0x%08x\n", when,
++		 readl(csis->dma_top + DMATOP_DBG_MON_HW(4)),
++		 readl(csis->dma_top + DMATOP_DBG_MON_HW(5)),
++		 readl(csis->dma_top + DMATOP_DBG_MON_HW(6)),
++		 readl(csis->dma_top + DMATOP_DBG_MON_HW(7)));
++}
++
++static int e9820_csis_hw_start(struct e9820_csis *csis)
++{
++	u32 div_before;
++	u32 width = csis->fmt.width, height = csis->fmt.height;
++	u32 lanes = csis->bus.num_data_lanes;
++	u32 mbps = div_u64(csis->link_freq * 2, 1000000);
++	unsigned long flags;
++	unsigned int ch;
++	u32 val;
++	int ret;
++
++	if (csis->pd_stuck) {
++		dev_err(csis->dev, "ISPPRE did not power off after the last stream; reboot before streaming again\n");
++		return -EIO;
++	}
++
++	/* shared DMA top, bus clock mux, PHY isolation: one at a time */
++	if (cmpxchg(&e9820_csis_active, NULL, csis)) {
++		dev_err(csis->dev, "another receiver is streaming\n");
++		return -EBUSY;
++	}
++
++	/* full bus level before the block gets its 400 MHz clock */
++	ret = exynos_acpm_dvfs_hold(true);
++	if (ret) {
++		dev_err(csis->dev, "cannot hold the MIF/INT levels: %d\n", ret);
++		goto err_active;
++	}
++	csis->held = true;
++
++	if (csis->mux_gpio && csis->source) {
++		gpiod_direction_output(csis->mux_gpio, csis->source->mux);
++		usleep_range(2000, 3000);
++	}
++
++	ret = pm_runtime_resume_and_get(csis->dev);
++	if (ret)
++		goto err_hold;
++
++	ret = e9820_csis_check_power(csis, "start");
++	if (ret)
++		goto err_rpm;
++
++	/*
++	 * Make the clock framework write the ISPPRE bus divider at every
++	 * start (it skips the write when its cached rate already matches).
++	 * After some system sleeps CMU_TOP's DIV_CLKCMU_ISPPRE_BUS came back
++	 * as 0xf (bus at 1/16, 25 MHz) while the framework still had 400 MHz:
++	 * the DMA could not drain and the stream wedged (wedged with div
++	 * 0xf, recovered with div 0 after this rewrite).
++	 */
++	if (e9820_csis_wedged)
++		e9820_csis_bus_log(csis, "wedge, before");
++	div_before = e9820_cmu_top ?
++		readl(e9820_cmu_top + CMU_TOP_DIV_ISPPRE_BUS) : 0;
++	clk_set_rate(csis->bus_clk, CSIS_BUS_RATE / 2);
++	ret = clk_set_rate(csis->bus_clk, CSIS_BUS_RATE);
++	if (!ret && e9820_cmu_top) {
++		u32 div_after = readl(e9820_cmu_top + CMU_TOP_DIV_ISPPRE_BUS);
++
++		if ((div_before ^ div_after) & 0xf)
++			dev_warn(csis->dev, "ISPPRE bus divider was 0x%x, rewritten to 0x%x (lost over a system sleep?)\n",
++				 div_before & 0xf, div_after & 0xf);
++	}
++	if (!ret)
++		ret = clk_prepare_enable(csis->bus_clk);
++	if (ret)
++		goto err_rpm;
++
++	if (cmu_option)
++		e9820_rmw(csis->cmu + CMU_OPTION, cmu_option, cmu_option);
++
++	/* The block comes out of power-down on the 26 MHz oscillator. */
++	e9820_rmw(csis->cmu + CMU_BUS_USER_MUX, CMU_BUS_USER_MUX_SEL,
++		  CMU_BUS_USER_MUX_SEL);
++	ret = readl_poll_timeout(csis->cmu + CMU_BUS_USER_MUX, val,
++				 !(val & CMU_BUS_USER_MUX_BUSY), 10, 1000);
++	if (ret) {
++		dev_err(csis->dev, "bus clock mux stuck busy\n");
++		goto err_clk;
++	}
++
++	dev_info(csis->dev, "CSIS version 0x%08x, bus clock %lu Hz, %ux%u, %u lanes, %u Mbit/s, settle %u%s, source %s (switch %u)\n",
++		 readl(csis->csis + CSIS_VERSION), clk_get_rate(csis->bus_clk),
++		 width, height, lanes, mbps, e9820_csis_find_settle(mbps),
++		 csis->phy_combo ? ", combo PHY" :
++		 csis->phy_split ? ", split PHY" : "",
++		 csis->sensor ? csis->sensor->name : "none",
++		 csis->source ? csis->source->mux : 0);
++
++	/* reset state of the block after power-on; the vendor PMU code restores these */
++	dev_info(csis->dev, "CMU user mux 0x%08x option 0x%08x, SYSREG DRCG 0x%08x MEMCLK 0x%08x DMA mux 0x%08x PHY reset 0x%08x\n",
++		 readl(csis->cmu + CMU_BUS_USER_MUX), readl(csis->cmu + 0x0800),
++		 readl(csis->sysreg + 0x0104), readl(csis->sysreg + 0x0108),
++		 readl(csis->sysreg + SYSREG_SC_CON_DMA(csis->dma_index)),
++		 readl(csis->sysreg + SYSREG_PHY_RESET));
++
++	ret = e9820_csis_phy_power(csis, true);
++	if (ret)
++		goto err_clk;
++
++	ret = e9820_csis_sw_reset(csis);
++	if (ret) {
++		dev_err(csis->dev, "CSIS reset timed out\n");
++		goto err_phy;
++	}
++
++	/* DMA input: the receiver wired to it (not a PDP output) */
++	writel(0, csis->sysreg + SYSREG_SC_CON_DMA(csis->dma_index));
++
++	/* DMA off before anything else; it has no reset of its own */
++	writel(0, csis->dma + DMA_CTRL);
++	writel(readl(csis->dma_cmn + DMA_INT_SRC), csis->dma_cmn + DMA_INT_SRC);
++
++	{
++		writel(CSIS_INT0_ENABLE, csis->csis + CSIS_INT_MSK0);
++		writel(CSIS_INT1_ERRORS, csis->csis + CSIS_INT_MSK1);
++
++		e9820_csis_phy_config(csis, mbps);
++
++		e9820_rmw(csis->csis + CSIS_CMN_CTRL, CSIS_CMN_CTRL_LANE_NUMBER,
++			  FIELD_PREP(CSIS_CMN_CTRL_LANE_NUMBER, lanes - 1));
++		e9820_rmw(csis->csis + CSIS_PHY_CMN_CTRL,
++			  CSIS_PHY_CMN_CTRL_ENABLE_DAT,
++			  FIELD_PREP(CSIS_PHY_CMN_CTRL_ENABLE_DAT,
++				     BIT(lanes) - 1));
++		/* interleave mode 2: virtual channels only */
++		e9820_rmw(csis->csis + CSIS_CMN_CTRL, CSIS_CMN_CTRL_INTERLEAVE,
++			  FIELD_PREP(CSIS_CMN_CTRL_INTERLEAVE, 2));
++		writel(1, csis->csis + CSIS_DEBUG_OPTION_SUITE); /* pixel align */
++
++		for (ch = 0; ch < 4; ch++) {
++			u32 dt = ch ? MIPI_DT_UNUSED : MIPI_DT_RAW10;
++
++			if (ch && csis->vc_dt[ch])
++				dt = csis->vc_dt[ch];
++			val = FIELD_PREP(CSIS_ISP_CONFIG_PIXEL_MODE,
++					 CSIS_PIXEL_MODE_DUAL) |
++			      FIELD_PREP(CSIS_ISP_CONFIG_DATAFORMAT, dt) |
++			      FIELD_PREP(CSIS_ISP_CONFIG_VC, ch);
++			writel(val, csis->csis + CSIS_ISP_CONFIG(ch));
++			writel(!ch ? height << 16 | width :
++			       dt != MIPI_DT_UNUSED ? csis->vc_resol[ch] : 0,
++			       csis->csis + CSIS_ISP_RESOL(ch));
++			if (ch && dt != MIPI_DT_UNUSED)
++				dev_info(csis->dev, "VC%u: data type 0x%02x, %ux%u, received and dropped\n",
++					 ch, dt, csis->vc_resol[ch] & 0xffff,
++					 csis->vc_resol[ch] >> 16);
++		}
++	}
++
++	writel(0, csis->dma + DMA_FMT);	/* unpacked 16 bit */
++	writel(width, csis->dma + DMA_RESOL);
++	writel(0, csis->dma + DMA_FCNTSEQ);
++	writel(0, csis->dma_cmn + DMA_OTF_FORMAT);	/* RAW10 */
++	e9820_rmw(csis->dma_cmn + DMA_DATA_CTRL, BIT(0), 0);	/* OTF input */
++	e9820_rmw(csis->dma_cmn + DMA_CMN_CTRL, DMA_CMN_CTRL_ABORT_REQ, 0);
++	writel(DMA_INT_ABORT_DONE, csis->dma_cmn + DMA_INT_SRC);
++	writel(DMA_INT_ENABLE, csis->dma_cmn + DMA_INT_MASK);
++
++	writel(0x6, csis->dma_top + DMATOP_ARB_PRI);
++	e9820_rmw(csis->dma_top + DMATOP_CTRL, DMATOP_CTRL_IP_PROCESSING,
++		  DMATOP_CTRL_IP_PROCESSING);
++	writel(0x04800480, csis->dma_top + DMATOP_SRAM_SPLIT);
++	e9820_rmw(csis->dma_top + DMATOP_MATRIX, 0x1f, 0);
++
++	enable_irq(csis->irq_csis);
++	enable_irq(csis->irq_dma);
++
++	spin_lock_irqsave(&csis->slock, flags);
++	csis->sequence = 0;
++	csis->n_fs = csis->n_fe = csis->n_err = 0;
++	csis->n_dma_start = csis->n_dma_end = csis->n_dma_err = 0;
++	csis->err0 = csis->err1 = 0;
++	csis->abort_frame = false;
++	csis->n_abort = 0;
++	csis->streaming = true;
++	csis->cur = NULL;
++	csis->next = e9820_csis_next_queued(csis);
++	e9820_csis_dma_arm(csis, csis->next);
++	spin_unlock_irqrestore(&csis->slock, flags);
++
++	/* csi_hw_enable() */
++	e9820_rmw(csis->csis + CSIS_CMN_CTRL, CSIS_CMN_CTRL_UPDATE_SHADOW,
++		  CSIS_CMN_CTRL_UPDATE_SHADOW);
++	e9820_rmw(csis->csis + CSIS_CMN_CTRL, CSIS_CMN_CTRL_PHY_SEL, 0);
++	e9820_rmw(csis->csis + CSIS_PHY_CMN_CTRL, CSIS_PHY_CMN_CTRL_ENABLE_CLK,
++		  CSIS_PHY_CMN_CTRL_ENABLE_CLK);
++	e9820_rmw(csis->csis + CSIS_CMN_CTRL, CSIS_CMN_CTRL_QCHANNEL_EN, 0);
++	e9820_rmw(csis->csis + CSIS_CMN_CTRL, CSIS_CMN_CTRL_CSI_EN,
++		  CSIS_CMN_CTRL_CSI_EN);
++
++	e9820_csis_dump(csis, "start");
++	if (e9820_csis_wedged)
++		e9820_csis_wedge_dump(csis, "start after wedge");
++	return 0;
++
++err_phy:
++	e9820_csis_phy_power(csis, false);
++err_clk:
++	clk_disable_unprepare(csis->bus_clk);
++err_rpm:
++	pm_runtime_put_sync(csis->dev);
++err_hold:
++	if (csis->held) {
++		exynos_acpm_dvfs_hold(false);
++		csis->held = false;
++	}
++err_active:
++	WRITE_ONCE(e9820_csis_active, NULL);
++	return ret;
++}
++
++static void e9820_csis_hw_stop(struct e9820_csis *csis)
++{
++	unsigned long flags;
++	bool wedged;
++	u32 val;
++
++	spin_lock_irqsave(&csis->slock, flags);
++	csis->streaming = false;
++	wedged = csis->n_dma_start > 2 && !csis->n_dma_end;
++	spin_unlock_irqrestore(&csis->slock, flags);
++
++	if (!wedged)
++		e9820_csis_dump(csis, "stop");
++	if (wedged) {
++		e9820_csis_wedge_dump(csis, "stop, wedged");
++		e9820_csis_wedges++;
++		dev_err(csis->dev, "DMA wedged: %u frames started, none ended (wedge %u since boot)\n",
++			csis->n_dma_start, e9820_csis_wedges);
++	} else if (csis->n_dma_end) {
++		if (e9820_csis_wedged)
++			dev_info(csis->dev, "DMA recovered after a wedge\n");
++		e9820_csis_wedged = false;
++	}
++	if (wedged)
++		e9820_csis_wedged = true;
++
++	/* csi_hw_disable() */
++	e9820_rmw(csis->csis + CSIS_PHY_CMN_CTRL,
++		  CSIS_PHY_CMN_CTRL_ENABLE_CLK | CSIS_PHY_CMN_CTRL_ENABLE_DAT, 0);
++	e9820_rmw(csis->csis + CSIS_CMN_CTRL, CSIS_CMN_CTRL_CSI_EN, 0);
++	e9820_csis_sw_reset(csis);
++
++	spin_lock_irqsave(&csis->slock, flags);
++	writel(0, csis->dma + DMA_CTRL);
++	spin_unlock_irqrestore(&csis->slock, flags);
++	/* let a frame in flight end before the block loses power */
++	msleep(40);
++	/* and terminate one that cannot end (a stream that only had errors) */
++	e9820_csis_dma_abort_sync(csis);
++
++	writel(0, csis->csis + CSIS_INT_MSK0);
++	writel(0, csis->csis + CSIS_INT_MSK1);
++	writel(0, csis->dma_cmn + DMA_INT_MASK);
++	disable_irq(csis->irq_csis);
++	disable_irq(csis->irq_dma);
++
++	dev_info(csis->dev, "stopped: FS %u FE %u errors %u, DMA start %u end %u errors %u, aborts %u\n",
++		 csis->n_fs, csis->n_fe, csis->n_err, csis->n_dma_start,
++		 csis->n_dma_end, csis->n_dma_err, csis->n_abort);
++	if (csis->n_err)
++		/* INT_SRC0: [19:16] SOT_HS [15:12] LOST_FS [11:8] LOST_FE [4] OVER [3] WRONG_CFG [2] ECC [1] CRC [0] ID */
++		dev_info(csis->dev, "error bits seen: INT_SRC0 0x%05x%s%s%s%s%s%s%s%s, INT_SRC1 0x%04x\n",
++			 csis->err0,
++			 csis->err0 & 0xf0000 ? " SOT_HS" : "",
++			 csis->err0 & 0x0f000 ? " LOST_FS" : "",
++			 csis->err0 & 0x00f00 ? " LOST_FE" : "",
++			 csis->err0 & BIT(4) ? " OVER" : "",
++			 csis->err0 & BIT(3) ? " WRONG_CFG" : "",
++			 csis->err0 & BIT(2) ? " ECC" : "",
++			 csis->err0 & BIT(1) ? " CRC" : "",
++			 csis->err0 & BIT(0) ? " ID" : "", csis->err1);
++
++	e9820_csis_phy_power(csis, false);
++
++	/*
++	 * Back to the state the block has after reset, which is known to
++	 * power off: with IP_PROCESSING left set the domain refused to
++	 * (STATUS stuck at 1). The vendor code never clears it, but it also
++	 * restores CMU Q-channel settings that we leave at reset values.
++	 */
++	e9820_rmw(csis->dma_top + DMATOP_CTRL, DMATOP_CTRL_IP_PROCESSING, 0);
++	e9820_rmw(csis->csis + CSIS_CMN_CTRL, CSIS_CMN_CTRL_QCHANNEL_EN, 0);
++	e9820_rmw(csis->cmu + CMU_BUS_USER_MUX, CMU_BUS_USER_MUX_SEL, 0);
++	readl_poll_timeout(csis->cmu + CMU_BUS_USER_MUX, val,
++			   !(val & CMU_BUS_USER_MUX_BUSY), 10, 1000);
++	dev_info(csis->dev, "idle: DMA top CTRL 0x%08x CSIS CMN_CTRL 0x%08x CMU user mux 0x%08x\n",
++		 readl(csis->dma_top + DMATOP_CTRL),
++		 readl(csis->csis + CSIS_CMN_CTRL),
++		 readl(csis->cmu + CMU_BUS_USER_MUX));
++
++	clk_disable_unprepare(csis->bus_clk);
++	pm_runtime_put_sync(csis->dev);
++
++	/* The domain has no other user: it must be off now. */
++	regmap_read(csis->pmu, PMU_ISPPRE_STATUS, &val);
++	if (val & 1) {
++		u32 states = 0;
++
++		regmap_read(csis->pmu, PMU_ISPPRE_STATES, &states);
++		csis->pd_stuck = true;
++		dev_err(csis->dev, "ISPPRE did not power off (STATUS 0x%x STATES 0x%x): no further streaming until reboot\n",
++			val, states);
++	}
++
++	if (csis->held) {
++		exynos_acpm_dvfs_hold(false);
++		csis->held = false;
++	}
++	WRITE_ONCE(e9820_csis_active, NULL);
++}
++
++/* -------------------------------------------------------------------------
++ * videobuf2
++ */
++
++static int e9820_csis_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
++				  unsigned int *nplanes, unsigned int sizes[],
++				  struct device *alloc_devs[])
++{
++	struct e9820_csis *csis = vb2_get_drv_priv(q);
++
++	if (*nplanes)
++		return sizes[0] < csis->fmt.sizeimage ? -EINVAL : 0;
++
++	*nplanes = 1;
++	sizes[0] = csis->fmt.sizeimage;
++	return 0;
++}
++
++static int e9820_csis_buf_prepare(struct vb2_buffer *vb)
++{
++	struct e9820_csis *csis = vb2_get_drv_priv(vb->vb2_queue);
++
++	if (vb2_plane_size(vb, 0) < csis->fmt.sizeimage)
++		return -EINVAL;
++	if (upper_32_bits(vb2_dma_contig_plane_dma_addr(vb, 0)))
++		return -EFAULT;
++	return 0;
++}
++
++static void e9820_csis_buf_queue(struct vb2_buffer *vb)
++{
++	struct e9820_csis *csis = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	struct e9820_csis_buffer *buf =
++		container_of(vbuf, struct e9820_csis_buffer, vb);
++	unsigned long flags;
++
++	spin_lock_irqsave(&csis->slock, flags);
++	if (csis->streaming && !csis->next) {
++		/* DMA idle or nothing set for the next frame: set it now */
++		csis->next = buf;
++		e9820_csis_dma_arm(csis, buf);
++	} else {
++		list_add_tail(&buf->list, &csis->queued);
++	}
++	spin_unlock_irqrestore(&csis->slock, flags);
++}
++
++static void e9820_csis_return_buffers(struct e9820_csis *csis,
++				      enum vb2_buffer_state state)
++{
++	struct e9820_csis_buffer *buf, *tmp;
++	unsigned long flags;
++
++	spin_lock_irqsave(&csis->slock, flags);
++	if (csis->cur)
++		vb2_buffer_done(&csis->cur->vb.vb2_buf, state);
++	if (csis->next)
++		vb2_buffer_done(&csis->next->vb.vb2_buf, state);
++	csis->cur = NULL;
++	csis->next = NULL;
++	list_for_each_entry_safe(buf, tmp, &csis->queued, list) {
++		list_del(&buf->list);
++		vb2_buffer_done(&buf->vb.vb2_buf, state);
++	}
++	spin_unlock_irqrestore(&csis->slock, flags);
++}
++
++static int e9820_csis_check_sensor(struct e9820_csis *csis)
++{
++	struct v4l2_subdev_format sfmt = {
++		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
++	};
++	const struct e9820_csis_format *f;
++	struct e9820_csis_source *src = NULL;
++	struct v4l2_mbus_frame_desc fd = { };
++	struct media_pad *pad;
++	unsigned int i;
++	s64 freq;
++	int ret;
++
++	/* the sensor whose link is enabled */
++	pad = media_pad_remote_pad_unique(&csis->pad);
++	if (IS_ERR(pad)) {
++		dev_err(csis->dev, "no sensor selected (exactly one link must be enabled): %ld\n",
++			PTR_ERR(pad));
++		return PTR_ERR(pad);
++	}
++	for (i = 0; i < csis->num_sources; i++)
++		if (csis->sources[i]->sd &&
++		    &csis->sources[i]->sd->entity == pad->entity)
++			src = csis->sources[i];
++	if (!src)
++		return -ENODEV;
++	csis->source = src;
++	csis->sensor = src->sd;
++	csis->bus = src->bus;
++	sfmt.pad = pad->index;
++
++	ret = v4l2_subdev_call_state_active(csis->sensor, pad, get_fmt, &sfmt);
++	if (ret)
++		return ret;
++
++	f = e9820_csis_find_fourcc(csis->fmt.pixelformat);
++	if (!f || f->mbus != sfmt.format.code ||
++	    sfmt.format.width != csis->fmt.width ||
++	    sfmt.format.height != csis->fmt.height) {
++		dev_err(csis->dev, "sensor outputs 0x%04x %ux%u, video node is set to %p4cc %ux%u\n",
++			sfmt.format.code, sfmt.format.width, sfmt.format.height,
++			&csis->fmt.pixelformat, csis->fmt.width, csis->fmt.height);
++		return -EPIPE;
++	}
++
++	freq = v4l2_get_link_freq(pad, 10, 2 * csis->bus.num_data_lanes);
++	if (freq < 0)
++		return freq;
++	csis->link_freq = freq;
++
++	/*
++	 * Other virtual channels of the sensor. Convention between the
++	 * drivers of this port: entry length = width | height << 16.
++	 */
++	memset(csis->vc_dt, 0, sizeof(csis->vc_dt));
++	if (!v4l2_subdev_call(csis->sensor, pad, get_frame_desc, pad->index,
++			      &fd) && fd.type == V4L2_MBUS_FRAME_DESC_TYPE_CSI2) {
++		for (i = 0; i < fd.num_entries; i++) {
++			u8 vc = fd.entry[i].bus.csi2.vc;
++
++			if (vc < 1 || vc > 3)
++				continue;
++			csis->vc_dt[vc] = fd.entry[i].bus.csi2.dt;
++			csis->vc_resol[vc] = (fd.entry[i].length >> 16) << 16 |
++					     (fd.entry[i].length & 0xffff);
++		}
++	}
++	return 0;
++}
++
++static int e9820_csis_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct e9820_csis *csis = vb2_get_drv_priv(q);
++	int ret;
++
++	ret = e9820_csis_check_sensor(csis);
++	if (ret)
++		goto err_buffers;
++
++	ret = video_device_pipeline_alloc_start(&csis->vdev);
++	if (ret)
++		goto err_buffers;
++
++	/* Receiver and PHY first, then the sensor, as the vendor driver. */
++	ret = e9820_csis_hw_start(csis);
++	if (ret)
++		goto err_pipeline;
++
++	ret = v4l2_subdev_call(csis->sensor, video, s_stream, 1);
++	if (ret) {
++		e9820_csis_hw_stop(csis);
++		goto err_pipeline;
++	}
++	return 0;
++
++err_pipeline:
++	video_device_pipeline_stop(&csis->vdev);
++err_buffers:
++	e9820_csis_return_buffers(csis, VB2_BUF_STATE_QUEUED);
++	return ret;
++}
++
++static void e9820_csis_stop_streaming(struct vb2_queue *q)
++{
++	struct e9820_csis *csis = vb2_get_drv_priv(q);
++
++	v4l2_subdev_call(csis->sensor, video, s_stream, 0);
++	e9820_csis_hw_stop(csis);
++	video_device_pipeline_stop(&csis->vdev);
++	e9820_csis_return_buffers(csis, VB2_BUF_STATE_ERROR);
++}
++
++static const struct vb2_ops e9820_csis_vb2_ops = {
++	.queue_setup = e9820_csis_queue_setup,
++	.buf_prepare = e9820_csis_buf_prepare,
++	.buf_queue = e9820_csis_buf_queue,
++	.start_streaming = e9820_csis_start_streaming,
++	.stop_streaming = e9820_csis_stop_streaming,
++};
++
++/* -------------------------------------------------------------------------
++ * V4L2 ioctls
++ */
++
++static void e9820_csis_fill_fmt(struct v4l2_pix_format *pix)
++{
++	if (!e9820_csis_find_fourcc(pix->pixelformat))
++		pix->pixelformat = e9820_csis_formats[0].fourcc;
++	pix->width = clamp(pix->width & ~1U, CSIS_MIN_WIDTH, CSIS_MAX_WIDTH);
++	pix->height = clamp(pix->height & ~1U, CSIS_MIN_WIDTH, CSIS_MAX_WIDTH);
++	pix->field = V4L2_FIELD_NONE;
++	pix->colorspace = V4L2_COLORSPACE_RAW;
++	pix->bytesperline = pix->width * 2;
++	/* The DMA has no height limit: one spare line */
++	pix->sizeimage = PAGE_ALIGN(pix->bytesperline * (pix->height + 1));
++}
++
++static int e9820_csis_querycap(struct file *file, void *fh,
++			       struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, "exynos9820-csis", sizeof(cap->driver));
++	strscpy(cap->card, "Exynos 9820 CSIS", sizeof(cap->card));
++	return 0;
++}
++
++static int e9820_csis_enum_fmt(struct file *file, void *fh,
++			       struct v4l2_fmtdesc *f)
++{
++	unsigned int i, n = 0;
++
++	for (i = 0; i < ARRAY_SIZE(e9820_csis_formats); i++) {
++		if (f->mbus_code && f->mbus_code != e9820_csis_formats[i].mbus)
++			continue;
++		if (n++ == f->index) {
++			f->pixelformat = e9820_csis_formats[i].fourcc;
++			return 0;
++		}
++	}
++	return -EINVAL;
++}
++
++static int e9820_csis_enum_framesizes(struct file *file, void *fh,
++				      struct v4l2_frmsizeenum *fsize)
++{
++	if (fsize->index || !e9820_csis_find_fourcc(fsize->pixel_format))
++		return -EINVAL;
++
++	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	fsize->stepwise.min_width = CSIS_MIN_WIDTH;
++	fsize->stepwise.max_width = CSIS_MAX_WIDTH;
++	fsize->stepwise.min_height = CSIS_MIN_WIDTH;
++	fsize->stepwise.max_height = CSIS_MAX_WIDTH;
++	fsize->stepwise.step_width = 2;
++	fsize->stepwise.step_height = 2;
++	return 0;
++}
++
++static int e9820_csis_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct e9820_csis *csis = video_drvdata(file);
++
++	f->fmt.pix = csis->fmt;
++	return 0;
++}
++
++static int e9820_csis_try_fmt(struct file *file, void *fh,
++			      struct v4l2_format *f)
++{
++	e9820_csis_fill_fmt(&f->fmt.pix);
++	return 0;
++}
++
++static int e9820_csis_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
++{
++	struct e9820_csis *csis = video_drvdata(file);
++
++	if (vb2_is_busy(&csis->queue))
++		return -EBUSY;
++	e9820_csis_fill_fmt(&f->fmt.pix);
++	csis->fmt = f->fmt.pix;
++	return 0;
++}
++
++static const struct v4l2_ioctl_ops e9820_csis_ioctl_ops = {
++	.vidioc_querycap = e9820_csis_querycap,
++	.vidioc_enum_fmt_vid_cap = e9820_csis_enum_fmt,
++	.vidioc_enum_framesizes = e9820_csis_enum_framesizes,
++	.vidioc_g_fmt_vid_cap = e9820_csis_g_fmt,
++	.vidioc_try_fmt_vid_cap = e9820_csis_try_fmt,
++	.vidioc_s_fmt_vid_cap = e9820_csis_s_fmt,
++	.vidioc_reqbufs = vb2_ioctl_reqbufs,
++	.vidioc_create_bufs = vb2_ioctl_create_bufs,
++	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
++	.vidioc_querybuf = vb2_ioctl_querybuf,
++	.vidioc_qbuf = vb2_ioctl_qbuf,
++	.vidioc_dqbuf = vb2_ioctl_dqbuf,
++	.vidioc_expbuf = vb2_ioctl_expbuf,
++	.vidioc_streamon = vb2_ioctl_streamon,
++	.vidioc_streamoff = vb2_ioctl_streamoff,
++};
++
++/*
++ * A lens actuator is bound by the notifier of its sensor, after (possibly
++ * long after) the sensor itself; this driver gets no callback for it, and
++ * the "complete" callback never runs on a receiver whose second sensor is
++ * absent. Create the device nodes of late sub-devices when the video node
++ * is opened.
++ */
++static int e9820_csis_open(struct file *file)
++{
++	struct e9820_csis *csis = video_drvdata(file);
++
++	mutex_lock(&csis->lock);
++	v4l2_device_register_subdev_nodes(&csis->v4l2_dev);
++	mutex_unlock(&csis->lock);
++
++	return v4l2_fh_open(file);
++}
++
++static const struct v4l2_file_operations e9820_csis_fops = {
++	.owner = THIS_MODULE,
++	.open = e9820_csis_open,
++	.release = vb2_fop_release,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = vb2_fop_mmap,
++	.poll = vb2_fop_poll,
++	.read = vb2_fop_read,
++};
++
++/* -------------------------------------------------------------------------
++ * Sensor binding
++ */
++
++static int e9820_csis_notify_bound(struct v4l2_async_notifier *notifier,
++				   struct v4l2_subdev *sd,
++				   struct v4l2_async_connection *asc)
++{
++	struct e9820_csis *csis =
++		container_of(notifier, struct e9820_csis, notifier);
++	struct e9820_csis_source *src =
++		container_of(asc, struct e9820_csis_source, asc);
++	u32 flags = MEDIA_LNK_FL_ENABLED | MEDIA_LNK_FL_IMMUTABLE;
++	unsigned int i;
++	int ret;
++
++	/*
++	 * Behind a MIPI switch: the first sensor that shows up is selected,
++	 * user space changes that with MEDIA_IOC_SETUP_LINK.
++	 */
++	if (csis->num_sources > 1) {
++		flags = MEDIA_LNK_FL_ENABLED;
++		for (i = 0; i < csis->num_sources; i++)
++			if (csis->sources[i]->sd)
++				flags = 0;
++	}
++	src->sd = sd;
++	if (!csis->sensor)
++		csis->sensor = sd;
++	ret = v4l2_create_fwnode_links_to_pad(sd, &csis->pad, flags);
++	if (ret)
++		return ret;
++	/*
++	 * Do not wait for the other sensor of a shared receiver: each one
++	 * is usable on its own (the complete callback only runs when all of
++	 * them are there).
++	 */
++	return v4l2_device_register_subdev_nodes(&csis->v4l2_dev);
++}
++
++static void e9820_csis_notify_unbind(struct v4l2_async_notifier *notifier,
++				     struct v4l2_subdev *sd,
++				     struct v4l2_async_connection *asc)
++{
++	struct e9820_csis *csis =
++		container_of(notifier, struct e9820_csis, notifier);
++	struct e9820_csis_source *src =
++		container_of(asc, struct e9820_csis_source, asc);
++
++	src->sd = NULL;
++	if (csis->sensor == sd)
++		csis->sensor = NULL;
++	if (csis->source == src)
++		csis->source = NULL;
++}
++
++static int e9820_csis_notify_complete(struct v4l2_async_notifier *notifier)
++{
++	struct e9820_csis *csis =
++		container_of(notifier, struct e9820_csis, notifier);
++
++	return v4l2_device_register_subdev_nodes(&csis->v4l2_dev);
++}
++
++static const struct v4l2_async_notifier_operations e9820_csis_notify_ops = {
++	.bound = e9820_csis_notify_bound,
++	.unbind = e9820_csis_notify_unbind,
++	.complete = e9820_csis_notify_complete,
++};
++
++static int e9820_csis_parse_endpoint(struct e9820_csis *csis)
++{
++	struct fwnode_handle *ep;
++	int ret;
++
++	v4l2_async_nf_init(&csis->notifier, &csis->v4l2_dev);
++	csis->notifier.ops = &e9820_csis_notify_ops;
++
++	fwnode_graph_for_each_endpoint(dev_fwnode(csis->dev), ep) {
++		struct v4l2_fwnode_endpoint vep = {
++			.bus_type = V4L2_MBUS_CSI2_DPHY,
++		};
++		struct e9820_csis_source *src;
++
++		if (csis->num_sources == CSIS_MAX_SOURCES) {
++			ret = dev_err_probe(csis->dev, -EINVAL,
++					    "too many endpoints\n");
++			goto err_put;
++		}
++
++		ret = v4l2_fwnode_endpoint_parse(ep, &vep);
++		if (ret) {
++			dev_err_probe(csis->dev, ret, "bad endpoint\n");
++			goto err_put;
++		}
++		if (vep.bus.mipi_csi2.num_data_lanes < 1 ||
++		    vep.bus.mipi_csi2.num_data_lanes > 4) {
++			ret = dev_err_probe(csis->dev, -EINVAL,
++					    "bad lane count\n");
++			goto err_put;
++		}
++
++		src = v4l2_async_nf_add_fwnode_remote(&csis->notifier, ep,
++						      struct e9820_csis_source);
++		if (IS_ERR(src)) {
++			ret = PTR_ERR(src);
++			goto err_put;
++		}
++		src->bus = vep.bus.mipi_csi2;
++		src->mux = vep.base.id;
++		csis->sources[csis->num_sources++] = src;
++	}
++
++	if (!csis->num_sources)
++		return dev_err_probe(csis->dev, -ENODEV, "no endpoint\n");
++	if (csis->num_sources > 1 && !csis->mux_gpio)
++		return dev_err_probe(csis->dev, -EINVAL,
++				     "several endpoints but no mux GPIO\n");
++	csis->bus = csis->sources[0]->bus;
++	return 0;
++
++err_put:
++	fwnode_handle_put(ep);
++	return ret;
++}
++
++/* -------------------------------------------------------------------------
++ * Probe
++ */
++
++static int e9820_csis_probe(struct platform_device *pdev)
++{
++	static const char * const names[] = {
++		"csis", "dma", "dma-common", "dma-top", "phy", "sysreg", "cmu",
++	};
++	struct device *dev = &pdev->dev;
++	void __iomem **maps[ARRAY_SIZE(names)];
++	struct e9820_csis *csis;
++	struct video_device *vdev;
++	struct vb2_queue *q;
++	unsigned int i;
++	int ret;
++
++	csis = devm_kzalloc(dev, sizeof(*csis), GFP_KERNEL);
++	if (!csis)
++		return -ENOMEM;
++
++	if (!e9820_cmu_top) {
++		struct device_node *np =
++			of_find_compatible_node(NULL, NULL, "samsung,exynos9820-cmu-top");
++
++		if (np) {
++			e9820_cmu_top = of_iomap(np, 0);
++			of_node_put(np);
++		}
++	}
++	/* not requested and not accessed */
++	csis->sysmmu = devm_ioremap(dev, SYSMMU_ISPPRE_BASE, SYSMMU_ISPPRE_SIZE);
++	csis->dev = dev;
++	platform_set_drvdata(pdev, csis);
++	mutex_init(&csis->lock);
++	spin_lock_init(&csis->slock);
++	INIT_LIST_HEAD(&csis->queued);
++
++	maps[0] = &csis->csis;
++	maps[1] = &csis->dma;
++	maps[2] = &csis->dma_cmn;
++	maps[3] = &csis->dma_top;
++	maps[4] = &csis->phy;
++	maps[5] = &csis->sysreg;
++	maps[6] = &csis->cmu;
++	/*
++	 * Several of these ranges are shared with the other receivers
++	 * (DMA top, SYSREG, CMU), so they are mapped without being claimed.
++	 * Nothing is read here: the ISPPRE blocks are powered off.
++	 */
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		struct resource *res;
++
++		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
++						   names[i]);
++		if (!res)
++			return dev_err_probe(dev, -EINVAL, "no %s reg\n",
++					     names[i]);
++		/* the CMU range in the first DT was too short for the Q-channel registers */
++		*maps[i] = devm_ioremap(dev, res->start,
++					maps[i] == &csis->cmu ?
++					max_t(resource_size_t, CMU_MAP_SIZE,
++					      resource_size(res)) :
++					resource_size(res));
++		if (!*maps[i])
++			return -ENOMEM;
++	}
++
++	csis->pmu = exynos_get_pmu_regmap_by_phandle(dev->of_node,
++						     "samsung,pmu-syscon");
++	if (IS_ERR(csis->pmu))
++		return dev_err_probe(dev, PTR_ERR(csis->pmu), "no PMU regmap\n");
++	if (of_property_read_u32(dev->of_node, "samsung,phy-isolation-offset",
++				 &csis->phy_iso_offset) ||
++	    of_property_read_u32(dev->of_node, "samsung,phy-reset-bit",
++				 &csis->phy_reset_bit) ||
++	    of_property_read_u32(dev->of_node, "samsung,dma-index",
++				 &csis->dma_index) || csis->dma_index > 3)
++		return dev_err_probe(dev, -EINVAL, "PHY/DMA properties missing\n");
++
++	csis->phy_combo = of_property_read_bool(dev->of_node,
++						"samsung,phy-combo");
++	csis->phy_iso_shared = of_property_read_bool(dev->of_node,
++					"samsung,phy-isolation-shared");
++	csis->phy_split = of_property_read_bool(dev->of_node,
++						"samsung,phy-split");
++	if (csis->phy_split) {
++		struct resource *res;
++
++		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "phy");
++		if (resource_size(res) < 0x600)
++			return dev_err_probe(dev, -EINVAL,
++					     "split PHY needs 0x600 bytes of registers (clock lane at 0x500)\n");
++	}
++
++	/* MIPI switch in front of the receiver; left as it is until a stream */
++	csis->mux_gpio = devm_gpiod_get_optional(dev, "mux", GPIOD_ASIS);
++	if (IS_ERR(csis->mux_gpio))
++		return dev_err_probe(dev, PTR_ERR(csis->mux_gpio),
++				     "cannot get the mux GPIO\n");
++
++	csis->bus_clk = devm_clk_get(dev, "bus");
++	if (IS_ERR(csis->bus_clk))
++		return dev_err_probe(dev, PTR_ERR(csis->bus_clk), "no bus clock\n");
++
++	csis->irq_csis = platform_get_irq_byname(pdev, "csis");
++	if (csis->irq_csis < 0)
++		return csis->irq_csis;
++	csis->irq_dma = platform_get_irq_byname(pdev, "dma");
++	if (csis->irq_dma < 0)
++		return csis->irq_dma;
++
++	/* The DMA address registers are 32 bit and no IOMMU is used. */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	/*
++	 * The handlers read registers of a block that is powered off outside
++	 * streaming, so the lines are only enabled while it is on.
++	 */
++	ret = devm_request_irq(dev, csis->irq_csis, e9820_csis_irq,
++			       IRQF_NO_AUTOEN, "exynos9820-csis", csis);
++	if (!ret)
++		ret = devm_request_irq(dev, csis->irq_dma, e9820_csis_dma_irq,
++				       IRQF_NO_AUTOEN, "exynos9820-csis-dma",
++				       csis);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot request interrupts\n");
++
++	pm_runtime_enable(dev);
++
++	csis->mdev.dev = dev;
++	strscpy(csis->mdev.model, "exynos9820-csis", sizeof(csis->mdev.model));
++	media_device_init(&csis->mdev);
++	csis->v4l2_dev.mdev = &csis->mdev;
++	ret = v4l2_device_register(dev, &csis->v4l2_dev);
++	if (ret)
++		goto err_mdev;
++
++	csis->fmt.pixelformat = e9820_csis_formats[0].fourcc;
++	csis->fmt.width = 2304;
++	csis->fmt.height = 1728;
++	e9820_csis_fill_fmt(&csis->fmt);
++
++	q = &csis->queue;
++	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	q->io_modes = VB2_MMAP | VB2_DMABUF | VB2_READ;
++	q->drv_priv = csis;
++	q->buf_struct_size = sizeof(struct e9820_csis_buffer);
++	q->ops = &e9820_csis_vb2_ops;
++	q->mem_ops = &vb2_dma_contig_memops;
++	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
++	q->min_queued_buffers = 1;
++	q->lock = &csis->lock;
++	q->dev = dev;
++	ret = vb2_queue_init(q);
++	if (ret)
++		goto err_v4l2;
++
++	vdev = &csis->vdev;
++	snprintf(vdev->name, sizeof(vdev->name), "csis %s", dev_name(dev));
++	vdev->fops = &e9820_csis_fops;
++	vdev->ioctl_ops = &e9820_csis_ioctl_ops;
++	vdev->release = video_device_release_empty;
++	vdev->v4l2_dev = &csis->v4l2_dev;
++	vdev->queue = q;
++	vdev->lock = &csis->lock;
++	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
++			    V4L2_CAP_READWRITE | V4L2_CAP_IO_MC;
++	video_set_drvdata(vdev, csis);
++
++	csis->pad.flags = MEDIA_PAD_FL_SINK;
++	ret = media_entity_pads_init(&vdev->entity, 1, &csis->pad);
++	if (ret)
++		goto err_v4l2;
++
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		goto err_v4l2;
++
++	ret = e9820_csis_parse_endpoint(csis);
++	if (ret)
++		goto err_nf;
++	ret = v4l2_async_nf_register(&csis->notifier);
++	if (ret)
++		goto err_nf;
++
++	ret = media_device_register(&csis->mdev);
++	if (ret)
++		goto err_nf_unreg;
++
++	return 0;
++
++err_nf_unreg:
++	v4l2_async_nf_unregister(&csis->notifier);
++err_nf:
++	v4l2_async_nf_cleanup(&csis->notifier);
++err_video:
++	video_unregister_device(vdev);
++err_v4l2:
++	v4l2_device_unregister(&csis->v4l2_dev);
++err_mdev:
++	media_device_cleanup(&csis->mdev);
++	pm_runtime_disable(dev);
++	return ret;
++}
++
++static void e9820_csis_remove(struct platform_device *pdev)
++{
++	struct e9820_csis *csis = platform_get_drvdata(pdev);
++
++	media_device_unregister(&csis->mdev);
++	v4l2_async_nf_unregister(&csis->notifier);
++	v4l2_async_nf_cleanup(&csis->notifier);
++	video_unregister_device(&csis->vdev);
++	v4l2_device_unregister(&csis->v4l2_dev);
++	media_device_cleanup(&csis->mdev);
++	pm_runtime_disable(&pdev->dev);
++}
++
++/*
++ * A stream keeps the ISPPRE domain, the PHY and the bus levels up; none of
++ * that survives system sleep, and the sensor would lose power under the
++ * receiver. Stop the stream first.
++ */
++static int e9820_csis_suspend(struct device *dev)
++{
++	struct e9820_csis *csis = dev_get_drvdata(dev);
++
++	if (READ_ONCE(e9820_csis_active) == csis) {
++		dev_warn(dev, "streaming: refusing system suspend\n");
++		return -EBUSY;
++	}
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(e9820_csis_pm_ops, e9820_csis_suspend, NULL);
++
++static const struct of_device_id e9820_csis_of_match[] = {
++	{ .compatible = "samsung,exynos9820-csis" },
++	{ }
++};
++/*
++ * No MODULE_DEVICE_TABLE during bring-up: the module is loaded by hand, so
++ * that a boot never depends on it.
++ */
++
++static struct platform_driver e9820_csis_driver = {
++	.driver = {
++		.name = "exynos9820-csis",
++		.pm = pm_sleep_ptr(&e9820_csis_pm_ops),
++		.of_match_table = e9820_csis_of_match,
++	},
++	.probe = e9820_csis_probe,
++	.remove = e9820_csis_remove,
++};
++module_platform_driver(e9820_csis_driver);
++
++MODULE_DESCRIPTION("Samsung Exynos 9820 MIPI CSIS RAW capture driver");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,51 @@
+From 7fc0973ffcc8338d476bf5f881fe5115ee7577ff Mon Sep 17 00:00:00 2001
+From: chiffathefox <chiffathefoxx@gmail.com>
+Date: Sun, 26 Jul 2026 15:58:38 +0300
+Subject: [PATCH 40/46] clk: exynos9820: add an empty CPUCL2 block
+
+These clocks probably will never be used by any consumers and can be left out. The main point of this block is to match the DRCG_EN downstream register values for this block
+
+(cherry picked from commit 8d10fa2bac0d4d7cf4c1eb80d689b56d9a0b8acd)
+---
+ drivers/clk/samsung/clk-exynos9820.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/drivers/clk/samsung/clk-exynos9820.c b/drivers/clk/samsung/clk-exynos9820.c
+index bbd6fce085..4f7069b0a9 100644
+--- a/drivers/clk/samsung/clk-exynos9820.c
++++ b/drivers/clk/samsung/clk-exynos9820.c
+@@ -2960,6 +2960,24 @@ static const struct samsung_cmu_info cpucl0_cmu_info __initconst = {
+ 	.memclk_offset		= EXYNOS9820_MEMCLK_OFFSET,
+ };
+ 
++/*
++ * Register offsets for CMU_CPUCL2 (0x1d120000)
++ */
++#define CPUCL2_CMU_CPUCL2_CONTROLLER_OPTION		0x0800
++
++static const unsigned long cpucl2_clk_regs[] __initconst = {
++	CPUCL2_CMU_CPUCL2_CONTROLLER_OPTION,
++};
++
++static const struct samsung_cmu_info cpucl2_cmu_info __initconst = {
++	.clk_regs		= cpucl2_clk_regs,
++	.nr_clk_regs		= ARRAY_SIZE(cpucl2_clk_regs),
++	.auto_clock_gate	= true,
++	.gate_dbg_offset	= EXYNOS9820_GATE_DBG_OFFSET,
++	.option_offset		= CPUCL2_CMU_CPUCL2_CONTROLLER_OPTION,
++	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
++};
++
+ static int __init exynos9820_cmu_probe(struct platform_device *pdev)
+ {
+ 	const struct samsung_cmu_info *info;
+@@ -2996,6 +3014,9 @@ static const struct of_device_id exynos9820_cmu_of_match[] = {
+ 	}, {
+ 		.compatible = "samsung,exynos9820-cmu-cpucl0",
+ 		.data = &cpucl0_cmu_info,
++	}, {
++		.compatible = "samsung,exynos9820-cmu-cpucl2",
++		.data = &cpucl2_cmu_info,
+ 	}, {
+ 	},
+ };

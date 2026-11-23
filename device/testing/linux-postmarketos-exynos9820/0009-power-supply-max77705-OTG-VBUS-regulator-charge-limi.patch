@@ -1,0 +1,404 @@
+From e5d0df3c2f1ef378bebb0407f1d700a7fd1e8e11 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] power: supply: max77705: OTG VBUS regulator, charge limits,
+ AICL loop fix
+
+MAX77705 charger (Galaxy S10 family):
+
+ - The CHGIN reverse boost is registered as the "usb-otg-vbus"
+   regulator, so that the Type-C driver can switch VBUS for the host
+   role. The OTG current limit is 900 mA at probe and follows the
+   consumer's regulator_set_current_limit().
+ - CONSTANT_CHARGE_VOLTAGE is writable (4.0 V .. battery
+   voltage-max-design): lowering the float voltage caps the state of
+   charge of a phone that stays plugged in.
+ - CHARGE_BEHAVIOUR property (auto / inhibit-charge); inhibit keeps the
+   buck on and the charger off.
+ - With wakeup-source in the DT node the CHGIN interrupt is the
+   device's wake IRQ, so plugging or unplugging the charger wakes the
+   system.
+ - The AICL interrupt handler lowered CHGIN_LIM in a loop until AICL_OK
+   returned. Without a charger input (the phone sourcing VBUS) that
+   never happens: the limit wrapped and the shared MAX77705 threaded
+   irq slept forever. Step down only while CHGIN is valid, stop at the
+   minimum and after at most 8 steps.
+ - mfd: the charger cell is dropped. The charger has its own I2C
+   address and is a separate I2C device; the cell never matched
+   anything and only logged an error at boot.
+
+The binding change (usb-otg-vbus) is part of this commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ .../bindings/power/supply/maxim,max77705.yaml |   7 +
+ drivers/mfd/max77705.c                        |   1 -
+ drivers/power/supply/max77705_charger.c       | 218 ++++++++++++++++--
+ include/linux/power/max77705_charger.h        |   1 +
+ 4 files changed, 213 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/power/supply/maxim,max77705.yaml b/Documentation/devicetree/bindings/power/supply/maxim,max77705.yaml
+index e3b8406899..0ee31a7e8e 100644
+--- a/Documentation/devicetree/bindings/power/supply/maxim,max77705.yaml
++++ b/Documentation/devicetree/bindings/power/supply/maxim,max77705.yaml
+@@ -25,6 +25,13 @@ properties:
+   reg:
+     maxItems: 1
+ 
++  usb-otg-vbus:
++    type: object
++    $ref: /schemas/regulator/regulator.yaml#
++    unevaluatedProperties: false
++    description:
++      CHGIN OTG boost converter, supplies 5 V VBUS for USB host mode.
++
+ required:
+   - compatible
+   - reg
+diff --git a/drivers/mfd/max77705.c b/drivers/mfd/max77705.c
+index 2113ce5c62..8032a9a0e4 100644
+--- a/drivers/mfd/max77705.c
++++ b/drivers/mfd/max77705.c
+@@ -17,7 +17,6 @@
+ 
+ static struct mfd_cell max77705_devs[] = {
+ 	MFD_CELL_OF("max77705-rgb", NULL, NULL, 0, 0, "maxim,max77705-rgb"),
+-	MFD_CELL_OF("max77705-charger", NULL, NULL, 0, 0, "maxim,max77705-charger"),
+ 	MFD_CELL_OF("max77705-haptic", NULL, NULL, 0, 0, "maxim,max77705-haptic"),
+ };
+ 
+diff --git a/drivers/power/supply/max77705_charger.c b/drivers/power/supply/max77705_charger.c
+index ca9ad041f1..0facde5e43 100644
+--- a/drivers/power/supply/max77705_charger.c
++++ b/drivers/power/supply/max77705_charger.c
+@@ -14,9 +14,28 @@
+ #include <linux/mfd/max77705-private.h>
+ #include <linux/power/max77705_charger.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_wakeirq.h>
+ #include <linux/power_supply.h>
+ #include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++
++/* CNFG_02 OTG_ILIM steps */
++static const unsigned int max77705_otg_ilim_ua[] = { 500000, 900000, 1200000, 1500000 };
++
++/* OTG (VBUS boost) current limit in uA set at probe */
++#define MAX77705_OTG_ILIM_PROBE_UA	900000
++
++static unsigned int max77705_otg_ilim_sel(unsigned int ua)
++{
++	unsigned int i;
++
++	for (i = ARRAY_SIZE(max77705_otg_ilim_ua) - 1; i > 0; i--)
++		if (ua >= max77705_otg_ilim_ua[i])
++			break;
++	return i;
++}
+ 
+ static const char *max77705_charger_model		= "max77705";
+ static const char *max77705_charger_manufacturer	= "Maxim Integrated";
+@@ -38,36 +57,48 @@ static enum power_supply_property max77705_charger_props[] = {
+ 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
+ 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
+ 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+ };
+ 
++/* Upper bound for one AICL handler run: 8 steps x AICL_WORK_DELAY_MS. */
++#define MAX77705_AICL_MAX_STEPS	8
++
+ static irqreturn_t max77705_aicl_irq(int irq, void *irq_drv_data)
+ {
+ 	struct max77705_charger_data *chg = irq_drv_data;
+ 	unsigned int regval, irq_status;
+-	int err;
++	int err, steps = 0;
+ 
+ 	err = regmap_read(chg->regmap, MAX77705_CHG_REG_INT_OK, &irq_status);
+ 	if (err < 0)
+ 		return IRQ_HANDLED;
+ 
+-	// irq is fiered at the end of current decrease sequence too
+-	// early check AICL_I bit to guard against that excess irq call
+-	while (!(irq_status & BIT(MAX77705_AICL_I))) {
++	/*
++	 * The irq also fires at the end of a current decrease sequence, so
++	 * check AICL_OK first. Step the input current limit down until AICL
++	 * reports OK again, but only while a charger input is present, never
++	 * below the minimum and for a bounded time: without CHGIN (e.g. while
++	 * the phone sources VBUS in OTG mode) AICL_OK never returns and an
++	 * unbounded loop would wrap the limit field around and block the
++	 * shared MAX77705 irq thread forever.
++	 */
++	while (!(irq_status & MAX77705_AICL_OK) &&
++	       (irq_status & MAX77705_CHGIN_OK) &&
++	       steps++ < MAX77705_AICL_MAX_STEPS) {
+ 		err = regmap_field_read(chg->rfield[MAX77705_CHG_CHGIN_LIM], &regval);
+-		if (err < 0)
+-			return IRQ_HANDLED;
+-
+-		regval--;
++		if (err < 0 || regval == 0)
++			break;
+ 
+-		err = regmap_field_write(chg->rfield[MAX77705_CHG_CHGIN_LIM], regval);
++		err = regmap_field_write(chg->rfield[MAX77705_CHG_CHGIN_LIM],
++					 regval - 1);
+ 		if (err < 0)
+-			return IRQ_HANDLED;
++			break;
+ 
+ 		msleep(AICL_WORK_DELAY_MS);
+ 
+ 		err = regmap_read(chg->regmap, MAX77705_CHG_REG_INT_OK, &irq_status);
+ 		if (err < 0)
+-			return IRQ_HANDLED;
++			break;
+ 	}
+ 
+ 	return IRQ_HANDLED;
+@@ -388,6 +419,58 @@ static int max77705_get_float_voltage(struct max77705_charger_data *chg,
+ 	return 0;
+ }
+ 
++/*
++ * "inhibit-charge": keep the buck converter on (the system still runs from
++ * the charger input) but switch the battery charger off, like the
++ * downstream SEC_BAT_CHG_MODE_CHARGING_OFF (CNFG_00 MODE 0x5 -> 0x4).
++ * Modes that involve the boost/OTG path are left alone.
++ */
++static int max77705_get_charge_behaviour(struct max77705_charger_data *chg,
++					 int *val)
++{
++	unsigned int mode;
++	int ret;
++
++	ret = regmap_field_read(chg->rfield[MAX77705_MODE], &mode);
++	if (ret)
++		return ret;
++
++	if (mode == MAX77705_BUCK_MASK)
++		*val = POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++	else
++		*val = POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++
++	return 0;
++}
++
++static int max77705_set_charge_behaviour(struct max77705_charger_data *chg,
++					 int val)
++{
++	unsigned int mode, new;
++	int ret;
++
++	ret = regmap_field_read(chg->rfield[MAX77705_MODE], &mode);
++	if (ret)
++		return ret;
++
++	switch (val) {
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
++		if (mode != MAX77705_BUCK_MASK)
++			return 0;
++		new = MAX77705_CHG_MASK | MAX77705_BUCK_MASK;
++		break;
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
++		if (mode != (MAX77705_CHG_MASK | MAX77705_BUCK_MASK))
++			return mode == MAX77705_BUCK_MASK ? 0 : -EBUSY;
++		new = MAX77705_BUCK_MASK;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return regmap_field_write(chg->rfield[MAX77705_MODE], new);
++}
++
+ static int max77705_chg_get_property(struct power_supply *psy,
+ 					enum power_supply_property psp,
+ 					union power_supply_propval *val)
+@@ -415,6 +498,8 @@ static int max77705_chg_get_property(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
+ 		val->intval = chg->bat_info->voltage_max_design_uv;
+ 		break;
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		return max77705_get_charge_behaviour(chg, &val->intval);
+ 	case POWER_SUPPLY_PROP_MODEL_NAME:
+ 		val->strval = max77705_charger_model;
+ 		break;
+@@ -449,6 +534,21 @@ static int max77705_set_property(struct power_supply *psy,
+ 					   MAX77705_CURRENT_CHGIN_STEP,
+ 					   val->intval);
+ 		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
++		/*
++		 * Lowering the float voltage is the hardware way to cap the
++		 * state of charge (e.g. 4.1 V is roughly 85 %). Never allow
++		 * more than the battery's design voltage.
++		 */
++		if (val->intval < 4000000 ||
++		    (chg->bat_info->voltage_max_design_uv > 0 &&
++		     val->intval > chg->bat_info->voltage_max_design_uv))
++			return -EINVAL;
++		err = max77705_set_float_voltage(chg, val->intval);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		err = max77705_set_charge_behaviour(chg, val->intval);
++		break;
+ 	default:
+ 		err = -EINVAL;
+ 	}
+@@ -462,6 +562,8 @@ static int max77705_property_is_writeable(struct power_supply *psy,
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+ 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -474,6 +576,8 @@ static const struct power_supply_desc max77705_charger_psy_desc = {
+ 	.properties = max77705_charger_props,
+ 	.property_is_writeable = max77705_property_is_writeable,
+ 	.num_properties = ARRAY_SIZE(max77705_charger_props),
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
+ 	.get_property = max77705_chg_get_property,
+ 	.set_property = max77705_set_property,
+ };
+@@ -530,7 +634,8 @@ static int max77705_charger_initialize(struct max77705_charger_data *chg)
+ 
+ 	/* charge current 450mA(default) */
+ 	/* otg current limit 900mA */
+-	err = regmap_field_write(chg->rfield[MAX77705_OTG_ILIM], MAX77705_OTG_ILIM_900);
++	err = regmap_field_write(chg->rfield[MAX77705_OTG_ILIM],
++				 max77705_otg_ilim_sel(MAX77705_OTG_ILIM_PROBE_UA));
+ 	if (err)
+ 		goto err;
+ 
+@@ -596,6 +701,69 @@ static int max77705_charger_initialize(struct max77705_charger_data *chg)
+ 
+ }
+ 
++/*
++ * CHGIN OTG boost: 5 V on VBUS for USB host mode. Enabled by setting the
++ * OTG and BOOST bits of the CNFG_00 mode field (mode 0x5 -> 0xf), like the
++ * downstream max77705_set_otg(). The OTG current limit (CNFG_02 OTG_ILIM,
++ * 500/900/1200/1500 mA; 900 mA) is set at probe and
++ * can be changed by the consumer through regulator_set_current_limit()
++ * when the DT node has regulator-min/max-microamp.
++ */
++static const struct regulator_ops max77705_otg_vbus_ops = {
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++	.set_current_limit = regulator_set_current_limit_regmap,
++	.get_current_limit = regulator_get_current_limit_regmap,
++};
++
++static const struct regulator_desc max77705_otg_vbus_desc = {
++	.name = "max77705-otg-vbus",
++	.of_match = "usb-otg-vbus",
++	.ops = &max77705_otg_vbus_ops,
++	.type = REGULATOR_VOLTAGE,
++	.owner = THIS_MODULE,
++	.n_voltages = 1,
++	.fixed_uV = 5000000,
++	.enable_reg = MAX77705_CHG_REG_CNFG_00,
++	.enable_mask = MAX77705_OTG_CTRL,
++	.enable_val = MAX77705_OTG_CTRL,
++	.disable_val = 0,
++	.enable_time = 20000,
++	.curr_table = max77705_otg_ilim_ua,
++	.n_current_limits = ARRAY_SIZE(max77705_otg_ilim_ua),
++	.csel_reg = MAX77705_CHG_REG_CNFG_02,
++	.csel_mask = MAX77705_OTG_ILIM_MASK,
++};
++
++static int max77705_charger_register_otg(struct max77705_charger_data *chg)
++{
++	struct regulator_config cfg = {};
++	struct regulator_dev *rdev;
++	struct device_node *np;
++
++	np = of_get_child_by_name(chg->dev->of_node, "usb-otg-vbus");
++	if (!np)
++		return 0;
++	of_node_put(np);
++
++	cfg.dev = chg->dev;
++	cfg.regmap = chg->regmap;
++	cfg.driver_data = chg;
++	rdev = devm_regulator_register(chg->dev, &max77705_otg_vbus_desc, &cfg);
++	if (IS_ERR(rdev))
++		return dev_err_probe(chg->dev, PTR_ERR(rdev),
++				     "failed to register OTG VBUS regulator\n");
++
++	/*
++	 * The regulator core applies the DT current range at registration
++	 * (it picks the maximum); keep the probe-time limit until a consumer
++	 * asks for more.
++	 */
++	return regmap_field_write(chg->rfield[MAX77705_OTG_ILIM],
++				  max77705_otg_ilim_sel(MAX77705_OTG_ILIM_PROBE_UA));
++}
++
+ static int max77705_charger_probe(struct i2c_client *i2c)
+ {
+ 	struct power_supply_config pscfg = {};
+@@ -665,6 +833,26 @@ static int max77705_charger_probe(struct i2c_client *i2c)
+ 	if (ret)
+ 		return ret;
+ 
++	/* Charger plug/unplug wakes the system when the DT asks for it. */
++	if (device_property_read_bool(dev, "wakeup-source")) {
++		ret = devm_device_init_wakeup(dev);
++		if (ret)
++			return dev_err_probe(dev, ret, "failed to init wakeup\n");
++
++		/*
++		 * For a "wakeup-source" client the I2C core has already made the
++		 * MAX77705's own interrupt line (the parent of CHGIN_I) the wake
++		 * IRQ; attaching a second one only triggers the WARN in
++		 * dev_pm_attach_wake_irq().
++		 */
++		if (!dev->power.wakeirq) {
++			ret = devm_pm_set_wake_irq(dev, regmap_irq_get_virq(irq_data,
++									     MAX77705_CHGIN_I));
++			if (ret)
++				return dev_err_probe(dev, ret, "failed to set wake irq\n");
++		}
++	}
++
+ 	ret = devm_request_threaded_irq(dev, regmap_irq_get_virq(irq_data, MAX77705_AICL_I),
+ 					NULL, max77705_aicl_irq,
+ 					IRQF_TRIGGER_NONE,
+@@ -676,7 +864,11 @@ static int max77705_charger_probe(struct i2c_client *i2c)
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to enable charge\n");
+ 
+-	return devm_add_action_or_reset(dev, max77705_charger_disable, chg);
++	ret = devm_add_action_or_reset(dev, max77705_charger_disable, chg);
++	if (ret)
++		return ret;
++
++	return max77705_charger_register_otg(chg);
+ }
+ 
+ static const struct of_device_id max77705_charger_of_match[] = {
+diff --git a/include/linux/power/max77705_charger.h b/include/linux/power/max77705_charger.h
+index b3950ce062..95622a568c 100644
+--- a/include/linux/power/max77705_charger.h
++++ b/include/linux/power/max77705_charger.h
+@@ -76,6 +76,7 @@
+ #define MAX77705_OTG_ILIM_900		1
+ #define MAX77705_OTG_ILIM_1200		2
+ #define MAX77705_OTG_ILIM_1500		3
++#define MAX77705_OTG_ILIM_MASK		GENMASK(7, 6)
+ 
+ /* MAX77705_CHG_REG_CNFG_03 */
+ #define MAX77705_TO_ITH_150MA		0

@@ -1,0 +1,254 @@
+From 00f1599cb4695911d2d6ee09d2a82d8e2c1d6ecb Mon Sep 17 00:00:00 2001
+From: Tudor Ambarus <tudor.ambarus@linaro.org>
+Date: Wed, 3 Jun 2026 13:00:19 +0000
+Subject: [PATCH 23/46] arm64: dts: exynos: gs101: Add thermal management unit
+
+Add the Thermal Management Unit (TMU) support for the Google GS101 SoC.
+
+Describe the TMU using a consolidated SoC node that includes memory
+resources for interrupt identification and a phandle to the ACPM IPC
+interface for functional control.
+
+Define thermal zones for the little, mid, and big CPU clusters, including
+associated trip points and cooling-device maps to enable thermal
+mitigation.
+
+Signed-off-by: Tudor Ambarus <tudor.ambarus@linaro.org>
+(cherry picked from commit 6579e621a8127bacdfa9d76181b63a7fcf20c962)
+---
+ .../boot/dts/exynos/google/gs101-tmu.dtsi     | 136 ++++++++++++++++++
+ arch/arm64/boot/dts/exynos/google/gs101.dtsi  |  18 +++
+ 2 files changed, 154 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/exynos/google/gs101-tmu.dtsi
+
+diff --git a/arch/arm64/boot/dts/exynos/google/gs101-tmu.dtsi b/arch/arm64/boot/dts/exynos/google/gs101-tmu.dtsi
+new file mode 100644
+index 0000000000..b27d1a539e
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/google/gs101-tmu.dtsi
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Google GS101 TMU configurations device tree source
++ *
++ * Copyright 2020 Samsung Electronics Co., Ltd.
++ * Copyright 2020 Google LLC.
++ * Copyright 2026 Linaro Ltd.
++ */
++
++#include <dt-bindings/thermal/thermal.h>
++
++/ {
++	thermal-zones {
++		cpucl2-thermal {
++			polling-delay-passive = <0>;
++			polling-delay = <0>;
++			thermal-sensors = <&tmu_top 0>;
++
++			trips {
++				big_switch_on: big-switch-on {
++					temperature = <80000>;
++					hysteresis = <2000>;
++					type = "passive";
++				};
++
++				big_mitigate: big-mitigate {
++					temperature = <90000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++
++				big_hot: big-hot {
++					temperature = <100000>;
++					hysteresis = <5000>;
++					type = "hot";
++				};
++
++				big_critical: big-critical {
++					temperature = <105000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&big_mitigate>;
++					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++
++		cpucl1-thermal {
++			polling-delay-passive = <0>;
++			polling-delay = <0>;
++			thermal-sensors = <&tmu_top 1>;
++
++			trips {
++				mid_switch_on: mid-switch-on {
++					temperature = <80000>;
++					hysteresis = <2000>;
++					type = "passive";
++				};
++
++				mid_mitigate: mid-mitigate {
++					temperature = <90000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++
++				mid_hot: mid-hot {
++					temperature = <100000>;
++					hysteresis = <5000>;
++					type = "hot";
++				};
++
++				mid_critical: mid-critical {
++					temperature = <105000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++				     trip = <&mid_mitigate>;
++					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++			       };
++			};
++		};
++
++		cpucl0-thermal {
++			polling-delay-passive = <0>;
++			polling-delay = <0>;
++			thermal-sensors = <&tmu_top 2>;
++
++			trips {
++				little_switch_on: little-switch-on {
++					temperature = <80000>;
++					hysteresis = <2000>;
++					type = "passive";
++				};
++
++				little_mitigate: little-mitigate {
++					temperature = <90000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++
++				little_hot: little-hot {
++					temperature = <100000>;
++					hysteresis = <5000>;
++					type = "hot";
++				};
++
++				little_critical: little-critical {
++					temperature = <105000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&little_mitigate>;
++					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++	};
++};
+diff --git a/arch/arm64/boot/dts/exynos/google/gs101.dtsi b/arch/arm64/boot/dts/exynos/google/gs101.dtsi
+index b218ff50d2..3ca0c804fe 100644
+--- a/arch/arm64/boot/dts/exynos/google/gs101.dtsi
++++ b/arch/arm64/boot/dts/exynos/google/gs101.dtsi
+@@ -91,6 +91,7 @@ cpu0: cpu@0 {
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x0000>;
+ 			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL0>;
++			#cooling-cells = <2>;
+ 			enable-method = "psci";
+ 			cpu-idle-states = <&ananke_cpu_sleep>;
+ 			capacity-dmips-mhz = <250>;
+@@ -103,6 +104,7 @@ cpu1: cpu@100 {
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x0100>;
+ 			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL0>;
++			#cooling-cells = <2>;
+ 			enable-method = "psci";
+ 			cpu-idle-states = <&ananke_cpu_sleep>;
+ 			capacity-dmips-mhz = <250>;
+@@ -115,6 +117,7 @@ cpu2: cpu@200 {
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x0200>;
+ 			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL0>;
++			#cooling-cells = <2>;
+ 			enable-method = "psci";
+ 			cpu-idle-states = <&ananke_cpu_sleep>;
+ 			capacity-dmips-mhz = <250>;
+@@ -127,6 +130,7 @@ cpu3: cpu@300 {
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x0300>;
+ 			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL0>;
++			#cooling-cells = <2>;
+ 			enable-method = "psci";
+ 			cpu-idle-states = <&ananke_cpu_sleep>;
+ 			capacity-dmips-mhz = <250>;
+@@ -139,6 +143,7 @@ cpu4: cpu@400 {
+ 			compatible = "arm,cortex-a76";
+ 			reg = <0x0400>;
+ 			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL1>;
++			#cooling-cells = <2>;
+ 			enable-method = "psci";
+ 			cpu-idle-states = <&enyo_cpu_sleep>;
+ 			capacity-dmips-mhz = <620>;
+@@ -151,6 +156,7 @@ cpu5: cpu@500 {
+ 			compatible = "arm,cortex-a76";
+ 			reg = <0x0500>;
+ 			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL1>;
++			#cooling-cells = <2>;
+ 			enable-method = "psci";
+ 			cpu-idle-states = <&enyo_cpu_sleep>;
+ 			capacity-dmips-mhz = <620>;
+@@ -163,6 +169,7 @@ cpu6: cpu@600 {
+ 			compatible = "arm,cortex-x1";
+ 			reg = <0x0600>;
+ 			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL2>;
++			#cooling-cells = <2>;
+ 			enable-method = "psci";
+ 			cpu-idle-states = <&hera_cpu_sleep>;
+ 			capacity-dmips-mhz = <1024>;
+@@ -175,6 +182,7 @@ cpu7: cpu@700 {
+ 			compatible = "arm,cortex-x1";
+ 			reg = <0x0700>;
+ 			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL2>;
++			#cooling-cells = <2>;
+ 			enable-method = "psci";
+ 			cpu-idle-states = <&hera_cpu_sleep>;
+ 			capacity-dmips-mhz = <1024>;
+@@ -646,6 +654,15 @@ watchdog_cl1: watchdog@10070000 {
+ 			status = "disabled";
+ 		};
+ 
++		tmu_top: thermal-sensor@100a0000 {
++			compatible = "google,gs101-tmu-top";
++			reg = <0x100a0000 0x800>;
++			clocks = <&cmu_misc CLK_GOUT_MISC_TMU_TOP_PCLK>;
++			interrupts = <GIC_SPI 769 IRQ_TYPE_LEVEL_HIGH 0>;
++			samsung,acpm-ipc = <&acpm_ipc>;
++			#thermal-sensor-cells = <1>;
++		};
++
+ 		trng: rng@10141400 {
+ 			compatible = "google,gs101-trng",
+ 				     "samsung,exynos850-trng";
+@@ -1937,3 +1954,4 @@ timer {
+ };
+ 
+ #include "gs101-pinctrl.dtsi"
++#include "gs101-tmu.dtsi"

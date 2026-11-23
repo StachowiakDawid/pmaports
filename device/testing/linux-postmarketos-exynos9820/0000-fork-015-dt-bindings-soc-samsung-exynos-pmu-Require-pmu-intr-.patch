@@ -1,0 +1,35 @@
+From 7fb06b7271e580d1ad769e51bf2b0896290d08b0 Mon Sep 17 00:00:00 2001
+From: Alexey Klimov <alexey.klimov@linaro.org>
+Date: Tue, 9 Jun 2026 18:39:24 +0100
+Subject: [PATCH 15/46] dt-bindings: soc: samsung: exynos-pmu: Require
+ pmu-intr-gen-syscon for Exynos850
+
+Update the Exynos PMU schema to mandate the 'google,pmu-intr-gen-syscon'
+property for the 'samsung,exynos850-pmu' compatible so the driver can
+obtain the necessary syscon regmap.
+
+The Exynos850 PMU relies on a separate system controller block to handle
+interrupts generation, similar to the hardware design of the GS101
+SoC. To ensure the hardware is correctly described, this syscon phandle
+must be explicitly provided.
+
+Reviewed-by: Peter Griffin <peter.griffin@linaro.org>
+Acked-by: Rob Herring (Arm) <robh@kernel.org>
+Signed-off-by: Alexey Klimov <alexey.klimov@linaro.org>
+(cherry picked from commit 52ac0d661b805b599e92408a88d6564301c0f2a6)
+---
+ Documentation/devicetree/bindings/soc/samsung/exynos-pmu.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/soc/samsung/exynos-pmu.yaml b/Documentation/devicetree/bindings/soc/samsung/exynos-pmu.yaml
+index 5bd39876e3..7d58976dcc 100644
+--- a/Documentation/devicetree/bindings/soc/samsung/exynos-pmu.yaml
++++ b/Documentation/devicetree/bindings/soc/samsung/exynos-pmu.yaml
+@@ -196,6 +196,7 @@ allOf:
+           contains:
+             enum:
+               - google,gs101-pmu
++              - samsung,exynos850-pmu
+     then:
+       properties:
+         reboot-mode:

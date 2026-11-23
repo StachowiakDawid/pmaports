@@ -1,0 +1,32 @@
+From 5f82615d22e5cf00381041de423dc34066b41b42 Mon Sep 17 00:00:00 2001
+From: chiffathefox <chiffathefoxx@gmail.com>
+Date: Sat, 13 Jun 2026 23:49:18 +0300
+Subject: [PATCH 07/46] mfd: sec-acpm: make regmap_cfg_meter optional
+
+(cherry picked from commit eed2af664f1cc62073f7769e4ca7898982cda897)
+---
+ drivers/mfd/sec-acpm.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/mfd/sec-acpm.c b/drivers/mfd/sec-acpm.c
+index f5e5990f5e..18cd399789 100644
+--- a/drivers/mfd/sec-acpm.c
++++ b/drivers/mfd/sec-acpm.c
+@@ -520,10 +520,13 @@ static int sec_pmic_acpm_probe(struct platform_device *pdev)
+ 			return PTR_ERR(regmap);
+ 	}
+ 
+-	regmap = sec_pmic_acpm_regmap_init(dev, shared_ctx, SEC_PMIC_ACPM_ACCESSTYPE_METER,
+-					   pdata->regmap_cfg_meter, true);
+-	if (IS_ERR(regmap))
+-		return PTR_ERR(regmap);
++	if (pdata->regmap_cfg_meter) {
++		regmap = sec_pmic_acpm_regmap_init(
++			dev, shared_ctx, SEC_PMIC_ACPM_ACCESSTYPE_METER,
++			pdata->regmap_cfg_meter, true);
++		if (IS_ERR(regmap))
++			return PTR_ERR(regmap);
++	}
+ 
+ 	ret = sec_pmic_probe(dev, pdata->device_type, irq, regmap_pmic, NULL);
+ 	if (ret)

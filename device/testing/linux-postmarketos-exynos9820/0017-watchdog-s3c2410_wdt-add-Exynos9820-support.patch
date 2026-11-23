@@ -1,0 +1,134 @@
+From ffd3b876233f3d577c769a9df6ba3e0f50d66893 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] watchdog: s3c2410_wdt: add Exynos9820 support
+
+Exynos 9820 has two watchdog instances, for CPU cluster 0 and cluster
+2, each with a bus clock and the oscillator as the counter source,
+selected with samsung,cluster-index. The reset is masked through
+CLUSTERx_NONCPU_INT_EN in the PMU (bit 2, set = reset enabled) like
+Exynos850/990, and watchdog resets are reported in RST_STAT bit 24
+(cluster 0) and bit 23 (cluster 2). There is no counter enable bit in
+CLUSTERx_NONCPU_OUT. The binding entry is part of this commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ .../bindings/watchdog/samsung-wdt.yaml        |  7 +++-
+ drivers/watchdog/s3c2410_wdt.c                | 37 ++++++++++++++++++-
+ 2 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/watchdog/samsung-wdt.yaml b/Documentation/devicetree/bindings/watchdog/samsung-wdt.yaml
+index a32c478315..6b912adeef 100644
+--- a/Documentation/devicetree/bindings/watchdog/samsung-wdt.yaml
++++ b/Documentation/devicetree/bindings/watchdog/samsung-wdt.yaml
+@@ -26,6 +26,7 @@ properties:
+           - samsung,exynos7-wdt                   # for Exynos7
+           - samsung,exynos850-wdt                 # for Exynos850
+           - samsung,exynos990-wdt                 # for Exynos990
++          - samsung,exynos9820-wdt                # for Exynos9820
+           - samsung,exynosautov9-wdt              # for Exynosautov9
+           - samsung,exynosautov920-wdt            # for Exynosautov920
+       - items:
+@@ -52,13 +53,14 @@ properties:
+     enum: [0, 1, 2]
+     description:
+       Index of CPU cluster on which watchdog is running (in case of Exynos850,
+-      Exynos990 or Google gs101).
++      Exynos990, Exynos9820 or Google gs101).
+ 
+   samsung,syscon-phandle:
+     $ref: /schemas/types.yaml#/definitions/phandle
+     description:
+       Phandle to the PMU system controller node (in case of Exynos5250,
+-      Exynos5420, Exynos5515, Exynos7, Exynos850, Exynos990 and gs101).
++      Exynos5420, Exynos5515, Exynos7, Exynos850, Exynos990, Exynos9820 and
++      gs101).
+ 
+ required:
+   - compatible
+@@ -120,6 +122,7 @@ allOf:
+           contains:
+             enum:
+               - samsung,exynos990-wdt
++              - samsung,exynos9820-wdt
+     then:
+       properties:
+         clocks:
+diff --git a/drivers/watchdog/s3c2410_wdt.c b/drivers/watchdog/s3c2410_wdt.c
+index d11cf2382b..160c2edeb3 100644
+--- a/drivers/watchdog/s3c2410_wdt.c
++++ b/drivers/watchdog/s3c2410_wdt.c
+@@ -89,6 +89,11 @@
+ #define EXYNOS990_CLUSTER2_NONCPU_INT_EN	0x1644
+ #define EXYNOS990_CLUSTER2_WDTRESET_BIT		23
+ 
++#define EXYNOS9820_CLUSTER0_NONCPU_INT_EN	0x1244
++#define EXYNOS9820_CLUSTER2_NONCPU_INT_EN	0x1644
++#define EXYNOS9820_CLUSTER0_WDTRESET_BIT	24
++#define EXYNOS9820_CLUSTER2_WDTRESET_BIT	23
++
+ /**
+  * DOC: Quirk flags for different Samsung watchdog IP-cores
+  *
+@@ -307,6 +312,31 @@ static const struct s3c2410_wdt_variant drv_data_exynos990_cl2 = {
+ 		  QUIRK_HAS_DBGACK_BIT,
+ };
+ 
++/*
++ * Exynos9820 has the Exynos850-style CLUSTERx_NONCPU_INT_EN reset mask, but
++ * the vendor kernel never touches a counter enable bit in CLUSTERx_NONCPU_OUT,
++ * so QUIRK_HAS_PMU_CNT_EN is not set.
++ */
++static const struct s3c2410_wdt_variant drv_data_exynos9820_cl0 = {
++	.mask_reset_reg = EXYNOS9820_CLUSTER0_NONCPU_INT_EN,
++	.mask_bit = 2,
++	.mask_reset_inv = true,
++	.rst_stat_reg = EXYNOS5_RST_STAT_REG_OFFSET,
++	.rst_stat_bit = EXYNOS9820_CLUSTER0_WDTRESET_BIT,
++	.quirks = QUIRK_HAS_WTCLRINT_REG | QUIRK_HAS_PMU_MASK_RESET |
++		  QUIRK_HAS_PMU_RST_STAT,
++};
++
++static const struct s3c2410_wdt_variant drv_data_exynos9820_cl2 = {
++	.mask_reset_reg = EXYNOS9820_CLUSTER2_NONCPU_INT_EN,
++	.mask_bit = 2,
++	.mask_reset_inv = true,
++	.rst_stat_reg = EXYNOS5_RST_STAT_REG_OFFSET,
++	.rst_stat_bit = EXYNOS9820_CLUSTER2_WDTRESET_BIT,
++	.quirks = QUIRK_HAS_WTCLRINT_REG | QUIRK_HAS_PMU_MASK_RESET |
++		  QUIRK_HAS_PMU_RST_STAT,
++};
++
+ static const struct s3c2410_wdt_variant drv_data_exynosautov9_cl0 = {
+ 	.mask_reset_reg = EXYNOS850_CLUSTER0_NONCPU_INT_EN,
+ 	.mask_bit = 2,
+@@ -402,6 +432,8 @@ static const struct of_device_id s3c2410_wdt_match[] = {
+ 	  .data = &drv_data_exynos850_cl0 },
+ 	{ .compatible = "samsung,exynos990-wdt",
+ 	  .data = &drv_data_exynos990_cl0 },
++	{ .compatible = "samsung,exynos9820-wdt",
++	  .data = &drv_data_exynos9820_cl0 },
+ 	{ .compatible = "samsung,exynosautov9-wdt",
+ 	  .data = &drv_data_exynosautov9_cl0 },
+ 	{ .compatible = "samsung,exynosautov920-wdt",
+@@ -725,7 +757,8 @@ s3c2410_get_wdt_drv_data(struct platform_device *pdev, struct s3c2410_wdt *wdt)
+ 	    variant == &drv_data_exynosautov9_cl0 ||
+ 	    variant == &drv_data_gs101_cl0 ||
+ 	    variant == &drv_data_exynosautov920_cl0 ||
+-	    variant == &drv_data_exynos990_cl0) {
++	    variant == &drv_data_exynos990_cl0 ||
++	    variant == &drv_data_exynos9820_cl0) {
+ 		u32 index;
+ 		int err;
+ 
+@@ -750,6 +783,8 @@ s3c2410_get_wdt_drv_data(struct platform_device *pdev, struct s3c2410_wdt *wdt)
+ 		case 2:
+ 			if (variant == &drv_data_exynos990_cl0)
+ 				variant = &drv_data_exynos990_cl2;
++			else if (variant == &drv_data_exynos9820_cl0)
++				variant = &drv_data_exynos9820_cl2;
+ 			break;
+ 		default:
+ 			return dev_err_probe(dev, -EINVAL, "wrong cluster index: %u\n", index);

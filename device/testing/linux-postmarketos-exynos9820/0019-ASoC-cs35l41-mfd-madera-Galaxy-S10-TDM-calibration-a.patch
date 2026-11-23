@@ -1,0 +1,503 @@
+From 697853d1c69760894ed0c69158b2afbddeb5e23c Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] ASoC: cs35l41, mfd: madera: Galaxy S10 TDM, calibration and
+ sleep fixes
+
+Codec side of the Galaxy S10 family audio (two CS35L41 speaker
+amplifiers, CS47L93 codec):
+
+ - cs35l41: set_tdm_slot, so that a machine driver can run the ASP
+   with 32-bit slots carrying 24-bit samples.
+ - cs35l41: the speaker protection calibration (CAL_R, ambient
+   temperature, CAL_STATUS) is written after every DSP start with
+   cal_apply=1, with per-amplifier CAL_R values (cal_rdc_right /
+   cal_rdc_left, falling back to cal_rdc; cal_ambient); DSP
+   hibernation at runtime suspend is optional (hibernate).
+ - cs35l41: the CSPL PAUSE at stream stop is best effort. After a
+   system sleep the firmware may not acknowledge it; the amplifier is
+   powered down right after and the next start accepts RUNNING as well
+   as PAUSED, so a missing acknowledgement is logged once and not
+   returned as an error.
+ - cs35l41: when the amplifier lost its supply in system suspend
+   (detected through the reset default of IRQ1_MASK1), the probe-time
+   init is redone, the register cache restored, the boost re-inited
+   and the DSP firmware reloaded.
+ - madera: pm_runtime_force_suspend()/resume() as system sleep
+   callbacks. With runtime PM callbacks only, the PM core set the
+   device runtime-active without powering DCVDD ("unbalanced disables
+   for vdd_codec_1p2").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/mfd/madera-core.c  |  10 ++
+ sound/soc/codecs/Kconfig   |   1 +
+ sound/soc/codecs/cs35l41.c | 273 ++++++++++++++++++++++++++++++++++++-
+ sound/soc/codecs/cs35l41.h |  11 +-
+ 4 files changed, 287 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/mfd/madera-core.c b/drivers/mfd/madera-core.c
+index 2f74a8c644..c9ed4dbd90 100644
+--- a/drivers/mfd/madera-core.c
++++ b/drivers/mfd/madera-core.c
+@@ -364,7 +364,17 @@ static int __maybe_unused madera_runtime_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * With runtime PM callbacks only, the PM core treats the device as having no
++ * PM callbacks, enables "smart suspend" for it and marks it runtime-active in
++ * device_resume_noirq() without calling madera_runtime_resume(). DCVDD is still
++ * off then, and the next autosuspend disables it a second time ("unbalanced
++ * disables for <DCVDD supply>" after most system resumes). Real system sleep
++ * callbacks keep the runtime PM status and DCVDD in step.
++ */
+ const struct dev_pm_ops madera_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				pm_runtime_force_resume)
+ 	SET_RUNTIME_PM_OPS(madera_runtime_suspend,
+ 			   madera_runtime_resume,
+ 			   NULL)
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index ba59dabeec..5b0398ef2e 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -827,6 +827,7 @@ config SND_SOC_CS35L41_LIB
+ config SND_SOC_CS35L41
+ 	tristate
+ 	select SND_SOC_WM_ADSP
++	select SND_SOC_CS_AMP_LIB
+ 
+ config SND_SOC_CS35L41_SPI
+ 	tristate "Cirrus Logic CS35L41 CODEC (SPI)"
+diff --git a/sound/soc/codecs/cs35l41.c b/sound/soc/codecs/cs35l41.c
+index 0e40444a10..3f68154176 100644
+--- a/sound/soc/codecs/cs35l41.c
++++ b/sound/soc/codecs/cs35l41.c
+@@ -16,6 +16,7 @@
+ #include <linux/moduleparam.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/property.h>
++#include <sound/cs-amp-lib.h>
+ #include <sound/initval.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+@@ -210,6 +211,128 @@ static int cs35l41_dsp_preload_ev(struct snd_soc_dapm_widget *w,
+ 	}
+ }
+ 
++/*
++ * Speaker protection calibration. The CS35L40 "Protection" firmware of the
++ * Galaxy S10+ (CSPL algorithm 0xcd) expects CAL_R/CAL_AMBIENT/CAL_STATUS/
++ * CAL_CHECKSUM after every DSP start; Samsung's driver writes them at every
++ * DSP power-up from /efs/cirrus, or defaults (8580, 23) when there is no
++ * calibration. Off by default: only for firmware that has these controls.
++ */
++static bool cal_apply;
++module_param(cal_apply, bool, 0644);
++MODULE_PARM_DESC(cal_apply, "Write cal_rdc/cal_ambient to the CSPL calibration controls after every DSP start");
++
++static ushort cal_rdc = 8580;
++module_param(cal_rdc, ushort, 0644);
++MODULE_PARM_DESC(cal_rdc, "Speaker calibration CAL_R (raw, Samsung default 8580)");
++
++static short cal_ambient = 23;
++module_param(cal_ambient, short, 0644);
++MODULE_PARM_DESC(cal_ambient, "Speaker calibration ambient temperature in C (Samsung default 23)");
++
++/*
++ * Per-amp CAL_R, picked by the ASoC name prefix ("Right"/"Left"); 0 = use
++ * cal_rdc. Samsung keeps one factory value per amp (sec_efs cirrus/rdc_cal_r
++ * for the right amp, cirrus/rdc_cal for the left one) and one ambient.
++ */
++static ushort cal_rdc_right;
++module_param(cal_rdc_right, ushort, 0644);
++MODULE_PARM_DESC(cal_rdc_right, "CAL_R for the amp with name prefix Right (0 = cal_rdc)");
++
++static ushort cal_rdc_left;
++module_param(cal_rdc_left, ushort, 0644);
++MODULE_PARM_DESC(cal_rdc_left, "CAL_R for the amp with name prefix Left (0 = cal_rdc)");
++
++/*
++ * Mainline hibernates a running DSP at runtime suspend. Samsung's driver
++ * never does, and the 2018 CS35L40 protection firmware may not support it.
++ */
++static bool dsp_hibernate = true;
++module_param_named(hibernate, dsp_hibernate, bool, 0644);
++MODULE_PARM_DESC(hibernate, "Hibernate a running DSP at runtime suspend (default: true)");
++
++/*
++ * Mainline sends CSPL PAUSE to the DSP at every stream stop. Samsung's driver
++ * never does (it pauses only when the PCM source is switched away from the
++ * DSP), and after a system deep sleep the S10+ protection firmware no longer
++ * acknowledges it (MBOX_2 stays RUNNING). The amp is powered down right after
++ * this anyway and the next start accepts RUNNING as well as PAUSED, so a
++ * missing acknowledgement is harmless and is not reported as an error.
++ */
++
++static const struct cirrus_amp_cal_controls cs35l41_cspl_cal_controls = {
++	.alg_id =	0xcd,
++	.mem_region =	WMFW_ADSP2_XM,
++	.ambient =	"CAL_AMBIENT",
++	.calr =		"CAL_R",
++	.status =	"CAL_STATUS",
++	.checksum =	"CAL_CHECKSUM",
++};
++
++static void cs35l41_apply_cal(struct cs35l41_private *cs35l41)
++{
++	struct snd_soc_component *component = cs35l41->dsp.component;
++	const char *prefix = component ? component->name_prefix : NULL;
++	struct cirrus_amp_cal_data cal = {
++		.calR = READ_ONCE(cal_rdc),
++		.calAmbient = READ_ONCE(cal_ambient),
++		.calStatus = 1,
++	};
++	u16 own = 0;
++	int ret;
++
++	if (!READ_ONCE(cal_apply))
++		return;
++
++	if (prefix && !strcasecmp(prefix, "Right"))
++		own = READ_ONCE(cal_rdc_right);
++	else if (prefix && !strcasecmp(prefix, "Left"))
++		own = READ_ONCE(cal_rdc_left);
++	if (own)
++		cal.calR = own;
++
++	ret = cs_amp_write_cal_coeffs(&cs35l41->dsp.cs_dsp,
++				      &cs35l41_cspl_cal_controls, &cal);
++	if (ret)
++		dev_warn(cs35l41->dev, "calibration not written: %d\n", ret);
++	else
++		dev_info(cs35l41->dev, "calibration: CAL_R %u ambient %d\n",
++			 cal.calR, cal.calAmbient);
++}
++
++/*
++ * Same handshake as cs35l41_set_cspl_mbox_cmd(PAUSE) with the same 5 ms
++ * budget, but quiet: the shared helper logs a timeout with dev_err, which
++ * here is expected after deep sleep and not a failure.
++ */
++static void cs35l41_dsp_pause(struct cs35l41_private *cs35l41)
++{
++	unsigned int sts = 0;
++	int ret;
++
++	ret = regmap_write(cs35l41->regmap, CS35L41_DSP_VIRT1_MBOX_1,
++			   CSPL_MBOX_CMD_PAUSE);
++	if (!ret)
++		ret = regmap_read_poll_timeout(cs35l41->regmap,
++					       CS35L41_DSP_MBOX_2, sts,
++					       sts == CSPL_MBOX_STS_PAUSED ||
++					       sts == CSPL_MBOX_STS_ERROR ||
++					       sts == CSPL_MBOX_STS_ERROR2,
++					       1000, 5000);
++	if (!ret && sts != CSPL_MBOX_STS_PAUSED) {
++		dev_warn(cs35l41->dev, "CSPL error at PAUSE (status %#x)\n", sts);
++		return;
++	}
++	if (!ret)
++		return;
++
++	dev_info_once(cs35l41->dev,
++		      "DSP did not acknowledge PAUSE (%d, status %u), ignoring\n",
++		      ret, sts);
++	dev_dbg(cs35l41->dev, "DSP PAUSE not acknowledged: %d (status %u)\n",
++		ret, sts);
++}
++
+ static int cs35l41_dsp_audio_ev(struct snd_soc_dapm_widget *w,
+ 				struct snd_kcontrol *kcontrol, int event)
+ {
+@@ -220,8 +343,12 @@ static int cs35l41_dsp_audio_ev(struct snd_soc_dapm_widget *w,
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_POST_PMU:
+-		if (!cs35l41->dsp.cs_dsp.running)
+-			return wm_adsp_event(w, kcontrol, event);
++		if (!cs35l41->dsp.cs_dsp.running) {
++			ret = wm_adsp_event(w, kcontrol, event);
++			if (!ret && cs35l41->dsp.cs_dsp.running)
++				cs35l41_apply_cal(cs35l41);
++			return ret;
++		}
+ 
+ 		ret = regmap_read(cs35l41->regmap, CS35L41_DSP_MBOX_2, &fw_status);
+ 		if (ret < 0) {
+@@ -240,11 +367,13 @@ static int cs35l41_dsp_audio_ev(struct snd_soc_dapm_widget *w,
+ 			return -EINVAL;
+ 		}
+ 
++		cs35l41_apply_cal(cs35l41);
++
+ 		return cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap,
+ 						 CSPL_MBOX_CMD_RESUME);
+ 	case SND_SOC_DAPM_PRE_PMD:
+-		return cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap,
+-						 CSPL_MBOX_CMD_PAUSE);
++		cs35l41_dsp_pause(cs35l41);
++		return 0;
+ 	default:
+ 		return 0;
+ 	}
+@@ -681,6 +810,23 @@ static int cs35l41_set_channel_map(struct snd_soc_dai *dai, unsigned int tx_n,
+ 	return cs35l41_set_channels(cs35l41->dev, cs35l41->regmap, tx_n, tx_slot, rx_n, rx_slot);
+ }
+ 
++/*
++ * Only the slot width is taken from here (slot positions come from
++ * set_channel_map): it lets a host run e.g. 24-bit samples in 32-bit TDM
++ * slots. 0 restores "slot width = sample width".
++ */
++static int cs35l41_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
++				unsigned int rx_mask, int slots, int slot_width)
++{
++	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(dai->component);
++
++	if (slot_width < 0 || slot_width > 128)
++		return -EINVAL;
++
++	cs35l41->slot_width = slot_width;
++	return 0;
++}
++
+ static int cs35l41_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ {
+ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(dai->component);
+@@ -780,14 +926,16 @@ static int cs35l41_pcm_hw_params(struct snd_pcm_substream *substream,
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_FORMAT,
+ 				   CS35L41_ASP_WIDTH_RX_MASK,
+-				   asp_wl << CS35L41_ASP_WIDTH_RX_SHIFT);
++				   (cs35l41->slot_width ?: asp_wl) <<
++				   CS35L41_ASP_WIDTH_RX_SHIFT);
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_RX_WL,
+ 				   CS35L41_ASP_RX_WL_MASK,
+ 				   asp_wl << CS35L41_ASP_RX_WL_SHIFT);
+ 	} else {
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_FORMAT,
+ 				   CS35L41_ASP_WIDTH_TX_MASK,
+-				   asp_wl << CS35L41_ASP_WIDTH_TX_SHIFT);
++				   (cs35l41->slot_width ?: asp_wl) <<
++				   CS35L41_ASP_WIDTH_TX_SHIFT);
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_TX_WL,
+ 				   CS35L41_ASP_TX_WL_MASK,
+ 				   asp_wl << CS35L41_ASP_TX_WL_SHIFT);
+@@ -968,6 +1116,7 @@ static const struct snd_soc_dai_ops cs35l41_ops = {
+ 	.set_channel_map = cs35l41_set_channel_map,
+ 	.auto_selectable_formats = &cs35l41_selectable_formats,
+ 	.num_auto_selectable_formats = 1,
++	.set_tdm_slot = cs35l41_set_tdm_slot,
+ };
+ 
+ #define CS35L41_RATES (		    \
+@@ -1209,6 +1358,8 @@ static int cs35l41_get_system_name(struct cs35l41_private *cs35l41)
+ 	return ret;
+ }
+ 
++static void cs35l41_dsp_reload_work(struct work_struct *work);
++
+ int cs35l41_probe(struct cs35l41_private *cs35l41, const struct cs35l41_hw_cfg *hw_cfg)
+ {
+ 	u32 regid, reg_revid, i, mtl_revid, chipid_match;
+@@ -1334,6 +1485,7 @@ int cs35l41_probe(struct cs35l41_private *cs35l41, const struct cs35l41_hw_cfg *
+ 	ret = cs35l41_dsp_init(cs35l41);
+ 	if (ret < 0)
+ 		goto err;
++	INIT_WORK(&cs35l41->dsp_reload_work, cs35l41_dsp_reload_work);
+ 
+ 	pm_runtime_set_autosuspend_delay(cs35l41->dev, 3000);
+ 	pm_runtime_use_autosuspend(cs35l41->dev);
+@@ -1373,6 +1525,7 @@ EXPORT_SYMBOL_GPL(cs35l41_probe);
+ 
+ void cs35l41_remove(struct cs35l41_private *cs35l41)
+ {
++	cancel_work_sync(&cs35l41->dsp_reload_work);
+ 	pm_runtime_get_sync(cs35l41->dev);
+ 	pm_runtime_dont_use_autosuspend(cs35l41->dev);
+ 	pm_runtime_disable(cs35l41->dev);
+@@ -1401,9 +1554,12 @@ static int cs35l41_runtime_suspend(struct device *dev)
+ 
+ 	if (!cs35l41->dsp.preloaded || !cs35l41->dsp.cs_dsp.running)
+ 		return 0;
++	if (!READ_ONCE(dsp_hibernate))
++		return 0;
+ 
+ 	wm_adsp_hibernate(&cs35l41->dsp, true);
+ 	cs35l41_enter_hibernate(dev, cs35l41->regmap, cs35l41->hw_cfg.bst_type);
++	cs35l41->dsp_hibernated = true;
+ 
+ 	regcache_cache_only(cs35l41->regmap, true);
+ 	regcache_mark_dirty(cs35l41->regmap);
+@@ -1418,8 +1574,10 @@ static int cs35l41_runtime_resume(struct device *dev)
+ 
+ 	dev_dbg(cs35l41->dev, "Runtime resume\n");
+ 
+-	if (!cs35l41->dsp.preloaded || !cs35l41->dsp.cs_dsp.running)
++	if (!cs35l41->dsp.preloaded || !cs35l41->dsp.cs_dsp.running ||
++	    !cs35l41->dsp_hibernated)
+ 		return 0;
++	cs35l41->dsp_hibernated = false;
+ 
+ 	regcache_cache_only(cs35l41->regmap, false);
+ 
+@@ -1474,10 +1632,110 @@ static int cs35l41_sys_resume_noirq(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * Some boards (Samsung Galaxy S10+, beyond2lte) cut the amplifier supply in
++ * system suspend while the reset line stays high: the chip comes back with
++ * its reset defaults (TDM slots, ASP format, IRQ masks, OTP trim) and an empty
++ * DSP, and nothing in the resume path notices. The driver always clears bit
++ * 31 of IRQ1_MASK1 at probe (CS35L41_INT1_MASK_DEFAULT) and the reset default
++ * has it set, so a set bit in the hardware means the chip lost power: redo the
++ * probe-time init, restore the register cache and reload the DSP firmware.
++ */
++static void cs35l41_restore_after_power_loss(struct cs35l41_private *cs35l41)
++{
++	struct regmap *regmap = cs35l41->regmap;
++	unsigned int mask1 = 0, sts, revid;
++	int ret;
++
++	if (cs35l41->dsp_hibernated)
++		return;		/* cache-only: runtime resume handles it */
++
++	regcache_cache_bypass(regmap, true);
++	ret = regmap_read(regmap, CS35L41_IRQ1_MASK1, &mask1);
++	regcache_cache_bypass(regmap, false);
++	if (ret || !(mask1 & BIT(31)))
++		return;
++
++	dev_info(cs35l41->dev, "lost power in suspend (IRQ1_MASK1 %#x), re-initialising\n",
++		 mask1);
++
++	ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS4, sts,
++				       sts & CS35L41_OTP_BOOT_DONE, 1000, 100000);
++	if (ret) {
++		dev_err(cs35l41->dev, "no OTP_BOOT_DONE after resume: %d\n", ret);
++		return;
++	}
++
++	regcache_cache_bypass(regmap, true);
++	ret = regmap_read(regmap, CS35L41_REVID, &revid);
++	regcache_cache_bypass(regmap, false);
++	if (ret)
++		return;
++
++	regcache_mark_dirty(regmap);
++
++	cs35l41_test_key_unlock(cs35l41->dev, regmap);
++	ret = cs35l41_register_errata_patch(cs35l41->dev, regmap, revid);
++	if (!ret)
++		ret = cs35l41_otp_unpack(cs35l41->dev, regmap);
++	cs35l41_test_key_lock(cs35l41->dev, regmap);
++	if (ret) {
++		dev_err(cs35l41->dev, "errata/OTP after resume failed: %d\n", ret);
++		return;
++	}
++
++	cs35l41_gpio_config(regmap, &cs35l41->hw_cfg);
++
++	cs35l41_test_key_unlock(cs35l41->dev, regmap);
++	ret = regcache_sync(regmap);
++	cs35l41_test_key_lock(cs35l41->dev, regmap);
++	if (ret) {
++		dev_err(cs35l41->dev, "register restore after resume failed: %d\n", ret);
++		return;
++	}
++
++	cs35l41_init_boost(cs35l41->dev, regmap, &cs35l41->hw_cfg);
++
++	/*
++	 * The DSP memory is gone. The DSP normally keeps running between
++	 * streams (only paused through the mailbox), so DAPM will not start it
++	 * again: stop it, reload the firmware and restart it if it was running.
++	 */
++	if (cs35l41->dsp.cs_dsp.booted) {
++		cs35l41->dsp_reload_run = cs35l41->dsp.cs_dsp.running;
++		if (cs35l41->dsp_reload_run)
++			wm_adsp_stop(&cs35l41->dsp);
++		wm_adsp_power_down(&cs35l41->dsp);
++		queue_work(system_unbound_wq, &cs35l41->dsp_reload_work);
++	}
++}
++
++static void cs35l41_dsp_reload_work(struct work_struct *work)
++{
++	struct cs35l41_private *cs35l41 =
++		container_of(work, struct cs35l41_private, dsp_reload_work);
++	int ret;
++
++	ret = wm_adsp_power_up(&cs35l41->dsp, true);
++	if (ret) {
++		dev_err(cs35l41->dev, "DSP reload after resume failed: %d\n", ret);
++		return;
++	}
++	if (cs35l41->dsp_reload_run) {
++		ret = wm_adsp_run(&cs35l41->dsp);
++		if (ret)
++			dev_err(cs35l41->dev, "DSP restart after resume failed: %d\n", ret);
++	}
++	dev_info(cs35l41->dev, "DSP reloaded after resume%s\n",
++		 cs35l41->dsp_reload_run ? " and restarted" : "");
++}
++
+ static int cs35l41_sys_resume(struct device *dev)
+ {
+ 	struct cs35l41_private *cs35l41 = dev_get_drvdata(dev);
+ 
++	cs35l41_restore_after_power_loss(cs35l41);
++
+ 	dev_dbg(cs35l41->dev, "System resume, reenabling IRQ\n");
+ 	enable_irq(cs35l41->irq);
+ 
+@@ -1493,4 +1751,5 @@ EXPORT_GPL_DEV_PM_OPS(cs35l41_pm_ops) = {
+ 
+ MODULE_DESCRIPTION("ASoC CS35L41 driver");
+ MODULE_AUTHOR("David Rhodes, Cirrus Logic Inc, <david.rhodes@cirrus.com>");
++MODULE_IMPORT_NS("SND_SOC_CS_AMP_LIB");
+ MODULE_LICENSE("GPL");
+diff --git a/sound/soc/codecs/cs35l41.h b/sound/soc/codecs/cs35l41.h
+index c85cbc1dd3..57f0418dfd 100644
+--- a/sound/soc/codecs/cs35l41.h
++++ b/sound/soc/codecs/cs35l41.h
+@@ -11,6 +11,7 @@
+ #define __CS35L41_H__
+ 
+ #include <linux/gpio/consumer.h>
++#include <linux/workqueue.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/firmware.h>
+ #include <sound/core.h>
+@@ -18,7 +19,8 @@
+ 
+ #include "wm_adsp.h"
+ 
+-#define CS35L41_RX_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE)
++#define CS35L41_RX_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE | \
++			    SNDRV_PCM_FMTBIT_S32_LE)
+ #define CS35L41_TX_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE)
+ 
+ extern const struct dev_pm_ops cs35l41_pm_ops;
+@@ -29,10 +31,17 @@ struct cs35l41_private {
+ 	struct cs35l41_hw_cfg hw_cfg;
+ 	struct device *dev;
+ 	struct regmap *regmap;
++	/* ASP slot width from set_tdm_slot(), 0 = use the sample width */
++	unsigned int slot_width;
+ 	struct regulator_bulk_data supplies[CS35L41_NUM_SUPPLIES];
+ 	int irq;
+ 	/* GPIO for /RST */
+ 	struct gpio_desc *reset_gpio;
++	/* runtime suspend put the DSP into hibernate (resume must wake it) */
++	bool dsp_hibernated;
++	/* DSP reload after a power loss in system suspend */
++	struct work_struct dsp_reload_work;
++	bool dsp_reload_run;
+ };
+ 
+ int cs35l41_probe(struct cs35l41_private *cs35l41, const struct cs35l41_hw_cfg *hw_cfg);

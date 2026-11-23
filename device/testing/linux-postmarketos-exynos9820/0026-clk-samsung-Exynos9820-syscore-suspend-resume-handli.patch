@@ -1,0 +1,810 @@
+From 2422f4238818988e11274608bf2636b75191f987 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] clk: samsung: Exynos9820 syscore suspend/resume handling
+
+The generic syscore save/restore of the CMU register caches does not
+fit a SoC sleep on Exynos 9820:
+
+ - a CMU whose power domain is off is not saved or restored,
+ - CMUs owned by the APM firmware (CMU_MIF0..3), the CPU clusters
+   (CMU_CPUCL0/2) and the always-on CMU_TOP, CMU_CORE and CMU_BUSC are
+   not written back,
+ - only registers that changed are rewritten,
+ - CMU_TOP is compared with its suspend state after the sleep: the
+   changed leaf muxes, dividers and gates of blocks that are powered
+   off at that point are rewritten, and every difference is logged
+   after the resume.
+
+A resume hook, called before each register cache is restored, lets the
+suspend code leave a breadcrumb.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/clk/samsung/clk-exynos9820.c | 228 +++++++++++++++++++
+ drivers/clk/samsung/clk.c            | 317 ++++++++++++++++++++++++++-
+ drivers/clk/samsung/clk.h            |  77 +++++++
+ 3 files changed, 619 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/clk/samsung/clk-exynos9820.c b/drivers/clk/samsung/clk-exynos9820.c
+index 097872b8da..bd3562aeeb 100644
+--- a/drivers/clk/samsung/clk-exynos9820.c
++++ b/drivers/clk/samsung/clk-exynos9820.c
+@@ -1239,6 +1239,8 @@ static const struct samsung_cmu_info fsys0a_cmu_info __initconst = {
+ 	.auto_clock_gate	= true,
+ 	.gate_dbg_offset	= EXYNOS9820_GATE_DBG_OFFSET,
+ 	.option_offset		= FSYS0A_CMU_FSYS0A_CONTROLLER_OPTION,
++	/* Samsung's save_sleep[] restores FSYS0A only while its domain is on */
++	.pd_status		= 0x15862204,
+ };
+ 
+ /*
+@@ -2460,6 +2462,8 @@ static const struct samsung_cmu_info g3d_cmu_info __initconst = {
+ 	.gate_dbg_offset	= EXYNOS9820_GATE_DBG_OFFSET,
+ 	.option_offset		= G3D_CMU_G3D_CONTROLLER_OPTION,
+ 	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
++	/* PMU G3D_STATUS (outer G3D block, resets CMU_G3D) */
++	.pd_status		= 0x15862384,
+ };
+ 
+ /*
+@@ -2702,6 +2706,8 @@ static const struct samsung_cmu_info aud_cmu_info __initconst = {
+ 	.auto_clock_gate	= true,
+ 	.gate_dbg_offset	= EXYNOS9820_GATE_DBG_OFFSET,
+ 	.option_offset		= AUD_CMU_AUD_CONTROLLER_OPTION,
++	/* PMU AUD_STATUS */
++	.pd_status		= 0x15861904,
+ };
+ 
+ /*
+@@ -3123,6 +3129,8 @@ static const struct samsung_cmu_info dpu_cmu_info __initconst = {
+ 	.option_offset		= DPU_CMU_DPU_CONTROLLER_OPTION,
+ 	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
+ 	.memclk_offset		= EXYNOS9820_MEMCLK_OFFSET,
++	/* PMU DPU_STATUS */
++	.pd_status		= 0x15861e04,
+ };
+ 
+ /*
+@@ -3143,6 +3151,8 @@ static const struct samsung_cmu_info core_cmu_info __initconst = {
+ 	.option_offset		= CORE_CMU_CORE_CONTROLLER_OPTION,
+ 	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
+ 	.memclk_offset		= EXYNOS9820_MEMCLK_OFFSET,
++	.sleep_skip		= SAMSUNG_SLEEP_SKIP_ALWAYS_ON,
++	.sleep_name		= "CMU_CORE",
+ };
+ 
+ /*
+@@ -3554,6 +3564,8 @@ static const struct samsung_cmu_info busc_cmu_info __initconst = {
+ 	.option_offset		= BUSC_CMU_BUSC_CONTROLLER_OPTION,
+ 	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
+ 	.memclk_offset		= EXYNOS9820_MEMCLK_OFFSET,
++	.sleep_skip		= SAMSUNG_SLEEP_SKIP_ALWAYS_ON,
++	.sleep_name		= "CMU_BUSC",
+ };
+ 
+ /*
+@@ -3931,6 +3943,207 @@ static const unsigned long top_clk_regs[] __initconst = {
+ 	CLK_CON_GAT_GATE_CLKCMU_VRA2_STR,
+ };
+ 
++/*
++ * Resume class of each CMU_TOP register (SAMSUNG_RESUME_*, see
++ * samsung_clk_aon_resume() in clk.c). CMU_TOP is always on and shared with the APM and the CP;
++ * its cache is not written back at syscore resume. Only the leaf
++ * mux/div/gate of blocks that are off (LEAF) or quiescent (IO) while the
++ * syscore resume runs may be rewritten. Never: PLLs, MUX_PLL_SHARED and the
++ * PLL_SHARED dividers, CMU_BOOST, CPUCL0/1/2 and MIF switches, CPUCL0_DBG,
++ * APM/BUSC/CORE/MIF_BUSP/PERIS bus, FSYS0/FSYS0A/FSYS1/PERIC0/PERIC1 bus (INT
++ * DVFS members), DPU/DPU_BUS (DISP DVFS, display running), G3D_SWITCH (the
++ * APM's PLL_G3D relock fallback), HPM, CMUREF, BUS_OTF, MODEM_SHARED0/1.
++ */
++#define TOP_RR(_reg, _cls, _name) \
++	{ .offset = _reg, .cls = SAMSUNG_RESUME_##_cls, .name = _name }
++
++static const struct samsung_clk_resume_reg top_resume_regs[] __initconst = {
++	TOP_RR(PLL_LOCKTIME_APLL_SHARED0, NEVER, "PLL_LOCKTIME_APLL_SHARED0"),
++	TOP_RR(PLL_LOCKTIME_APLL_SHARED1, NEVER, "PLL_LOCKTIME_APLL_SHARED1"),
++	TOP_RR(PLL_LOCKTIME_PLL_G3D, NEVER, "PLL_LOCKTIME_PLL_G3D"),
++	TOP_RR(PLL_LOCKTIME_PLL_SHARED0, NEVER, "PLL_LOCKTIME_PLL_SHARED0"),
++	TOP_RR(PLL_LOCKTIME_PLL_SHARED1, NEVER, "PLL_LOCKTIME_PLL_SHARED1"),
++	TOP_RR(PLL_LOCKTIME_PLL_SHARED2, NEVER, "PLL_LOCKTIME_PLL_SHARED2"),
++	TOP_RR(PLL_LOCKTIME_PLL_SHARED3, NEVER, "PLL_LOCKTIME_PLL_SHARED3"),
++	TOP_RR(PLL_LOCKTIME_PLL_SHARED4, NEVER, "PLL_LOCKTIME_PLL_SHARED4"),
++	TOP_RR(PLL_CON0_APLL_SHARED0, NEVER, "PLL_CON0_APLL_SHARED0"),
++	TOP_RR(PLL_CON0_APLL_SHARED1, NEVER, "PLL_CON0_APLL_SHARED1"),
++	TOP_RR(PLL_CON0_PLL_G3D, NEVER, "PLL_CON0_PLL_G3D"),
++	TOP_RR(PLL_CON0_PLL_SHARED0, NEVER, "PLL_CON0_PLL_SHARED0"),
++	TOP_RR(PLL_CON0_PLL_SHARED1, NEVER, "PLL_CON0_PLL_SHARED1"),
++	TOP_RR(PLL_CON0_PLL_SHARED2, NEVER, "PLL_CON0_PLL_SHARED2"),
++	TOP_RR(PLL_CON0_PLL_SHARED3, NEVER, "PLL_CON0_PLL_SHARED3"),
++	TOP_RR(PLL_CON0_PLL_SHARED4, NEVER, "PLL_CON0_PLL_SHARED4"),
++	TOP_RR(CMU_CMU_CMU_CONTROLLER_OPTION, NEVER, "CMU_CMU_CMU_CONTROLLER_OPTION"),
++	TOP_RR(CLK_CON_MUX_CLKCMU_DPU_BUS, NEVER, "MUX_CLKCMU_DPU_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_APM_BUS, NEVER, "MUX_MUX_CLKCMU_APM_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_AUD_CPU, IO, "MUX_MUX_CLKCMU_AUD_CPU"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_BUSC_BUS, NEVER, "MUX_MUX_CLKCMU_BUSC_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CIS_CLK0, LEAF, "MUX_MUX_CLKCMU_CIS_CLK0"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CIS_CLK1, LEAF, "MUX_MUX_CLKCMU_CIS_CLK1"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CIS_CLK2, LEAF, "MUX_MUX_CLKCMU_CIS_CLK2"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CIS_CLK3, LEAF, "MUX_MUX_CLKCMU_CIS_CLK3"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CIS_CLK4, LEAF, "MUX_MUX_CLKCMU_CIS_CLK4"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CMU_BOOST, NEVER, "MUX_MUX_CLKCMU_CMU_BOOST"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CORE_BUS, NEVER, "MUX_MUX_CLKCMU_CORE_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CPUCL0_DBG_BUS, NEVER, "MUX_MUX_CLKCMU_CPUCL0_DBG_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CPUCL0_SWITCH, NEVER, "MUX_MUX_CLKCMU_CPUCL0_SWITCH"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CPUCL1_SWITCH, NEVER, "MUX_MUX_CLKCMU_CPUCL1_SWITCH"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_CPUCL2_SWITCH, NEVER, "MUX_MUX_CLKCMU_CPUCL2_SWITCH"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_DPU, NEVER, "MUX_MUX_CLKCMU_DPU"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_DPU_BUS, NEVER, "MUX_MUX_CLKCMU_DPU_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_DSPM_BUS, LEAF, "MUX_MUX_CLKCMU_DSPM_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_DSPM_BUS_OTF, LEAF, "MUX_MUX_CLKCMU_DSPM_BUS_OTF"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_DSPS_AUD, IO, "MUX_MUX_CLKCMU_DSPS_AUD"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS0A_BUS, NEVER, "MUX_MUX_CLKCMU_FSYS0A_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS0A_USB31DRD, IO, "MUX_MUX_CLKCMU_FSYS0A_USB31DRD"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS0A_USBDP_DEBUG, IO, "MUX_MUX_CLKCMU_FSYS0A_USBDP_DEBUG"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS0_BUS, NEVER, "MUX_MUX_CLKCMU_FSYS0_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS0_DPGTC, IO, "MUX_MUX_CLKCMU_FSYS0_DPGTC"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS0_PCIE, IO, "MUX_MUX_CLKCMU_FSYS0_PCIE"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS1_BUS, NEVER, "MUX_MUX_CLKCMU_FSYS1_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS1_MMC_CARD, IO, "MUX_MUX_CLKCMU_FSYS1_MMC_CARD"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS1_PCIE, IO, "MUX_MUX_CLKCMU_FSYS1_PCIE"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS1_UFS_CARD, IO, "MUX_MUX_CLKCMU_FSYS1_UFS_CARD"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_FSYS1_UFS_EMBD, IO, "MUX_MUX_CLKCMU_FSYS1_UFS_EMBD"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_G2D_G2D, LEAF, "MUX_MUX_CLKCMU_G2D_G2D"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_G2D_MSCL, LEAF, "MUX_MUX_CLKCMU_G2D_MSCL"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_HPM, NEVER, "MUX_MUX_CLKCMU_HPM"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_ISPHQ_BUS, LEAF, "MUX_MUX_CLKCMU_ISPHQ_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_ISPLP_BUS, LEAF, "MUX_MUX_CLKCMU_ISPLP_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_ISPLP_GDC, LEAF, "MUX_MUX_CLKCMU_ISPLP_GDC"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_ISPPRE_BUS, LEAF, "MUX_MUX_CLKCMU_ISPPRE_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_IVA_BUS, LEAF, "MUX_MUX_CLKCMU_IVA_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_MFC_MFC, LEAF, "MUX_MUX_CLKCMU_MFC_MFC"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_MFC_WFD, LEAF, "MUX_MUX_CLKCMU_MFC_WFD"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_MIF_BUSP, NEVER, "MUX_MUX_CLKCMU_MIF_BUSP"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_MIF_SWITCH, NEVER, "MUX_MUX_CLKCMU_MIF_SWITCH"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_NPU0_BUS, LEAF, "MUX_MUX_CLKCMU_NPU0_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_NPU0_CPU, LEAF, "MUX_MUX_CLKCMU_NPU0_CPU"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_NPU1_BUS, LEAF, "MUX_MUX_CLKCMU_NPU1_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_PERIC0_BUS, NEVER, "MUX_MUX_CLKCMU_PERIC0_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_PERIC0_IP, IO, "MUX_MUX_CLKCMU_PERIC0_IP"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_PERIC1_BUS, NEVER, "MUX_MUX_CLKCMU_PERIC1_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_PERIC1_IP, IO, "MUX_MUX_CLKCMU_PERIC1_IP"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_PERIS_BUS, NEVER, "MUX_MUX_CLKCMU_PERIS_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_VRA2_BUS, LEAF, "MUX_MUX_CLKCMU_VRA2_BUS"),
++	TOP_RR(CLK_CON_MUX_MUX_CLKCMU_VRA2_STR, LEAF, "MUX_MUX_CLKCMU_VRA2_STR"),
++	TOP_RR(CLK_CON_MUX_MUX_CLK_CMU_CMUREF, NEVER, "MUX_MUX_CLK_CMU_CMUREF"),
++	TOP_RR(CLK_CON_MUX_MUX_CMU_CMUREF, NEVER, "MUX_MUX_CMU_CMUREF"),
++	TOP_RR(CLK_CON_MUX_MUX_PLL_SHARED0, NEVER, "MUX_MUX_PLL_SHARED0"),
++	TOP_RR(CLK_CON_MUX_MUX_PLL_SHARED1, NEVER, "MUX_MUX_PLL_SHARED1"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_APM_BUS, NEVER, "DIV_CLKCMU_APM_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_AUD_CPU, IO, "DIV_CLKCMU_AUD_CPU"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_BUSC_BUS, NEVER, "DIV_CLKCMU_BUSC_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CIS_CLK0, LEAF, "DIV_CLKCMU_CIS_CLK0"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CIS_CLK1, LEAF, "DIV_CLKCMU_CIS_CLK1"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CIS_CLK2, LEAF, "DIV_CLKCMU_CIS_CLK2"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CIS_CLK3, LEAF, "DIV_CLKCMU_CIS_CLK3"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CIS_CLK4, LEAF, "DIV_CLKCMU_CIS_CLK4"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CMU_BOOST, NEVER, "DIV_CLKCMU_CMU_BOOST"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CORE_BUS, NEVER, "DIV_CLKCMU_CORE_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CPUCL0_DBG_BUS, NEVER, "DIV_CLKCMU_CPUCL0_DBG_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CPUCL0_SWITCH, NEVER, "DIV_CLKCMU_CPUCL0_SWITCH"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CPUCL1_SWITCH, NEVER, "DIV_CLKCMU_CPUCL1_SWITCH"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_CPUCL2_SWITCH, NEVER, "DIV_CLKCMU_CPUCL2_SWITCH"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_DSPM_BUS, LEAF, "DIV_CLKCMU_DSPM_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_DSPM_BUS_OTF, LEAF, "DIV_CLKCMU_DSPM_BUS_OTF"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_DSPS_AUD, IO, "DIV_CLKCMU_DSPS_AUD"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_FSYS0A_BUS, NEVER, "DIV_CLKCMU_FSYS0A_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_FSYS0A_USB31DRD, IO, "DIV_CLKCMU_FSYS0A_USB31DRD"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_FSYS0_BUS, NEVER, "DIV_CLKCMU_FSYS0_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_FSYS0_DPGTC, IO, "DIV_CLKCMU_FSYS0_DPGTC"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_FSYS1_UFS_CARD, IO, "DIV_CLKCMU_FSYS1_UFS_CARD"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_FSYS1_UFS_EMBD, IO, "DIV_CLKCMU_FSYS1_UFS_EMBD"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_G2D_G2D, LEAF, "DIV_CLKCMU_G2D_G2D"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_G2D_MSCL, LEAF, "DIV_CLKCMU_G2D_MSCL"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_G3D_SWITCH, NEVER, "DIV_CLKCMU_G3D_SWITCH"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_HPM, NEVER, "DIV_CLKCMU_HPM"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_ISPHQ_BUS, LEAF, "DIV_CLKCMU_ISPHQ_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_ISPLP_BUS, LEAF, "DIV_CLKCMU_ISPLP_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_ISPLP_GDC, LEAF, "DIV_CLKCMU_ISPLP_GDC"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_ISPPRE_BUS, LEAF, "DIV_CLKCMU_ISPPRE_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_IVA_BUS, LEAF, "DIV_CLKCMU_IVA_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_MFC_MFC, LEAF, "DIV_CLKCMU_MFC_MFC"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_MFC_WFD, LEAF, "DIV_CLKCMU_MFC_WFD"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_MIF_BUSP, NEVER, "DIV_CLKCMU_MIF_BUSP"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_NPU0_BUS, LEAF, "DIV_CLKCMU_NPU0_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_NPU1_BUS, LEAF, "DIV_CLKCMU_NPU1_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_PERIC0_BUS, NEVER, "DIV_CLKCMU_PERIC0_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_PERIC0_IP, IO, "DIV_CLKCMU_PERIC0_IP"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_PERIC1_BUS, NEVER, "DIV_CLKCMU_PERIC1_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_PERIC1_IP, IO, "DIV_CLKCMU_PERIC1_IP"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_PERIS_BUS, NEVER, "DIV_CLKCMU_PERIS_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_VRA2_BUS, LEAF, "DIV_CLKCMU_VRA2_BUS"),
++	TOP_RR(CLK_CON_DIV_CLKCMU_VRA2_STR, LEAF, "DIV_CLKCMU_VRA2_STR"),
++	TOP_RR(CLK_CON_DIV_DIV_CLKCMU_DPU, NEVER, "DIV_DIV_CLKCMU_DPU"),
++	TOP_RR(CLK_CON_DIV_DIV_CLKCMU_DPU_BUS, NEVER, "DIV_DIV_CLKCMU_DPU_BUS"),
++	TOP_RR(CLK_CON_DIV_DIV_CLK_CMU_CMUREF, NEVER, "DIV_DIV_CLK_CMU_CMUREF"),
++	TOP_RR(CLK_CON_DIV_PLL_SHARED0_DIV2, NEVER, "DIV_PLL_SHARED0_DIV2"),
++	TOP_RR(CLK_CON_DIV_PLL_SHARED0_DIV3, NEVER, "DIV_PLL_SHARED0_DIV3"),
++	TOP_RR(CLK_CON_DIV_PLL_SHARED0_DIV4, NEVER, "DIV_PLL_SHARED0_DIV4"),
++	TOP_RR(CLK_CON_DIV_PLL_SHARED1_DIV2, NEVER, "DIV_PLL_SHARED1_DIV2"),
++	TOP_RR(CLK_CON_DIV_PLL_SHARED1_DIV3, NEVER, "DIV_PLL_SHARED1_DIV3"),
++	TOP_RR(CLK_CON_DIV_PLL_SHARED1_DIV4, NEVER, "DIV_PLL_SHARED1_DIV4"),
++	TOP_RR(CLK_CON_DIV_PLL_SHARED2_DIV2, NEVER, "DIV_PLL_SHARED2_DIV2"),
++	TOP_RR(CLK_CON_DIV_PLL_SHARED3_DIV2, NEVER, "DIV_PLL_SHARED3_DIV2"),
++	TOP_RR(CLK_CON_DIV_PLL_SHARED4_DIV2, NEVER, "DIV_PLL_SHARED4_DIV2"),
++	TOP_RR(CLK_CON_GAT_CLKCMU_FSYS1_BUS, NEVER, "GAT_CLKCMU_FSYS1_BUS"),
++	TOP_RR(CLK_CON_GAT_CLKCMU_FSYS1_MMC_CARD, IO, "GAT_CLKCMU_FSYS1_MMC_CARD"),
++	TOP_RR(CLK_CON_GAT_CLKCMU_MIF_SWITCH, NEVER, "GAT_CLKCMU_MIF_SWITCH"),
++	TOP_RR(CLK_CON_GAT_CLKCMU_MODEM_SHARED0, NEVER, "GAT_CLKCMU_MODEM_SHARED0"),
++	TOP_RR(CLK_CON_GAT_CLKCMU_MODEM_SHARED1, NEVER, "GAT_CLKCMU_MODEM_SHARED1"),
++	TOP_RR(CLK_CON_GAT_CLKCMU_NPU0_CPU, LEAF, "GAT_CLKCMU_NPU0_CPU"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_APM_BUS, NEVER, "GAT_GATE_CLKCMU_APM_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_AUD_CPU, IO, "GAT_GATE_CLKCMU_AUD_CPU"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_BUSC_BUS, NEVER, "GAT_GATE_CLKCMU_BUSC_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_BUS_OTF, NEVER, "GAT_GATE_CLKCMU_BUS_OTF"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CIS_CLK0, LEAF, "GAT_GATE_CLKCMU_CIS_CLK0"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CIS_CLK1, LEAF, "GAT_GATE_CLKCMU_CIS_CLK1"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CIS_CLK2, LEAF, "GAT_GATE_CLKCMU_CIS_CLK2"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CIS_CLK3, LEAF, "GAT_GATE_CLKCMU_CIS_CLK3"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CIS_CLK4, LEAF, "GAT_GATE_CLKCMU_CIS_CLK4"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CORE_BUS, NEVER, "GAT_GATE_CLKCMU_CORE_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CPUCL0_DBG_BUS, NEVER, "GAT_GATE_CLKCMU_CPUCL0_DBG_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CPUCL0_SWITCH, NEVER, "GAT_GATE_CLKCMU_CPUCL0_SWITCH"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CPUCL1_SWITCH, NEVER, "GAT_GATE_CLKCMU_CPUCL1_SWITCH"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_CPUCL2_SWITCH, NEVER, "GAT_GATE_CLKCMU_CPUCL2_SWITCH"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_DPU, NEVER, "GAT_GATE_CLKCMU_DPU"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_DPU_BUS, NEVER, "GAT_GATE_CLKCMU_DPU_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_DSPM_BUS, LEAF, "GAT_GATE_CLKCMU_DSPM_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_DSPS_AUD, IO, "GAT_GATE_CLKCMU_DSPS_AUD"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_FSYS0A_BUS, NEVER, "GAT_GATE_CLKCMU_FSYS0A_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_FSYS0A_USB31DRD, IO, "GAT_GATE_CLKCMU_FSYS0A_USB31DRD"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_FSYS0A_USBDP_DEBUG, IO, "GAT_GATE_CLKCMU_FSYS0A_USBDP_DEBUG"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_FSYS0_BUS, NEVER, "GAT_GATE_CLKCMU_FSYS0_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_FSYS0_DPGTC, IO, "GAT_GATE_CLKCMU_FSYS0_DPGTC"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_FSYS0_PCIE, IO, "GAT_GATE_CLKCMU_FSYS0_PCIE"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_FSYS1_PCIE, IO, "GAT_GATE_CLKCMU_FSYS1_PCIE"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_FSYS1_UFS_CARD, IO, "GAT_GATE_CLKCMU_FSYS1_UFS_CARD"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_FSYS1_UFS_EMBD, IO, "GAT_GATE_CLKCMU_FSYS1_UFS_EMBD"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_G2D_G2D, LEAF, "GAT_GATE_CLKCMU_G2D_G2D"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_G2D_MSCL, LEAF, "GAT_GATE_CLKCMU_G2D_MSCL"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_G3D_SWITCH, NEVER, "GAT_GATE_CLKCMU_G3D_SWITCH"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_HPM, NEVER, "GAT_GATE_CLKCMU_HPM"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_ISPHQ_BUS, LEAF, "GAT_GATE_CLKCMU_ISPHQ_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_ISPLP_BUS, LEAF, "GAT_GATE_CLKCMU_ISPLP_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_ISPLP_GDC, LEAF, "GAT_GATE_CLKCMU_ISPLP_GDC"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_ISPPRE_BUS, LEAF, "GAT_GATE_CLKCMU_ISPPRE_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_IVA_BUS, LEAF, "GAT_GATE_CLKCMU_IVA_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_MFC_MFC, LEAF, "GAT_GATE_CLKCMU_MFC_MFC"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_MFC_WFD, LEAF, "GAT_GATE_CLKCMU_MFC_WFD"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_MIF_BUSP, NEVER, "GAT_GATE_CLKCMU_MIF_BUSP"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_NPU0_BUS, LEAF, "GAT_GATE_CLKCMU_NPU0_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_NPU1_BUS, LEAF, "GAT_GATE_CLKCMU_NPU1_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_PERIC0_BUS, NEVER, "GAT_GATE_CLKCMU_PERIC0_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_PERIC0_IP, IO, "GAT_GATE_CLKCMU_PERIC0_IP"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_PERIC1_BUS, NEVER, "GAT_GATE_CLKCMU_PERIC1_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_PERIC1_IP, IO, "GAT_GATE_CLKCMU_PERIC1_IP"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_PERIS_BUS, NEVER, "GAT_GATE_CLKCMU_PERIS_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_VRA2_BUS, LEAF, "GAT_GATE_CLKCMU_VRA2_BUS"),
++	TOP_RR(CLK_CON_GAT_GATE_CLKCMU_VRA2_STR, LEAF, "GAT_GATE_CLKCMU_VRA2_STR"),
++};
++
+ static const struct samsung_pll_clock top_pll_clks[] __initconst = {
+ 	PLL(pll_0822x, CLK_FOUT_APLL_SHARED0, "fout_apll_shared0", "oscclk",
+ 	    PLL_LOCKTIME_APLL_SHARED0, PLL_CON0_APLL_SHARED0, NULL),
+@@ -4506,6 +4719,10 @@ static const struct samsung_cmu_info top_cmu_info __initconst = {
+ 	.auto_clock_gate	= true,
+ 	.gate_dbg_offset	= EXYNOS9820_GATE_DBG_OFFSET,
+ 	.option_offset		= CMU_CMU_CMU_CONTROLLER_OPTION,
++	.sleep_skip		= SAMSUNG_SLEEP_SKIP_ALWAYS_ON,
++	.resume_regs		= top_resume_regs,
++	.nr_resume_regs		= ARRAY_SIZE(top_resume_regs),
++	.sleep_name		= "CMU_TOP",
+ };
+ 
+ static void __init exynos9820_cmu_top_init(struct device_node *np)
+@@ -4534,6 +4751,8 @@ static const struct samsung_cmu_info mif_cmu_info __initconst = {
+ 	.gate_dbg_offset	= EXYNOS9820_GATE_DBG_OFFSET,
+ 	.option_offset		= MIF_CMU_MIF_CONTROLLER_OPTION,
+ 	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
++	/* the APM owns MIF across SoC SLEEP: no write-back at syscore resume */
++	.sleep_skip		= SAMSUNG_SLEEP_SKIP_FW_OWNED,
+ };
+ 
+ /*
+@@ -4553,6 +4772,8 @@ static const struct samsung_cmu_info cpucl0_cmu_info __initconst = {
+ 	.option_offset		= CPUCL0_CMU_CPUCL0_CONTROLLER_OPTION,
+ 	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
+ 	.memclk_offset		= EXYNOS9820_MEMCLK_OFFSET,
++	/* only CONTROLLER_OPTION is cached; Samsung does not restore it either */
++	.sleep_skip		= SAMSUNG_SLEEP_SKIP_CPU_CLUSTER,
+ };
+ 
+ /*
+@@ -4571,6 +4792,13 @@ static const struct samsung_cmu_info cpucl2_cmu_info __initconst = {
+ 	.gate_dbg_offset	= EXYNOS9820_GATE_DBG_OFFSET,
+ 	.option_offset		= CPUCL2_CMU_CPUCL2_CONTROLLER_OPTION,
+ 	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
++	/*
++	 * In cluster 2's power domain (CLUSTER2_NONCPU_STATUS), which is off
++	 * whenever CPUs 6 and 7 are: always at syscore resume after a SoC
++	 * SLEEP (only CPU0 runs then) -> an access is an asynchronous SError.
++	 */
++	.pd_status		= 0x15861604,
++	.sleep_skip		= SAMSUNG_SLEEP_SKIP_CPU_CLUSTER,
+ };
+ 
+ /*
+diff --git a/drivers/clk/samsung/clk.c b/drivers/clk/samsung/clk.c
+index a3b251fb6f..f98968f31f 100644
+--- a/drivers/clk/samsung/clk.c
++++ b/drivers/clk/samsung/clk.c
+@@ -16,6 +16,9 @@
+ #include <linux/of_address.h>
+ #include <linux/regmap.h>
+ #include <linux/syscore_ops.h>
++#include <linux/mm.h>
++#include <linux/suspend.h>
++#include <linux/vmalloc.h>
+ 
+ #include "clk.h"
+ 
+@@ -394,6 +397,12 @@ static int samsung_clk_suspend(void *data)
+ 	struct samsung_clock_reg_cache *reg_cache;
+ 
+ 	list_for_each_entry(reg_cache, &clock_reg_cache_list, node) {
++		reg_cache->aon_valid = false;
++		/* registers of a powered-down domain are not accessible */
++		reg_cache->skipped = reg_cache->pd_status &&
++				     !(readl(reg_cache->pd_status) & 0x1);
++		if (reg_cache->skipped)
++			continue;
+ 		samsung_clk_save(reg_cache->reg_base, reg_cache->sysreg,
+ 				 reg_cache->rdump, reg_cache->rd_num);
+ 		samsung_clk_restore(reg_cache->reg_base, reg_cache->sysreg,
+@@ -403,13 +412,235 @@ static int samsung_clk_suspend(void *data)
+ 	return 0;
+ }
+ 
+-static void samsung_clk_resume(void *data)
++/*
++ * Register caches that the syscore resume leaves alone (Exynos9820 SoC
++ * SLEEP). The suspend still saves them (the blocks
++ * are powered then), only the write-back after the wake is skipped:
++ *
++ * - SAMSUNG_SLEEP_SKIP_FW_OWNED (CMU_MIF0..3): the APM takes MIF down and
++ *   back up in SLEEP and owns these blocks; Samsung's own SLEEP save list
++ *   (flexpmu_cal_system_exynos9820.h save_sleep[]) has no CMU_MIF register.
++ * - SAMSUNG_SLEEP_SKIP_CPU_CLUSTER (CMU_CPUCL0/CMU_CPUCL2): these CMUs sit in
++ *   a CPU cluster's power domain. At syscore resume only CPU0 runs, so cluster
++ *   2 is off and any access to CMU_CPUCL2 is an asynchronous SError.
++ *   Their cache holds only CONTROLLER_OPTION (auto clock gating), which
++ *   Samsung's sleep save list and cluster-on sequences never write either.
++ */
++
++/*
++ * Syscore resume: write a cached register back only if its live value differs
++ * (status bits 16 = MUX/DIV busy, 29 = PLL locked ignored).  CMUs that lost
++ * their state get everything back; CMUs that kept running (always-on blocks,
++ * the APM's) no longer get running PLLs and muxes rewritten.
++ */
++#define SAMSUNG_CLK_STATUS_BITS	(BIT(16) | BIT(29))
++
++static bool samsung_clk_reg_differs(u32 now, u32 saved)
++{
++	return ((now ^ saved) & ~SAMSUNG_CLK_STATUS_BITS) != 0;
++}
++
++static void samsung_clk_restore_changed(void __iomem *base, struct regmap *regmap,
++					const struct samsung_clk_reg_dump *rd,
++					unsigned int num_regs)
++{
++	u32 now;
++
++	for (; num_regs > 0; --num_regs, ++rd) {
++		if (base)
++			now = readl(base + rd->offset);
++		else if (!regmap || regmap_read(regmap, rd->offset, &now))
++			continue;
++		if (!samsung_clk_reg_differs(now, rd->value))
++			continue;
++		if (base)
++			writel(rd->value, base + rd->offset);
++		else
++			regmap_write(regmap, rd->offset, rd->value);
++	}
++}
++
++/*
++ * Always-on CMUs after a SoC SLEEP.
++ *
++ * The CMU_TOP/CORE/BUSC caches are left alone at syscore resume (writing
++ * all of CMU_TOP back, PLLs and system bus muxes included, hung the resume at
++ * breadcrumb stage 96 with the CP running). But CMU_TOP does not come back
++ * as Linux left it: the camera found DIV_CLKCMU_ISPPRE_BUS at 0xf (its boot
++ * value, bus at 1/16) after 19 of 20 sleeps while the clock framework still
++ * had 400 MHz, so a later clk_set_rate() of the same rate wrote nothing.
++ *
++ * For caches flagged SAMSUNG_SLEEP_SKIP_ALWAYS_ON:
++ * - every register is read back at syscore resume and compared with its
++ *   suspend value (read-only; status bits ignored, as in
++ *   samsung_clk_restore_changed());
++ * - the suspend value is written back to the changed registers of resume
++ *   class 1 (see samsung_cmu_info.resume_regs): leaf mux/div/gate of blocks
++ *   that are powered off at that point (ISPPRE/ISPLP/ISPHQ/VRA2, MFC, G2D,
++ *   NPU, IVA, DSPM, sensor MCLKs). Class 2 (the leaves of quiescent I/O
++ *   blocks: UFS, MMC, USB, PCIe, PERIC USI/I2C/UART sources, AUD CPU,
++ *   DSPS_AUD) and class 0 (PLLs, CMU_BOOST, CPUCLx/MIF switches,
++ *   APM/BUSC/CORE/MIF_BUSP/PERIS/FSYSx/PERICx bus, DPU, G3D switch, HPM,
++ *   CMUREF and the MODEM_SHARED gates) are never written;
++ * - after the resume (PM_POST_SUSPEND) every register that differed is
++ *   logged with its suspend, post-sleep, boot and current value and what
++ *   was done with it.
++ */
++static bool aon_report_pending;
++
++/* syscore resume, IRQs off, CPU0 only: compare, optionally rewrite leaves */
++static void samsung_clk_aon_resume(struct samsung_clock_reg_cache *reg_cache)
++{
++	const struct samsung_clk_reg_dump *rd = reg_cache->rdump;
++	struct samsung_clk_aon_reg *aon = reg_cache->aon;
++	unsigned int i;
++	u32 now;
++
++	for (i = 0; i < reg_cache->rd_num; i++, rd++, aon++) {
++		now = readl(reg_cache->reg_base + rd->offset);
++		aon->wake = now;
++		if (!samsung_clk_reg_differs(now, rd->value)) {
++			aon->state = SAMSUNG_AON_SAME;
++			continue;
++		}
++		aon->state = SAMSUNG_AON_DIFF;
++		if (aon->cls == SAMSUNG_RESUME_NEVER ||
++		    aon->cls > SAMSUNG_RESUME_LEAF)
++			continue;
++		writel(rd->value, reg_cache->reg_base + rd->offset);
++		aon->state = SAMSUNG_AON_RESTORED;
++	}
++	reg_cache->aon_valid = true;
++	aon_report_pending = true;
++}
++
++static const char *samsung_clk_aon_action(const struct samsung_clk_aon_reg *aon)
++{
++	if (aon->state == SAMSUNG_AON_RESTORED)
++		return "rewritten";
++	if (aon->cls == SAMSUNG_RESUME_NEVER)
++		return "left (class 0, never written)";
++	return aon->cls == SAMSUNG_RESUME_LEAF ?
++		"left (class 1)" :
++		"left (class 2, never written)";
++}
++
++static phys_addr_t samsung_clk_cache_phys(void __iomem *base);
++
++/* process context after the resume: log what the syscore resume found */
++static void samsung_clk_aon_report(struct samsung_clock_reg_cache *reg_cache)
++{
++	const struct samsung_clk_reg_dump *rd = reg_cache->rdump;
++	const struct samsung_clk_aon_reg *aon = reg_cache->aon;
++	const char *name = reg_cache->name ?: "CMU";
++	phys_addr_t phys = samsung_clk_cache_phys(reg_cache->reg_base);
++	unsigned int i, ndiff = 0, nrest = 0;
++	u32 now, expect;
++	bool again;
++
++	for (i = 0; i < reg_cache->rd_num; i++) {
++		if (aon[i].state != SAMSUNG_AON_SAME)
++			ndiff++;
++		if (aon[i].state == SAMSUNG_AON_RESTORED)
++			nrest++;
++	}
++	pr_info("clk: %s %pa after resume: %u of %u registers differ from suspend, %u rewritten\n",
++		name, &phys, ndiff, reg_cache->rd_num, nrest);
++
++	for (i = 0; i < reg_cache->rd_num; i++, rd++, aon++) {
++		if (aon->state == SAMSUNG_AON_SAME)
++			continue;
++		/* a second look: did anyone change it after the syscore resume? */
++		now = readl(reg_cache->reg_base + rd->offset);
++		expect = aon->state == SAMSUNG_AON_RESTORED ? rd->value : aon->wake;
++		again = samsung_clk_reg_differs(now, expect);
++		pr_info("clk:   %s +0x%04x %s: suspend 0x%08x resume 0x%08x%s boot 0x%08x, %s%s\n",
++			name, rd->offset, aon->name ?: "?", rd->value, aon->wake,
++			samsung_clk_reg_differs(aon->wake, aon->boot) ? "" : " (= boot)",
++			aon->boot, samsung_clk_aon_action(aon),
++			again ? ", changed again later" : "");
++		if (again)
++			pr_info("clk:   %s +0x%04x now 0x%08x\n", name, rd->offset,
++				now);
++	}
++}
++
++static int samsung_clk_pm_notify(struct notifier_block *nb,
++				 unsigned long action, void *data)
+ {
+ 	struct samsung_clock_reg_cache *reg_cache;
+ 
++	/* s2idle and aborted suspends never ran the syscore resume */
++	if (action != PM_POST_SUSPEND || !aon_report_pending)
++		return NOTIFY_DONE;
++	aon_report_pending = false;
++
+ 	list_for_each_entry(reg_cache, &clock_reg_cache_list, node)
+-		samsung_clk_restore(reg_cache->reg_base, reg_cache->sysreg,
+-				    reg_cache->rdump, reg_cache->rd_num);
++		if (reg_cache->aon && reg_cache->aon_valid)
++			samsung_clk_aon_report(reg_cache);
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block samsung_clk_pm_nb = {
++	.notifier_call = samsung_clk_pm_notify,
++};
++
++static bool samsung_clk_skip_restore(const struct samsung_clock_reg_cache *reg_cache)
++{
++	if (reg_cache->sleep_skip & SAMSUNG_SLEEP_SKIP_FW_OWNED)
++		return true;
++	if (reg_cache->sleep_skip & SAMSUNG_SLEEP_SKIP_CPU_CLUSTER)
++		return true;
++	if (reg_cache->sleep_skip & SAMSUNG_SLEEP_SKIP_ALWAYS_ON)
++		return true;
++	return false;
++}
++
++/* debug: called before each cache restore, NULL = off */
++void (*samsung_clk_resume_hook)(unsigned int idx, void __iomem *base);
++
++static phys_addr_t samsung_clk_cache_phys(void __iomem *base)
++{
++	if (!base || !is_vmalloc_addr((__force void *)base))
++		return 0;
++	return ((phys_addr_t)vmalloc_to_pfn((__force void *)base) << PAGE_SHIFT) |
++	       offset_in_page(base);
++}
++
++/* list the caches in restore order: index, CMU physical base, pd guard */
++void samsung_clk_for_each_cache(void (*cb)(unsigned int idx, phys_addr_t base,
++					   bool pd_guard))
++{
++	struct samsung_clock_reg_cache *reg_cache;
++	unsigned int idx = 0;
++
++	list_for_each_entry(reg_cache, &clock_reg_cache_list, node)
++		cb(idx++, samsung_clk_cache_phys(reg_cache->reg_base),
++		   !!reg_cache->pd_status);
++}
++
++static void samsung_clk_resume(void *data)
++{
++	struct samsung_clock_reg_cache *reg_cache;
++	unsigned int idx = 0;
++
++	list_for_each_entry(reg_cache, &clock_reg_cache_list, node) {
++		if (samsung_clk_resume_hook)
++			samsung_clk_resume_hook(idx, reg_cache->reg_base);
++		idx++;
++		if (samsung_clk_skip_restore(reg_cache)) {
++			/* always-on CMU, cache not written back: diff + leaves */
++			if (reg_cache->aon && !reg_cache->skipped)
++				samsung_clk_aon_resume(reg_cache);
++			continue;
++		}
++		if (reg_cache->skipped ||
++		    (reg_cache->pd_status &&
++		     !(readl(reg_cache->pd_status) & 0x1)))
++			continue;
++		samsung_clk_restore_changed(reg_cache->reg_base, reg_cache->sysreg,
++					    reg_cache->rdump, reg_cache->rd_num);
++	}
+ }
+ 
+ static const struct syscore_ops samsung_clk_syscore_ops = {
+@@ -421,6 +652,84 @@ static struct syscore samsung_clk_syscore = {
+ 	.ops = &samsung_clk_syscore_ops,
+ };
+ 
++/*
++ * Attach the power domain STATUS register and the sleep_skip flags of one CMU
++ * to its register caches (its own registers and its sysreg), see
++ * samsung_cmu_info.pd_status and .sleep_skip.
++ */
++/*
++ * Always-on CMU: resume class and name of each cached register, and its boot
++ * value (the firmware's, read when the CMU is registered, before any Linux
++ * consumer changed it).
++ */
++static void samsung_clk_aon_init(void __iomem *reg_base,
++				 const struct samsung_cmu_info *cmu)
++{
++	static bool pm_nb_registered;
++	struct samsung_clock_reg_cache *reg_cache;
++	struct samsung_clk_aon_reg *aon;
++	unsigned int i, j;
++
++	list_for_each_entry(reg_cache, &clock_reg_cache_list, node) {
++		if (reg_cache->reg_base != reg_base || !reg_cache->rd_num ||
++		    reg_cache->aon)
++			continue;
++		aon = kcalloc(reg_cache->rd_num, sizeof(*aon), GFP_KERNEL);
++		if (!aon) {
++			pr_warn("%s: no memory for the resume diff\n", __func__);
++			return;
++		}
++		for (i = 0; i < reg_cache->rd_num; i++) {
++			unsigned long off = reg_cache->rdump[i].offset;
++
++			aon[i].boot = readl(reg_base + off);
++			aon[i].cls = SAMSUNG_RESUME_NEVER;
++			for (j = 0; j < cmu->nr_resume_regs; j++) {
++				if (cmu->resume_regs[j].offset != off)
++					continue;
++				aon[i].cls = cmu->resume_regs[j].cls;
++				aon[i].name = cmu->resume_regs[j].name;
++				break;
++			}
++		}
++		reg_cache->aon = aon;
++		reg_cache->name = cmu->sleep_name;
++	}
++
++	if (!pm_nb_registered) {
++		pm_nb_registered = true;
++		register_pm_notifier(&samsung_clk_pm_nb);
++	}
++}
++
++void samsung_clk_sleep_set_cmu(void __iomem *reg_base, struct regmap *sysreg,
++			       const struct samsung_cmu_info *cmu)
++{
++	struct samsung_clock_reg_cache *reg_cache;
++	phys_addr_t pd_status = cmu->pd_status;
++	void __iomem *status = NULL;
++
++	if (!pd_status && !cmu->sleep_skip)
++		return;
++
++	if (reg_base && (cmu->sleep_skip & SAMSUNG_SLEEP_SKIP_ALWAYS_ON))
++		samsung_clk_aon_init(reg_base, cmu);
++
++	if (pd_status) {
++		status = ioremap(pd_status, 4);
++		if (!status)
++			pr_warn("%s: cannot map %pa\n", __func__, &pd_status);
++	}
++
++	list_for_each_entry(reg_cache, &clock_reg_cache_list, node)
++		if ((reg_base && reg_cache->reg_base == reg_base) ||
++		    (sysreg && reg_cache->sysreg == sysreg)) {
++			if (status)
++				reg_cache->pd_status = status;
++			reg_cache->sleep_skip |= cmu->sleep_skip;
++		}
++}
++
+ void samsung_clk_extended_sleep_init(void __iomem *reg_base,
+ 			struct regmap *sysreg,
+ 			const unsigned long *rdump,
+@@ -556,5 +865,7 @@ struct samsung_clk_provider * __init samsung_cmu_register_one(
+ 	/* sysreg DT nodes reference a clock in this CMU */
+ 	samsung_en_dyn_root_clk_gating(np, ctx, cmu, false);
+ 
++	samsung_clk_sleep_set_cmu(reg_base, ctx->sysreg, cmu);
++
+ 	return ctx;
+ }
+diff --git a/drivers/clk/samsung/clk.h b/drivers/clk/samsung/clk.h
+index 3b8d51e9b7..9beb2b7521 100644
+--- a/drivers/clk/samsung/clk.h
++++ b/drivers/clk/samsung/clk.h
+@@ -326,10 +326,65 @@ struct samsung_clock_reg_cache {
+ 	struct regmap *sysreg;
+ 	const struct samsung_clk_reg_dump *rsuspend;
+ 	unsigned int rsuspend_num;
++	/* power domain STATUS register (bit 0 = on), NULL if always on */
++	void __iomem *pd_status;
++	/* registers not saved at suspend (power domain off) */
++	bool skipped;
++	/* SAMSUNG_SLEEP_SKIP_* flags of the CMU, see samsung_cmu_info */
++	unsigned int sleep_skip;
++	/*
++	 * Always-on CMUs (SAMSUNG_SLEEP_SKIP_ALWAYS_ON) only: per register
++	 * resume class, name, boot and post-sleep value (rd_num entries), and
++	 * whether the last syscore resume filled them in. NULL otherwise.
++	 */
++	struct samsung_clk_aon_reg *aon;
++	const char *name;
++	bool aon_valid;
+ 	unsigned int rd_num;
+ 	struct samsung_clk_reg_dump rdump[] __counted_by(rd_num);
+ };
+ 
++/*
++ * Resume classes of the registers of an always-on CMU (CMU_TOP) whose cache
++ * the syscore resume does not write back (SAMSUNG_SLEEP_SKIP_ALWAYS_ON).
++ * The syscore resume rewrites the changed registers of class 1.
++ */
++/* PLLs, system bus/NoC, APM, CP, CPU, MIF, DPU, G3D switch: never written */
++#define SAMSUNG_RESUME_NEVER	0
++/* leaf of a block that is powered off at syscore resume (ISP, MFC, NPU...) */
++#define SAMSUNG_RESUME_LEAF	1
++/* leaf of an I/O block that is quiescent at syscore resume (UFS, USB...) */
++#define SAMSUNG_RESUME_IO	2
++
++struct samsung_clk_resume_reg {
++	unsigned long offset;
++	unsigned int cls;
++	const char *name;
++};
++
++struct samsung_clk_aon_reg {
++	const char *name;	/* NULL: unnamed, the log prints the offset */
++	u32 boot;		/* value when the CMU was registered */
++	u32 wake;		/* value read at the last syscore resume */
++	u8 cls;			/* SAMSUNG_RESUME_* */
++	u8 state;		/* SAMSUNG_AON_* */
++};
++
++#define SAMSUNG_AON_SAME	0
++#define SAMSUNG_AON_DIFF	1
++#define SAMSUNG_AON_RESTORED	2
++
++/*
++ * samsung_cmu_info.sleep_skip: CMUs whose registers the syscore resume must
++ * not write back after a SoC sleep (each class has a clk.skip_*_restore knob).
++ */
++/* owned by the firmware (APM) across sleep, e.g. CMU_MIF0..3 */
++#define SAMSUNG_SLEEP_SKIP_FW_OWNED	BIT(0)
++/* inside a CPU cluster's power domain, e.g. CMU_CPUCL0/CMU_CPUCL2 */
++#define SAMSUNG_SLEEP_SKIP_CPU_CLUSTER	BIT(1)
++/* always-on top/bus CMUs Samsung's SLEEP save list never writes (CMU_TOP...) */
++#define SAMSUNG_SLEEP_SKIP_ALWAYS_ON	BIT(2)
++
+ /**
+  * struct samsung_cmu_info - all clocks information needed for CMU registration
+  * @pll_clks: list of PLL clocks
+@@ -360,6 +415,15 @@ struct samsung_clock_reg_cache {
+  * @option_offset: option reg offset. Enables auto clk mode for entire CMU
+  * @drcg_offset: dynamic root clk gate enable register offset in sysreg
+  * @memclk_offset: memclk enable register offset in sysreg
++ * @pd_status: physical address of the PMU STATUS register (bit 0 = on) of the
++ *	power domain that contains the CMU and its sysreg, 0 if always on.
++ *	The syscore suspend/resume skips the CMU while the domain is off.
++ * @sleep_skip: SAMSUNG_SLEEP_SKIP_* flags: the syscore resume does not
++ *	restore the CMU's (and its sysreg's) register cache.
++ * @resume_regs: always-on CMUs: SAMSUNG_RESUME_* class and name of registers
++ *	of @clk_regs (registers not listed are SAMSUNG_RESUME_NEVER)
++ * @nr_resume_regs: count of entries in @resume_regs
++ * @sleep_name: name of the CMU in the resume log (e.g. "CMU_TOP")
+  */
+ struct samsung_cmu_info {
+ 	const struct samsung_pll_clock *pll_clks;
+@@ -395,6 +459,11 @@ struct samsung_cmu_info {
+ 	u32 option_offset;
+ 	u32 drcg_offset;
+ 	u32 memclk_offset;
++	phys_addr_t pd_status;
++	unsigned int sleep_skip;
++	const struct samsung_clk_resume_reg *resume_regs;
++	unsigned int nr_resume_regs;
++	const char *sleep_name;
+ };
+ 
+ struct samsung_clk_provider *samsung_clk_init(struct device *dev,
+@@ -458,6 +527,14 @@ static inline void samsung_clk_extended_sleep_init(void __iomem *reg_base,
+ 			const struct samsung_clk_reg_dump *rsuspend,
+ 			unsigned long nr_rsuspend) {}
+ #endif
++#ifdef CONFIG_PM_SLEEP
++void samsung_clk_sleep_set_cmu(void __iomem *reg_base, struct regmap *sysreg,
++			       const struct samsung_cmu_info *cmu);
++#else
++static inline void samsung_clk_sleep_set_cmu(void __iomem *reg_base,
++					     struct regmap *sysreg,
++					     const struct samsung_cmu_info *cmu) {}
++#endif
+ #define samsung_clk_sleep_init(reg_base, sysreg, rdump, nr_rdump)	   \
+ 	samsung_clk_extended_sleep_init(reg_base, sysreg, rdump, nr_rdump, \
+ 					NULL, 0)

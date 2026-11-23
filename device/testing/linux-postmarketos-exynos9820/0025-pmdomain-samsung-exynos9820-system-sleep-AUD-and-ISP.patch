@@ -1,0 +1,893 @@
+From 5aa295da0544add0c78d77a26a2de3a9d6c72665 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] pmdomain: samsung: exynos9820: system sleep, AUD and ISPPRE
+ state restore
+
+Make the Exynos 9820 power domains work across suspend-to-idle and a
+SoC sleep:
+
+ - AUD is kept on during suspend-to-idle (sleep_on, default "AUD") and
+   powered off before a suspend-to-RAM; its CMU/SYSREG state is saved
+   and restored around a power cycle, with 10 ms for the PLLs to lock.
+ - D_TZPC of the powered domains is saved before a SoC sleep and
+   restored after it.
+ - Domains whose power-off does not complete (NPU0, DSPM, ISPLP): the
+   feed clocks are switched on around every power transition, a
+   request that still times out is withdrawn and re-issued, and a
+   domain that stays stuck is left on.
+ - Devices of child domains are kept out of system sleep handling.
+ - ISPPRE: the block loses the bootloader's CMU/SYSREG setup in a
+   power cycle and then no longer completes a power-down. As the
+   vendor PMUCAL sequence does, the BUSP divider, the bus user mux,
+   the Q-channel control registers, the controller option register,
+   DRCG and MEMCLK are kept across the cycle when the domain has a
+   D_TZPC address.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/pmdomain/samsung/exynos-pm-domains.c | 753 ++++++++++++++++++-
+ 1 file changed, 745 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/pmdomain/samsung/exynos-pm-domains.c b/drivers/pmdomain/samsung/exynos-pm-domains.c
+index b2313bc876..4261d364dd 100644
+--- a/drivers/pmdomain/samsung/exynos-pm-domains.c
++++ b/drivers/pmdomain/samsung/exynos-pm-domains.c
+@@ -10,6 +10,7 @@
+ // based power domain support is included.
+ 
+ #include <linux/arm-smccc.h>
++#include <linux/clk.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/err.h>
+@@ -21,6 +22,9 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/pm_runtime.h>
++#include <linux/suspend.h>
++
++#include <dt-bindings/clock/exynos9820.h>
+ 
+ struct exynos_pm_domain;
+ 
+@@ -50,6 +54,70 @@ struct exynos9820_g3d {
+ 	u32 sysreg_save;
+ };
+ 
++/*
++ * Exynos 9820 AUD domain (ABOX, CMU_AUD, SYSREG_AUD, GPIO_AUD, SYSMMU_AUD).
++ *
++ * CMU_AUD and SYSREG_AUD are inside the domain and come back from a power
++ * cycle with their reset values; the downstream PMUCAL sequence (aud_save
++ * in cal-if/exynos9820/flexpmu_cal_local_exynos9820.h) saves and restores
++ * them around it. The clock framework caches the CMU_AUD rates and parents
++ * and never re-reads them, so the registers must be restored exactly.
++ */
++struct exynos9820_aud {
++	void __iomem *cmu;	/* CMU_AUD */
++	void __iomem *sysreg;	/* SYSREG_AUD */
++	u32 cmu_save[64];
++	u32 pll_save[2];
++	u32 sysreg_save[3];
++	bool saved;
++};
++
++/*
++ * ISPPRE (camera front end): like AUD, CMU_ISPPRE and SYSREG_ISPPRE come back
++ * from a power cycle with reset values, and with those the block does not
++ * complete the next power-down (STATUS stays 1). The downstream PMUCAL
++ * sequence isppre_save keeps the boot loader's values across the cycle:
++ * BUSP divider, bus user mux, all Q-channel controls, the controller option
++ * register, DRCG and MEMCLK. Only done when the domain has a D_TZPC address,
++ * because without the EL3 restore the registers are not accessible at all.
++ */
++#define EXYNOS9820_ISPPRE_CMU		0x17000000
++#define EXYNOS9820_ISPPRE_CMU_SIZE	0x4000
++#define EXYNOS9820_ISPPRE_SYSREG	0x17020000
++#define EXYNOS9820_ISPPRE_SYSREG_SIZE	0x200
++#define EXYNOS9820_ISPPRE_QCH_FIRST	0x3020
++#define EXYNOS9820_ISPPRE_QCH_LAST	0x30bc
++#define EXYNOS9820_ISPPRE_NR_QCH	\
++	((EXYNOS9820_ISPPRE_QCH_LAST - EXYNOS9820_ISPPRE_QCH_FIRST) / 4 + 1)
++
++struct exynos9820_isppre {
++	void __iomem *cmu;
++	void __iomem *sysreg;
++	u32 busp_div;		/* 0x1804 */
++	u32 user_mux;		/* 0x0100 */
++	u32 qch[EXYNOS9820_ISPPRE_NR_QCH];
++	u32 option;		/* 0x0800 */
++	u32 drcg;		/* SYSREG 0x0104 */
++	u32 memclk;		/* SYSREG 0x0108 */
++	bool saved;
++	bool logged;
++};
++
++/*
++ * Exynos 9820 domain description: the D_TZPC SFR of the block ("need_smc"
++ * of the downstream pd node, exynos9820-pm-domains.dtsi) and the clocks that
++ * feed it from outside the domain: the CMU_TOP CLKCMU_<blk> gates and the
++ * BUSC side of the block's LH bus bridges. Up to EXYNOS9820_PD_MAX_FEEDS.
++ */
++#define EXYNOS9820_PD_MAX_FEEDS		3
++
++struct exynos9820_pd_info {
++	const char *name;
++	u32 dtzpc;
++	u16 top[EXYNOS9820_PD_MAX_FEEDS];
++	u16 busc[EXYNOS9820_PD_MAX_FEEDS];
++};
++
+ /*
+  * Exynos specific wrapper around the generic power domain
+  */
+@@ -60,8 +128,114 @@ struct exynos_pm_domain {
+ 	/* D_TZPC SFR the secure monitor saves/restores, 0 if none */
+ 	u32 dtzpc_addr;
+ 	struct exynos9820_g3d *g3d;
++	struct exynos9820_aud *aud;
++	struct exynos9820_isppre *isppre;
++	/* Exynos 9820: recover from a power transition that does not complete */
++	bool unstick;
++	const struct exynos9820_pd_info *info;
++	struct clk *feeds[2 * EXYNOS9820_PD_MAX_FEEDS];
++	unsigned int nfeeds;		/* published by exynos9820_pd_feeds_init */
++	unsigned int nfeeds_init;
++	struct list_head node;
++	/* D_TZPC saved before a real SoC SLEEP, restore after it */
++	bool sleep_dtzpc_saved;
+ };
+ 
++/*
++ * Domains that must stay powered during system sleep, by name (comma separated).
++ *
++ * History: "AUD" while the ABOX driver had no sleep callbacks and the AUD
++ * domain did not restore D_TZPC_AUD / CMU_AUD (SError in the AUD pinctrl
++ * restore); "" once AUD could really be off in s2idle; then "AUD" again
++ * because AUD-off s2idle gave no power gain and was followed once by a
++ * kernel-text corruption oops.
++ *
++ * The two sleep modes need the opposite:
++ *  - s2idle: keep AUD on (no gain from AUD off, and AUD off is the one case
++ *    that crashed);
++ *  - suspend-to-RAM (exynos9820-suspend, PSCI SYSTEM SLEEP): AUD must be off
++ *    before the PSCI call. The firmware power-cycles every non-alive block
++ *    anyway, and a domain genpd kept on comes back unpowered/secure behind
++ *    its back (the D_TZPC_AUD restore SMC hangs).
++ * So the list only applies to PM_SUSPEND_TO_IDLE (and to hibernation's
++ * freeze/poweroff, i.e. everything except PM_SUSPEND_MEM).
++ * pm_suspend_target_state is set by suspend_devices_and_enter()
++ * before the first device callback and reset after the last one, so it is
++ * valid in genpd's suspend_noirq, where power_off is called.
++ *
++ * Writable at run time; it is read on every power_off.
++ */
++static char sleep_on[64] = "AUD";
++module_param_string(sleep_on, sleep_on, sizeof(sleep_on), 0644);
++MODULE_PARM_DESC(sleep_on,
++		 "Domains kept powered during system sleep, comma separated (default: \"AUD\"; s2idle only; \"\" lets AUD off in s2idle too)");
++
++static bool exynos_pd_in_list(const char *list, const char *name)
++{
++	size_t n = strlen(name);
++	const char *p = list;
++
++	while (*p) {
++		/* '\n': the value may come from "echo AUD > .../sleep_on" */
++		if (!strncmp(p, name, n) &&
++		    (p[n] == ',' || p[n] == '\0' || p[n] == '\n'))
++			return true;
++		p = strchrnul(p, ',');
++		if (*p)
++			p++;
++	}
++	return false;
++}
++
++/*
++ * genpd system sleep (suspended_count != 0): should @pd stay on?
++ * See sleep_on above. Logged once per sleep for the listed domains so the
++ * test logs show which way it went.
++ */
++static bool exynos_pd_keep_for_sleep(struct exynos_pm_domain *pd)
++{
++	suspend_state_t state = READ_ONCE(pm_suspend_target_state);
++	bool keep;
++
++	if (!exynos_pd_in_list(sleep_on, pd->pd.name))
++		return false;
++
++	keep = state != PM_SUSPEND_MEM;
++	pr_info("Power domain %s: %s for %s (sleep_on)\n", pd->pd.name,
++		keep ? "kept on" : "allowed off",
++		state == PM_SUSPEND_MEM ? "suspend-to-RAM" :
++		state == PM_SUSPEND_TO_IDLE ? "s2idle" : "system sleep");
++	return keep;
++}
++
++/*
++ * NPU0, DSPM and ISPLP do not power off: CONFIGURATION reads 0 but STATUS
++ * stays 1 forever. The downstream sequences for them are the same plain
++ * CONFIGURATION write + STATUS wait as ours (flexpmu_cal_local_exynos9820.h
++ * npu0_off/dspm_off/isplp_off), so the difference is the state of the SoC
++ * around the write. Two suspects, both handled here:
++ *  - clk_disable_unused (late_initcall_sync, runs before genpd powers the
++ *    unused domains off) has gated the CMU_TOP CLKCMU_<blk> clocks and the
++ *    BUSC LH clocks of the block; downstream never gates them that way.
++ *    The power-down handshake (Q-channels, LH bridges) cannot finish
++ *    without a clock.
++ *  - all three are parents of a subdomain (NPU1, DSPS, VRA2) and genpd
++ *    writes the parent's CONFIGURATION right after the child's STATUS went
++ *    to 0; a request the PMU dropped is re-issued.
++ * If nothing helps, the request is withdrawn (CONFIGURATION back to 1), so
++ * the PMU cannot power the block down later behind genpd's back.
++ */
++/*
++ * The feed clocks must be on before the first CONFIGURATION write, so they
++ * are kept on around every transition.
++ * A power-off attempted with them gated (clk_disable_unused runs before
++ * genpd_power_off_unused) leaves NPU0/DSPM/ISPLP stuck at CONFIGURATION 0 /
++ * STATUS 1, and enabling them afterwards (step 1) never recovers it. With the
++ * clocks on all three power off at boot (same result as clk_ignore_unused).
++ */
++/* wait per recovery step, in microseconds */
++#define EXYNOS9820_PD_UNSTICK_US	10000
++
+ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
+ {
+ 	struct exynos_pm_domain *pd;
+@@ -98,6 +272,50 @@ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
+ #define EXYNOS_WAKEUP_PD_DOWN			1
+ #define EXYNOS_RUNTIME_PM_TZPC_GROUP		2
+ 
++/* Block powered, clocked and D_TZPC valid (before the save SMC). */
++static void exynos9820_isppre_save(struct exynos9820_isppre *ip)
++{
++	int i;
++
++	ip->busp_div = readl(ip->cmu + 0x1804);
++	ip->user_mux = readl(ip->cmu + 0x0100);
++	for (i = 0; i < EXYNOS9820_ISPPRE_NR_QCH; i++)
++		ip->qch[i] = readl(ip->cmu + EXYNOS9820_ISPPRE_QCH_LAST - 4 * i);
++	ip->option = readl(ip->cmu + 0x0800);
++	ip->drcg = readl(ip->sysreg + 0x0104);
++	ip->memclk = readl(ip->sysreg + 0x0108);
++	ip->saved = true;
++
++	if (!ip->logged) {
++		ip->logged = true;
++		pr_info("Power domain ISPPRE: saved BUSP div %#x user mux %#x option %#x DRCG %#x MEMCLK %#x, QCH_CON 0x30bc..0x3020:\n",
++			ip->busp_div, ip->user_mux, ip->option, ip->drcg,
++			ip->memclk);
++		print_hex_dump(KERN_INFO, "ISPPRE QCH: ", DUMP_PREFIX_OFFSET, 32,
++			       4, ip->qch, sizeof(ip->qch), false);
++	}
++}
++
++/* After the power-on and the D_TZPC restore, downstream order. */
++static void exynos9820_isppre_restore(struct exynos9820_isppre *ip)
++{
++	u32 val;
++	int i;
++
++	if (!ip->saved)
++		return;
++
++	writel(ip->busp_div, ip->cmu + 0x1804);
++	writel(ip->user_mux, ip->cmu + 0x0100);
++	readl_poll_timeout_atomic(ip->cmu + 0x0100, val, !(val & BIT(7)), 1, 200);
++	for (i = 0; i < EXYNOS9820_ISPPRE_NR_QCH; i++)
++		writel(ip->qch[i], ip->cmu + EXYNOS9820_ISPPRE_QCH_LAST - 4 * i);
++	writel(ip->option, ip->cmu + 0x0800);
++	writel(ip->drcg, ip->sysreg + 0x0104);
++	val = readl(ip->sysreg + 0x0108);
++	writel((val & ~1U) | (ip->memclk & 1), ip->sysreg + 0x0108);
++}
++
+ static int exynos_pd_dtzpc(struct exynos_pm_domain *pd, bool wakeup)
+ {
+ 	struct arm_smccc_res res;
+@@ -118,6 +336,217 @@ static int exynos_pd_dtzpc(struct exynos_pm_domain *pd, bool wakeup)
+ 	return 0;
+ }
+ 
++/*
++ * D_TZPC: downstream exynos9820-pm-domains.dtsi need_smc. Feed clocks: the
++ * CMU_TOP gates named after the block and the BUSC LHM gates of its data
++ * bridges that the clock driver does not mark critical (clk-exynos9820.c).
++ * DPU and G3D are left out (display in use, G3D has its own sequence).
++ */
++static const struct exynos9820_pd_info exynos9820_pd_info[] = {
++	{ "AUD",    0x18c62000, { }, { } },
++	{ "DPU",    0x191b0204, { }, { } },
++	{ "NPU0",   0x17920204, { CLK_GOUT_CMU_NPU0_BUS, CLK_GOUT_CMU_NPU0_CPU },
++			       { CLK_GOUT_BUSC_LHM_ACEL_D_NPU_I_CLK } },
++	{ "NPU1",   0x17a20204, { CLK_GOUT_CMU_NPU1_BUS }, { } },
++	{ "DSPM",   0x17ca0204, { CLK_GOUT_CMU_DSPM_BUS },
++			       { CLK_GOUT_BUSC_LHM_ACEL_D0_DSPM_I_CLK,
++				 CLK_GOUT_BUSC_LHM_ACEL_D1_DSPM_I_CLK } },
++	{ "DSPS",   0x17f20204, { CLK_GOUT_CMU_DSPS_AUD }, { } },
++	{ "G2D",    0x18a10204, { CLK_GOUT_CMU_G2D_G2D, CLK_GOUT_CMU_G2D_MSCL },
++			       { CLK_GOUT_BUSC_LHM_ACEL_D0_G2D_I_CLK,
++				 CLK_GOUT_BUSC_LHM_ACEL_D1_G2D_I_CLK,
++				 CLK_GOUT_BUSC_LHM_ACEL_D2_G2D_I_CLK } },
++	{ "ISPPRE", 0x17010204, { CLK_GOUT_CMU_ISPPRE_BUS }, { } },
++	{ "ISPHQ",  0x17710204, { CLK_GOUT_CMU_ISPHQ_BUS }, { } },
++	{ "ISPLP",  0x17410204, { CLK_GOUT_CMU_ISPLP_BUS, CLK_GOUT_CMU_ISPLP_GDC }, { } },
++	{ "IVA",    0x18070204, { CLK_GOUT_CMU_IVA_BUS },
++			       { CLK_GOUT_BUSC_LHM_ACEL_D_IVA_I_CLK } },
++	{ "MFC",    0x18820204, { CLK_GOUT_CMU_MFC_MFC, CLK_GOUT_CMU_MFC_WFD }, { } },
++	{ "VTS",    0x15410204, { }, { } },
++	{ "VRA2",   0x17610204, { CLK_GOUT_CMU_VRA2_BUS, CLK_GOUT_CMU_VRA2_STR }, { } },
++};
++
++/* Exynos 9820 domains, for the late feed clock lookup */
++static LIST_HEAD(exynos9820_pds);
++
++/*
++ * A real SoC SLEEP (exynos9820-suspend, PSCI 0x03000000) power-cycles
++ * every non-alive domain behind genpd's back, also those genpd keeps on (AUD
++ * with sleep_on, DPU, G3D...). Their D_TZPC must be saved before and restored
++ * after, or every SFR of the block is secure-only after the wake (CMU_AUD
++ * restore in samsung_clk_resume hung). Called with IRQs off from
++ * exynos9820-suspend's ->enter, before the PSCI call and right after it returns.
++ */
++/* debug: before each restore SMC, idx in exynos9820_pds, status bit */
++void (*exynos9820_pd_sleep_hook)(unsigned int idx, bool on);
++
++void exynos9820_pd_for_each(void (*cb)(unsigned int idx, const char *name, u32 dtzpc))
++{
++	struct exynos_pm_domain *pd;
++	unsigned int idx = 0;
++
++	list_for_each_entry(pd, &exynos9820_pds, node)
++		cb(idx++, pd->pd.name,
++		   pd->dtzpc_addr ?: (pd->info ? pd->info->dtzpc : 0));
++}
++
++void exynos9820_pd_sleep_dtzpc(bool resume)
++{
++	struct exynos_pm_domain *pd;
++	struct arm_smccc_res res;
++	unsigned int idx = 0;
++	bool on;
++	u32 addr;
++
++	list_for_each_entry(pd, &exynos9820_pds, node) {
++		unsigned int i = idx++;
++
++		addr = pd->dtzpc_addr ?: (pd->info ? pd->info->dtzpc : 0);
++		if (!addr)
++			continue;
++		if (resume && pd->sleep_dtzpc_saved) {
++			on = (readl_relaxed(pd->base + 0x4) & pd->local_pwr_cfg) ==
++			     pd->local_pwr_cfg;
++			if (exynos9820_pd_sleep_hook)
++				exynos9820_pd_sleep_hook(i, on);
++			if (!on) {
++				/* not powered after the wake: no SMC into a dead block */
++				pd->sleep_dtzpc_saved = false;
++				continue;
++			}
++		}
++		if (!resume) {
++			pd->sleep_dtzpc_saved =
++				(readl_relaxed(pd->base + 0x4) & pd->local_pwr_cfg) ==
++				pd->local_pwr_cfg;
++			if (!pd->sleep_dtzpc_saved)
++				continue;
++		} else if (!pd->sleep_dtzpc_saved) {
++			continue;
++		}
++		arm_smccc_smc(EXYNOS_SMC_CMD_PREPARE_PD_ONOFF,
++			      resume ? EXYNOS_WAKEUP_PD_DOWN : EXYNOS_GET_IN_PD_DOWN,
++			      addr, EXYNOS_RUNTIME_PM_TZPC_GROUP, 0, 0, 0, 0, &res);
++		if (res.a0)
++			pr_err("Power domain %s: sleep D_TZPC %s SMC (%#x) failed: 0x%lx\n",
++			       pd->pd.name, resume ? "restore" : "save", addr, res.a0);
++		if (resume)
++			pd->sleep_dtzpc_saved = false;
++	}
++}
++
++#define EXYNOS9820_PD_STATES		0x8
++#define EXYNOS9820_PD_FIRST_US		1000
++
++static bool exynos9820_pd_feeds_enable(struct exynos_pm_domain *pd,
++				       unsigned int n)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i++) {
++		if (clk_enable(pd->feeds[i])) {
++			while (i--)
++				clk_disable(pd->feeds[i]);
++			return false;
++		}
++	}
++
++	return n > 0;
++}
++
++static void exynos9820_pd_feeds_disable(struct exynos_pm_domain *pd,
++					unsigned int n)
++{
++	while (n--)
++		clk_disable(pd->feeds[n]);
++}
++
++static void exynos9820_pd_dump(struct exynos_pm_domain *pd, const char *what)
++{
++	pr_warn("Power domain %s: %s (CONFIGURATION %#x STATUS %#x STATES %#x)\n",
++		pd->pd.name, what, readl_relaxed(pd->base),
++		readl_relaxed(pd->base + 0x4),
++		readl_relaxed(pd->base + EXYNOS9820_PD_STATES));
++}
++
++static int exynos9820_pd_wait(struct exynos_pm_domain *pd, u32 want,
++			      unsigned int timeout_us)
++{
++	u32 val;
++
++	return readl_relaxed_poll_timeout(pd->base + 0x4, val,
++					  (val & pd->local_pwr_cfg) == want,
++					  20, timeout_us);
++}
++
++/*
++ * CONFIGURATION write + STATUS wait (all the downstream sequence does for
++ * these domains), then the recovery steps described above. Only PMU
++ * registers and clocks of always-on CMUs are touched, never the block itself.
++ */
++static int exynos9820_pd_switch(struct exynos_pm_domain *pd, bool on)
++{
++	unsigned int n = smp_load_acquire(&pd->nfeeds);
++	unsigned int tmo = max((unsigned int)EXYNOS9820_PD_UNSTICK_US,
++			       (unsigned int)EXYNOS9820_PD_FIRST_US);
++	u32 want = on ? pd->local_pwr_cfg : 0;
++	u32 other = on ? 0 : pd->local_pwr_cfg;
++	const char *op = on ? "enable" : "disable";
++	bool clocks = false;
++	int ret;
++
++	clocks = exynos9820_pd_feeds_enable(pd, n);
++
++	writel_relaxed(want, pd->base);
++	ret = exynos9820_pd_wait(pd, want, EXYNOS9820_PD_FIRST_US);
++	if (!ret)
++		goto out;
++
++	exynos9820_pd_dump(pd, on ? "power-on not done after 1 ms" :
++				    "power-off not done after 1 ms");
++
++	/* step 1: clock the handshake */
++	if (!clocks && n) {
++		clocks = exynos9820_pd_feeds_enable(pd, n);
++		if (clocks) {
++			ret = exynos9820_pd_wait(pd, want, tmo);
++			if (!ret) {
++				pr_info("Power domain %s: %s done after enabling %u feed clocks\n",
++					pd->pd.name, op, n);
++				goto out;
++			}
++		}
++	}
++
++	/* step 2: withdraw and re-issue the request */
++	writel_relaxed(other, pd->base);
++	exynos9820_pd_wait(pd, other, tmo);
++	usleep_range(100, 200);
++	writel_relaxed(want, pd->base);
++	ret = exynos9820_pd_wait(pd, want, tmo);
++	if (!ret) {
++		pr_info("Power domain %s: %s done after re-issuing the request\n",
++			pd->pd.name, op);
++		goto out;
++	}
++
++	/* give up */
++	exynos9820_pd_dump(pd, on ? "enable failed" : "disable failed");
++	if (!on) {
++		/* no surprise power-off later: genpd keeps the domain on */
++		writel_relaxed(pd->local_pwr_cfg, pd->base);
++		if (exynos9820_pd_wait(pd, pd->local_pwr_cfg, tmo))
++			exynos9820_pd_dump(pd, "does not return to on");
++	}
++	pr_err("Power domain %s %s failed%s\n", pd->pd.name, op,
++	       on ? "" : ", request withdrawn, domain stays on");
++	ret = -ETIMEDOUT;
++out:
++	if (clocks)
++		exynos9820_pd_feeds_disable(pd, n);
++	return ret;
++}
++
+ /* CMU_G3D registers saved by the downstream embedded_g3d_save sequence */
+ static const u16 exynos9820_g3d_cmu_regs[] = {
+ 	0x1804,	/* CLK_CON_DIV_DIV_CLK_G3D_BUSP */
+@@ -227,23 +656,208 @@ static int exynos9820_g3d_power_off(struct exynos_pm_domain *pd)
+ 	return 0;
+ }
+ 
++/*
++ * CMU_AUD registers of the downstream aud_save sequence, in restore order:
++ * PLL settings first, then dividers before muxes (a mux must not switch to
++ * a parent while its divider still has the reset value), then Q-channels
++ * and the global automatic clock gating option. PLL_CON0 (enable, PLL mux)
++ * is handled separately, see exynos9820_aud_restore().
++ */
++static const u16 exynos9820_aud_cmu_regs[] = {
++	0x0000,			/* PLL_LOCKTIME_PLL_AUD0 */
++	0x0124, 0x0128, 0x012c, 0x0130,	/* PLL_CON1..4_PLL_AUD0 */
++	0x0144, 0x0148, 0x014c, 0x0150,	/* PLL_CON1..4_PLL_AUD1 */
++	/* CLK_CON_DIV_DIV_CLK_AUD_{AUDIF,BUS,BUSP,CNT,CPU_ACLK,CPU_ATCLK,
++	 * CPU_PCLKDBG,DMIC,DSIF,MCLK,PLL,UAIF0..3} */
++	0x1800, 0x1804, 0x1808, 0x180c, 0x1810, 0x1814, 0x1818, 0x181c,
++	0x1820, 0x1824, 0x1828, 0x182c, 0x1830, 0x1834, 0x1838,
++	/* CLK_CON_MUX_MUX_CLK_AUD_{CPU,DSIF,UAIF0..3}, MUX_HCHGEN_CLK_AUD_CPU */
++	0x1000, 0x1004, 0x100c, 0x1010, 0x1014, 0x1018, 0x101c,
++	0x0100,			/* PLL_CON0_MUX_CLKCMU_AUD_CPU_USER */
++	0x0850,			/* AUD_HCHGEN_CLKMUX */
++	/* QCH_CON_* / DMYQCH_CON_* */
++	0x3000, 0x3004, 0x3008, 0x300c,
++	0x3020, 0x3024, 0x3028, 0x302c, 0x3030, 0x3034, 0x3038, 0x3040,
++	0x3044, 0x3048, 0x304c, 0x3050, 0x3054, 0x3058, 0x305c, 0x3060,
++	0x3064, 0x3068, 0x306c, 0x3070, 0x3074,
++	0x0800,			/* AUD_CMU_AUD_CONTROLLER_OPTION */
++};
++
++/* PLL_CON0_PLL_AUD0, PLL_CON0_PLL_AUD1 */
++static const u16 exynos9820_aud_pll_regs[] = { 0x0120, 0x0140 };
++
++/* SYSREG_AUD BUS_COMPONENT_DRCG_EN, MEMCLK, SNPS_EMA */
++static const u16 exynos9820_aud_sysreg_regs[] = { 0x0104, 0x0108, 0x0300 };
++
++#define EXYNOS9820_AUD_CMU		0x18c00000
++#define EXYNOS9820_AUD_CMU_SIZE		0x4000
++#define EXYNOS9820_AUD_SYSREG		0x18c10000
++#define EXYNOS9820_AUD_SYSREG_SIZE	0x1000
++/* D_TZPC_AUD ("need_smc" of pd_aud in the downstream DT) */
++#define EXYNOS9820_AUD_DTZPC		0x18c62000
++
++#define EXYNOS9820_PLL_ENABLE		BIT(31)
++#define EXYNOS9820_PLL_LOCKED		BIT(29)
++#define EXYNOS9820_PLL_MUX_SEL		BIT(4)
++
++static_assert(ARRAY_SIZE(exynos9820_aud_cmu_regs) <=
++	      ARRAY_SIZE(((struct exynos9820_aud *)0)->cmu_save));
++
++static void exynos9820_aud_save(struct exynos9820_aud *aud)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(exynos9820_aud_cmu_regs); i++)
++		aud->cmu_save[i] = readl(aud->cmu + exynos9820_aud_cmu_regs[i]);
++	for (i = 0; i < ARRAY_SIZE(exynos9820_aud_pll_regs); i++)
++		aud->pll_save[i] = readl(aud->cmu + exynos9820_aud_pll_regs[i]);
++	for (i = 0; i < ARRAY_SIZE(exynos9820_aud_sysreg_regs); i++)
++		aud->sysreg_save[i] =
++			readl(aud->sysreg + exynos9820_aud_sysreg_regs[i]);
++	aud->saved = true;
++}
++
++static void exynos9820_aud_restore(struct exynos9820_aud *aud)
++{
++	u32 val;
++	int i;
++
++	if (!aud->saved)
++		return;
++
++	/* PLL_LOCKTIME and PLL_CON1..4 */
++	for (i = 0; i < 9; i++)
++		writel(aud->cmu_save[i], aud->cmu + exynos9820_aud_cmu_regs[i]);
++
++	/*
++	 * PLLs: start with the PLL mux on OSCCLK, wait for the lock, then
++	 * switch the mux (downstream writes PLL_CON0 and polls LOCKED).
++	 */
++	for (i = 0; i < ARRAY_SIZE(exynos9820_aud_pll_regs); i++) {
++		void __iomem *reg = aud->cmu + exynos9820_aud_pll_regs[i];
++		u32 con0 = aud->pll_save[i];
++
++		writel(con0 & ~EXYNOS9820_PLL_MUX_SEL, reg);
++		if (!(con0 & EXYNOS9820_PLL_ENABLE))
++			continue;
++		{
++			ktime_t t0 = ktime_get();
++
++			/*
++			 * 1 ms was too short after a SoC SLEEP (PLL_CON0 0x120 not
++			 * locked, audio fine afterwards): wait up to 10 ms and say
++			 * how long it took when it was slow.
++			 */
++			if (readl_poll_timeout_atomic(reg, val,
++						      val & EXYNOS9820_PLL_LOCKED, 1,
++						      10000))
++				pr_err("Power domain AUD: PLL_CON0 %#x did not lock in 10 ms (%#x)\n",
++				       exynos9820_aud_pll_regs[i], val);
++			else if (ktime_us_delta(ktime_get(), t0) > 1000)
++				pr_info("Power domain AUD: PLL_CON0 %#x locked after %lld us\n",
++					exynos9820_aud_pll_regs[i],
++					ktime_us_delta(ktime_get(), t0));
++		}
++		writel(con0, reg);
++	}
++
++	for (i = 9; i < ARRAY_SIZE(exynos9820_aud_cmu_regs); i++)
++		writel(aud->cmu_save[i], aud->cmu + exynos9820_aud_cmu_regs[i]);
++	for (i = 0; i < ARRAY_SIZE(exynos9820_aud_sysreg_regs); i++)
++		writel(aud->sysreg_save[i],
++		       aud->sysreg + exynos9820_aud_sysreg_regs[i]);
++}
++
++static int exynos9820_pd_init(struct platform_device *pdev,
++			      struct exynos_pm_domain *pd)
++{
++	struct device *dev = &pdev->dev;
++	struct exynos9820_aud *aud;
++	int i;
++
++	pd->unstick = true;
++	for (i = 0; i < ARRAY_SIZE(exynos9820_pd_info); i++)
++		if (!strcmp(pd->pd.name, exynos9820_pd_info[i].name))
++			pd->info = &exynos9820_pd_info[i];
++
++	if (strcmp(pd->pd.name, "AUD")) {
++		if (!strcmp(pd->pd.name, "ISPPRE") && pd->dtzpc_addr) {
++			struct exynos9820_isppre *ip;
++
++			ip = devm_kzalloc(dev, sizeof(*ip), GFP_KERNEL);
++			if (!ip)
++				return -ENOMEM;
++			/* owned by the camera driver: map without claiming */
++			ip->cmu = devm_ioremap(dev, EXYNOS9820_ISPPRE_CMU,
++					       EXYNOS9820_ISPPRE_CMU_SIZE);
++			ip->sysreg = devm_ioremap(dev, EXYNOS9820_ISPPRE_SYSREG,
++						  EXYNOS9820_ISPPRE_SYSREG_SIZE);
++			if (!ip->cmu || !ip->sysreg)
++				return -ENOMEM;
++			pd->isppre = ip;
++			dev_info(dev, "ISPPRE state save/restore enabled\n");
++		}
++		return 0;
++	}
++
++	/*
++	 * Older DTs do not describe D_TZPC_AUD: without the EL3 restore every
++	 * AUD SFR is secure-only after a power cycle (SError on first access).
++	 */
++	if (!pd->dtzpc_addr)
++		pd->dtzpc_addr = EXYNOS9820_AUD_DTZPC;
++
++	aud = devm_kzalloc(dev, sizeof(*aud), GFP_KERNEL);
++	if (!aud)
++		return -ENOMEM;
++
++	/* owned by the CMU and ABOX drivers: map without claiming */
++	aud->cmu = devm_ioremap(dev, EXYNOS9820_AUD_CMU, EXYNOS9820_AUD_CMU_SIZE);
++	aud->sysreg = devm_ioremap(dev, EXYNOS9820_AUD_SYSREG,
++				   EXYNOS9820_AUD_SYSREG_SIZE);
++	if (!aud->cmu || !aud->sysreg)
++		return -ENOMEM;
++
++	pd->aud = aud;
++	dev_info(dev, "AUD state save/restore enabled, D_TZPC %#x\n",
++		 pd->dtzpc_addr);
++
++	return 0;
++}
++
+ static int exynos_pd_power_on(struct generic_pm_domain *domain)
+ {
+ 	struct exynos_pm_domain *pd =
+ 		container_of(domain, struct exynos_pm_domain, pd);
++	unsigned int n = 0;
++	bool held = false;
+ 	int ret;
+ 
++	/* EL3 accesses the block's D_TZPC: make sure the block is clocked */
++	if (pd->unstick && pd->dtzpc_addr) {
++		n = smp_load_acquire(&pd->nfeeds);
++		held = exynos9820_pd_feeds_enable(pd, n);
++	}
++
+ 	if (pd->g3d)
+ 		ret = exynos9820_g3d_power_on(pd);
++	else if (pd->unstick)
++		ret = exynos9820_pd_switch(pd, true);
+ 	else
+ 		ret = exynos_pd_power(domain, true);
+-	if (ret)
+-		return ret;
++	if (!ret)
++		ret = exynos_pd_dtzpc(pd, true);
++	if (!ret && pd->isppre)
++		exynos9820_isppre_restore(pd->isppre);
+ 
+-	ret = exynos_pd_dtzpc(pd, true);
++	if (held)
++		exynos9820_pd_feeds_disable(pd, n);
+ 	if (ret)
+ 		return ret;
+ 
++	if (pd->aud)
++		exynos9820_aud_restore(pd->aud);
++
+ 	if (pd->g3d) {
+ 		exynos9820_g3d_restore(pd->g3d);
+ 		pr_debug("Power domain %s: on, MUX_EMBEDDED_G3D_USER=0x%08x MUX_G3D_BUSD=0x%08x\n",
+@@ -259,20 +873,122 @@ static int exynos_pd_power_off(struct generic_pm_domain *domain)
+ {
+ 	struct exynos_pm_domain *pd =
+ 		container_of(domain, struct exynos_pm_domain, pd);
++	unsigned int n = 0;
++	bool held = false;
+ 	int ret;
+ 
++	/* system sleep (genpd noirq): refuse, genpd then leaves the domain on */
++	if (domain->suspended_count && exynos_pd_keep_for_sleep(pd))
++		return -EBUSY;
++
+ 	if (pd->g3d)
+ 		exynos9820_g3d_save(pd->g3d);
++	if (pd->aud)
++		exynos9820_aud_save(pd->aud);
++
++	if (pd->g3d) {
++		ret = exynos_pd_dtzpc(pd, false);
++		if (ret)
++			return ret;
++		return exynos9820_g3d_power_off(pd);
++	}
++
++	if (!pd->unstick) {
++		ret = exynos_pd_dtzpc(pd, false);
++		if (ret)
++			return ret;
++		return exynos_pd_power(domain, false);
++	}
++
++	/* EL3 reads the block's D_TZPC: make sure the block is clocked */
++	if (pd->dtzpc_addr) {
++		n = smp_load_acquire(&pd->nfeeds);
++		held = exynos9820_pd_feeds_enable(pd, n);
++	}
++
++	/* only a domain that is really up can be read */
++	if (pd->isppre &&
++	    (readl_relaxed(pd->base + 0x4) & pd->local_pwr_cfg) == pd->local_pwr_cfg)
++		exynos9820_isppre_save(pd->isppre);
+ 
+ 	ret = exynos_pd_dtzpc(pd, false);
+-	if (ret)
+-		return ret;
++	if (!ret) {
++		ret = exynos9820_pd_switch(pd, false);
++		/* still powered: undo the save so that EL3 stays balanced */
++		if (ret)
++			exynos_pd_dtzpc(pd, true);
++	}
+ 
+-	if (pd->g3d)
+-		return exynos9820_g3d_power_off(pd);
++	if (held)
++		exynos9820_pd_feeds_disable(pd, n);
+ 
+-	return exynos_pd_power(domain, false);
++	return ret;
++}
++
++static void exynos9820_pd_get_feed(struct exynos_pm_domain *pd,
++				  struct device_node *np, u16 id)
++{
++	struct of_phandle_args args = {
++		.np = np,
++		.args_count = 1,
++		.args = { id },
++	};
++	struct clk *clk;
++
++	if (!np || !id)
++		return;
++
++	clk = of_clk_get_from_provider(&args);
++	if (IS_ERR(clk)) {
++		pr_warn("Power domain %s: no feed clock %pOFn:%u (%pe)\n",
++			pd->pd.name, np, id, clk);
++		return;
++	}
++	/* prepared only: clk_disable_unused still gates it while unused */
++	if (clk_prepare(clk)) {
++		clk_put(clk);
++		return;
++	}
++	pd->feeds[pd->nfeeds_init++] = clk;
++}
++
++/*
++ * The CMU_TOP and CMU_BUSC providers register after the power domains
++ * (core_initcall order), and clk_prepare() must not run under the genpd
++ * lock. Look the feed clocks up once, before late_initcall_sync, where
++ * clk_disable_unused() and then genpd_power_off_unused() run.
++ */
++static int __init exynos9820_pd_feeds_init(void)
++{
++	struct device_node *top, *busc;
++	struct exynos_pm_domain *pd;
++	int i;
++
++	if (list_empty(&exynos9820_pds))
++		return 0;
++
++	top = of_find_compatible_node(NULL, NULL, "samsung,exynos9820-cmu-top");
++	busc = of_find_compatible_node(NULL, NULL, "samsung,exynos9820-cmu-busc");
++
++	list_for_each_entry(pd, &exynos9820_pds, node) {
++		if (!pd->info)
++			continue;
++		for (i = 0; i < EXYNOS9820_PD_MAX_FEEDS; i++) {
++			exynos9820_pd_get_feed(pd, top, pd->info->top[i]);
++			exynos9820_pd_get_feed(pd, busc, pd->info->busc[i]);
++		}
++		smp_store_release(&pd->nfeeds, pd->nfeeds_init);
++		if (pd->nfeeds)
++			pr_debug("Power domain %s: %u feed clocks\n",
++				 pd->pd.name, pd->nfeeds);
++	}
++
++	of_node_put(top);
++	of_node_put(busc);
++
++	return 0;
+ }
++late_initcall(exynos9820_pd_feeds_init);
+ 
+ static void __iomem *exynos_pd_ioremap_byname(struct platform_device *pdev,
+ 					      const char *name,
+@@ -346,6 +1062,7 @@ static const struct exynos_pm_domain_config exynos5433_cfg = {
+ 
+ static const struct exynos_pm_domain_config exynos9820_cfg = {
+ 	.local_pwr_cfg		= 0x1,
++	.init			= exynos9820_pd_init,
+ };
+ 
+ static const struct exynos_pm_domain_config exynos9820_g3d_cfg = {
+@@ -425,6 +1142,11 @@ static int exynos_pd_probe(struct platform_device *pdev)
+ 		exynos_pd_power_off(&pd->pd);
+ 
+ 	on = readl_relaxed(pd->base + 0x4) & pd->local_pwr_cfg;
++	if (pd->unstick)
++		dev_info(dev, "%s: boot state CONFIGURATION %#x STATUS %#x STATES %#x\n",
++			 pd->pd.name, readl_relaxed(pd->base),
++			 readl_relaxed(pd->base + 0x4),
++			 readl_relaxed(pd->base + EXYNOS9820_PD_STATES));
+ 
+ 	pm_genpd_init(&pd->pd, NULL, !on);
+ 	ret = of_genpd_add_provider_simple(np, &pd->pd);
+@@ -440,8 +1162,23 @@ static int exynos_pd_probe(struct platform_device *pdev)
+ 		else
+ 			pr_info("%pOF has as child subdomain: %pOF.\n",
+ 				parent.np, child.np);
++
++		/*
++		 * The "power-domains" link also attaches this provider device
++		 * to the parent domain. genpd's system sleep callbacks for it
++		 * then power the parent on in resume_noirq (genpd_sync_power_on)
++		 * although nothing needs it, and on 9820 the power-off that
++		 * follows gets stuck (NPU0/DSPM/ISPLP on after every s2idle).
++		 * The subdomain link keeps the parent on while the child is on,
++		 * so leave this device out of system sleep.
++		 */
++		if (pd->unstick)
++			dev_pm_syscore_device(dev, true);
+ 	}
+ 
++	if (!ret && pd->unstick)
++		list_add_tail(&pd->node, &exynos9820_pds);
++
+ 	pm_runtime_enable(dev);
+ 	return ret;
+ }

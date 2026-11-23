@@ -1,0 +1,2256 @@
+From 4d57f296df8e5ef853e660b467f866985d795c92 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] usb: typec: add Maxim MAX77705 USB Type-C/PD and MUIC driver
+
+Driver for the firmware-driven USB Type-C / Power Delivery controller
+and D+/D- switch of the MAX77705 PMIC (Galaxy S10 family), talking to
+its firmware through the opcode interface, with its binding.
+
+ - Type-C port with orientation, data and power role reporting, role
+   switch and VBUS (OTG) control through the charger's OTG regulator;
+   the CC role bits follow the port type.
+ - PD: role swaps, optional DR_Swap to host as a sink (prefer_host),
+   input current limit from the PD contract (chg_icl, chg_icl_max_ma),
+   OTG current limit (otg_ma).
+ - DisplayPort alternate mode (altmode): lanes and HPD are routed
+   after the Configure ACK and every DP status update is passed to the
+   muxes.
+ - The init sequence sends the opcodes the vendor driver sends at
+   probe (CC/SBU short detection, AUTOIBUS, CCCTRL1 with the debug and
+   audio accessory bits, CC lock-error clear, alternate mode); the
+   alternate mode opcode is what makes the firmware attach OTG
+   adapters.
+ - The interrupt registers are also polled once a second, and the host
+   role is re-asserted after a DWC3 rebind. Firmware restarts are
+   handled; the work runs on a freezable workqueue.
+ - debugfs: a state file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ .../bindings/usb/maxim,max77705-usbc.yaml     |   83 +
+ drivers/usb/typec/Kconfig                     |   18 +
+ drivers/usb/typec/Makefile                    |    1 +
+ drivers/usb/typec/max77705-usbc.c             | 2082 +++++++++++++++++
+ 4 files changed, 2184 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/usb/maxim,max77705-usbc.yaml
+ create mode 100644 drivers/usb/typec/max77705-usbc.c
+
+diff --git a/Documentation/devicetree/bindings/usb/maxim,max77705-usbc.yaml b/Documentation/devicetree/bindings/usb/maxim,max77705-usbc.yaml
+new file mode 100644
+index 0000000000..ecab2210d5
+--- /dev/null
++++ b/Documentation/devicetree/bindings/usb/maxim,max77705-usbc.yaml
+@@ -0,0 +1,83 @@
++# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/usb/maxim,max77705-usbc.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Maxim MAX77705 USB Type-C/PD controller and MUIC
++
++maintainers:
++  - Dzmitry Sankouski <dsankouski@gmail.com>
++
++description: |
++  The MAX77705 PMIC contains a USB Type-C/PD controller with integrated
++  firmware (CC detection, BC1.2, PD policy engine, VDM discovery) and a
++  D+/D- switch (MUIC). It sits on its own I2C address next to the PMIC
++  (maxim,max77705), whose interrupt controller provides its interrupt.
++
++properties:
++  compatible:
++    const: maxim,max77705-usbc
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  vbus-supply:
++    description: VBUS source used when the port is power source (the
++      charger OTG boost, see maxim,max77705-charger usb-otg-vbus).
++
++  connector:
++    type: object
++    $ref: ../connector/usb-connector.yaml#
++    unevaluatedProperties: false
++    description:
++      USB-C connector. port@0 links to the USB controller (role switch),
++      port@1 to the SuperSpeed orientation switch, port@2 to the SBU/DP
++      mode switch. An optional "displayport" phandle names the DRM
++      DisplayPort connector for HPD.
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - connector
++
++additionalProperties: false
++
++examples:
++  - |
++    i2c {
++      #address-cells = <1>;
++      #size-cells = <0>;
++
++      usb-typec@25 {
++        compatible = "maxim,max77705-usbc";
++        reg = <0x25>;
++        interrupt-parent = <&pmic>;
++        interrupts = <3>;
++        vbus-supply = <&otg_vbus>;
++
++        connector {
++          compatible = "usb-c-connector";
++          label = "USB-C";
++          data-role = "dual";
++          power-role = "dual";
++          try-power-role = "sink";
++
++          ports {
++            #address-cells = <1>;
++            #size-cells = <0>;
++
++            port@0 {
++              reg = <0>;
++              endpoint {
++                remote-endpoint = <&usb_hs>;
++              };
++            };
++          };
++        };
++      };
++    };
+diff --git a/drivers/usb/typec/Kconfig b/drivers/usb/typec/Kconfig
+index 2f80c2792d..8f7a260cac 100644
+--- a/drivers/usb/typec/Kconfig
++++ b/drivers/usb/typec/Kconfig
+@@ -110,6 +110,24 @@ config TYPEC_WUSB3801
+ 	  If you choose to build this driver as a dynamically linked module, the
+ 	  module will be called wusb3801.ko.
+ 
++config TYPEC_MAX77705
++	tristate "Maxim MAX77705 USB Type-C/PD controller and MUIC driver"
++	depends on I2C
++	depends on MFD_MAX77705 || COMPILE_TEST
++	depends on USB_ROLE_SWITCH || !USB_ROLE_SWITCH
++	depends on DRM || DRM=n
++	depends on POWER_SUPPLY
++	select REGMAP_I2C
++	help
++	  Say Y or M here if your system has a Maxim MAX77705 PMIC with its
++	  USB Type-C/PD block (CCIC), e.g. the Samsung Galaxy S10 family.
++	  The firmware on the chip does CC detection and PD; this driver
++	  registers the Type-C port, drives the USB role switch, routes the
++	  D+/D- switch (MUIC) to the AP and controls VBUS for host mode.
++
++	  If you choose to build this driver as a dynamically linked module, the
++	  module will be called max77705-usbc.ko.
++
+ source "drivers/usb/typec/mux/Kconfig"
+ 
+ source "drivers/usb/typec/altmodes/Kconfig"
+diff --git a/drivers/usb/typec/Makefile b/drivers/usb/typec/Makefile
+index 8a6a1c663e..16ff85864d 100644
+--- a/drivers/usb/typec/Makefile
++++ b/drivers/usb/typec/Makefile
+@@ -11,4 +11,5 @@ obj-$(CONFIG_TYPEC_HD3SS3220)	+= hd3ss3220.o
+ obj-$(CONFIG_TYPEC_STUSB160X) 	+= stusb160x.o
+ obj-$(CONFIG_TYPEC_RT1719)	+= rt1719.o
+ obj-$(CONFIG_TYPEC_WUSB3801)	+= wusb3801.o
++obj-$(CONFIG_TYPEC_MAX77705)	+= max77705-usbc.o
+ obj-$(CONFIG_TYPEC)		+= mux/
+diff --git a/drivers/usb/typec/max77705-usbc.c b/drivers/usb/typec/max77705-usbc.c
+new file mode 100644
+index 0000000000..0b69a38485
+--- /dev/null
++++ b/drivers/usb/typec/max77705-usbc.c
+@@ -0,0 +1,2082 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Maxim MAX77705 USB Type-C / PD controller (CCIC) and MUIC driver
++ *
++ * The MAX77705 contains a microcontroller running Maxim firmware that does
++ * CC detection, BC1.2, the PD policy engine and structured VDM discovery on
++ * its own.  The AP talks to it through the "USBC" I2C slave (0x25):
++ *
++ *   0x02..0x05   UIC/CC/PD/VDM interrupt registers (clear on read)
++ *   0x06..0x0d   status registers
++ *   0x0e..0x11   interrupt masks
++ *   0x21         opcode, 0x22.. opcode data, write 0x41 to commit
++ *   0x51         response (0x51 echoes the opcode, data from 0x52)
++ *
++ * Completion of an opcode is signalled with UIC_INT.APCmdResI.
++ *
++ * Register/opcode knowledge comes from the Samsung downstream driver
++ * (drivers/ccic/max77705_*.c, drivers/muic/max77705-muic.c, SM-G975F).
++ *
++ * This driver:
++ *  - registers a Type-C port (DRP, DRD) + partner, reports power/data role,
++ *    orientation, VCONN and power operation mode,
++ *  - drives a usb_role_switch (DWC3) from the CC/PD data role,
++ *  - routes the MUIC D+/D- switch to the AP USB PHY (CTRL1 = COM_USB),
++ *  - switches the charger OTG boost (vbus-supply) when we are source,
++ *  - reports the PD contract through a power_supply and sets the charger
++ *    input current limit from it,
++ *  - PD role swaps: DR_Swap/PR_Swap on request (typec data_role/power_role
++ *    sysfs), follows swaps the partner asks for, and optionally
++ *    (prefer_host=1) asks to become USB host while staying power sink,
++ *  - optionally (altmode=1) enters DisplayPort alternate mode and passes
++ *    pin assignment / HPD to a typec_mux and the DRM connector.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/completion.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/kfifo.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/property.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include <linux/seq_file.h>
++#include <linux/unaligned.h>
++#include <linux/usb/gadget.h>
++#include <linux/usb/pd.h>
++#include <linux/usb/pd_vdo.h>
++#include <linux/usb/role.h>
++#include <linux/usb/typec.h>
++#include <linux/usb/typec_altmode.h>
++#include <linux/usb/typec_dp.h>
++#include <linux/usb/typec_mux.h>
++#include <linux/workqueue.h>
++
++#if IS_REACHABLE(CONFIG_DRM)
++#include <drm/drm_connector.h>
++#endif
++
++/* registers */
++#define MAX77705_UIC_HW_REV		0x00
++#define MAX77705_UIC_FW_REV		0x01
++#define MAX77705_UIC_INT		0x02
++#define MAX77705_CC_INT			0x03
++#define MAX77705_PD_INT			0x04
++#define MAX77705_VDM_INT		0x05
++#define MAX77705_USBC_STATUS1		0x06
++#define MAX77705_USBC_STATUS2		0x07
++#define MAX77705_BC_STATUS		0x08
++#define MAX77705_UIC_FW_MINOR		0x09
++#define MAX77705_CC_STATUS0		0x0a
++#define MAX77705_CC_STATUS1		0x0b
++#define MAX77705_PD_STATUS0		0x0c
++#define MAX77705_PD_STATUS1		0x0d
++#define MAX77705_UIC_INT_M		0x0e
++#define MAX77705_CC_INT_M		0x0f
++#define MAX77705_PD_INT_M		0x10
++#define MAX77705_VDM_INT_M		0x11
++#define MAX77705_OPCODE			0x21
++#define MAX77705_OPCODE_END		0x41
++#define MAX77705_OPCODE_RESP		0x51
++#define MAX77705_REG_MAX		0x71
++
++/* UIC_INT */
++#define UIC_APCMDRES			BIT(7)
++#define UIC_SYSMSG			BIT(6)
++#define UIC_VBUSDET			BIT(5)
++#define UIC_VBADC			BIT(4)
++#define UIC_DCDTMO			BIT(3)
++#define UIC_FAKVB			BIT(2)
++#define UIC_CHGTYP			BIT(1)
++#define UIC_UIDADC			BIT(0)
++/* CC_INT */
++#define CC_VCONNOCP			BIT(7)
++#define CC_VSAFE0V			BIT(6)
++#define CC_DETABRT			BIT(5)
++#define CC_VCONNSC			BIT(4)
++#define CC_PINSTAT			BIT(3)
++#define CC_ISTAT			BIT(2)
++#define CC_VCNSTAT			BIT(1)
++#define CC_STAT				BIT(0)
++/* PD_INT */
++#define PD_PDMSG			BIT(7)
++#define PD_PSRDY			BIT(6)
++#define PD_DATAROLE			BIT(5)
++#define PD_DP_ATTENTION			BIT(4)
++#define PD_DP_CONFIGURE			BIT(3)
++#define PD_DP_STATUS			BIT(2)
++#define PD_SSACC			BIT(1)
++#define PD_FCTID			BIT(0)
++/* VDM_INT */
++#define VDM_DISCOVER_ID			BIT(0)
++#define VDM_DISCOVER_SVIDS		BIT(1)
++#define VDM_DISCOVER_MODES		BIT(2)
++#define VDM_ENTER_MODE			BIT(3)
++
++/* BC_STATUS */
++#define BC_VBUSDET			BIT(7)
++#define BC_CHGTYP			GENMASK(1, 0)
++#define  CHGTYP_NONE			0
++#define  CHGTYP_SDP			1
++#define  CHGTYP_CDP			2
++#define  CHGTYP_DCP			3
++/* CC_STATUS0 */
++#define CC0_PINSTAT			GENMASK(7, 6)
++#define  CCPIN_CC1			1
++#define  CCPIN_CC2			2
++#define CC0_ISTAT			GENMASK(5, 4)
++#define  CCI_500MA			1
++#define  CCI_1_5A			2
++#define  CCI_3_0A			3
++#define CC0_VCNSTAT			BIT(3)
++#define CC0_STAT			GENMASK(2, 0)
++#define  CCSTAT_NONE			0
++#define  CCSTAT_SINK			1
++#define  CCSTAT_SOURCE			2
++#define  CCSTAT_AUDIO			3
++#define  CCSTAT_DEBUG			4
++#define  CCSTAT_ERROR			5
++#define  CCSTAT_DISABLED		6
++/* CC_STATUS1 (downstream max77705.h "REG_CC_STATUS2" bit names) */
++#define CC1_SBUSHORT			GENMASK(7, 6)	/* 1 CC-5V, 2 SBU-5V, 3 SBU-GND short */
++#define CC1_VCONNOCP			BIT(5)
++#define CC1_VCONNSC			BIT(4)
++#define CC1_VSAFE0V			BIT(3)
++#define CC1_ATTACHSRCERR		BIT(2)	/* attach as source failed */
++#define CC1_CONNSTAT			BIT(1)	/* 1 = moisture ("WATER") detected */
++#define CC1_ALTMODE			BIT(0)
++/* PD_STATUS1 */
++#define PD1_DATAROLE_DFP		BIT(7)
++#define PD1_PSRDY			BIT(4)
++
++/* USBC_STATUS2 (SYSMsg) values */
++#define SYSMSG_BOOT_WDT			0x03
++#define SYSMSG_BOOT_SWRSTREQ		0x04
++#define SYSMSG_BOOT_POR			0x05
++#define SYSMSG_APCMD_UNKNOWN		0x31
++#define SYSMSG_APCMD_INPROGRESS		0x32
++#define SYSMSG_APCMD_FAIL		0x33
++#define SYSMSG_CCX_5V_SHORT		0x61
++#define SYSMSG_PD_GENDER_SHORT		0x6a
++#define SYSMSG_CCRP_HIGH		0x90
++#define SYSMSG_CCRP_LOW			0x91
++
++/* opcodes */
++#define OP_CTRL1_R			0x05
++#define OP_CTRL1_W			0x06
++#define OP_CCCTRL1_R			0x0b
++#define OP_CCCTRL1_W			0x0c
++#define OP_CCCTRL2_R			0x0d
++#define OP_CCCTRL2_W			0x0e
++#define OP_CCCTRL3_R			0x0f
++#define OP_CTRLREG3_R			0x1c
++#define OP_CTRLREG3_W			0x1d
++#define OP_CURRENT_SRCCAP		0x30
++#define OP_SWAP_REQUEST			0x37
++#define  SWAP_DR			0x01
++#define  SWAP_PR			0x02
++#define OP_VDM_SET_REQ			0x48
++#define OP_VDM_GET_RESP			0x4b
++/* OP_FACTORY_TEST data 0x02: FW drives VBUS ("auto VBUS"), 0x00: AP does */
++#define OP_FACTORY_TEST			0x54
++#define OP_SET_ALTERNATEMODE		0x55
++/* data bit 0 VBUS-CC, bit 1 SBU-GND, bit 2 VBUS-SBU short detection (downstream: 0x07) */
++#define OP_CCSBU_SHORT			0x56
++#define OP_FW_AUTOIBUS			0x57	/* 0: FW+auto ibus, 1: auto off, 2: FW off, 3: both off */
++#define  ALTMODE_SRCCAP			0x01
++#define  ALTMODE_SRC_VDM		0x03
++
++/*
++ * CCCTRL1 (opcode 0x0b read / 0x0c write), bit names from the downstream
++ * include/linux/ccic/max77705.h.  The MAX77775 header calls bits 4/3 of its
++ * CCCTRL1 "CCSrcEn"/"CCSnkEn": both set = DRP toggling, one = that role only.
++ * The FW default on beyond2lte is 0x1d (DRP + debug accessory detection);
++ * downstream never writes it except to add CCDbgEn|CCAudEn (audio).
++ */
++#define CCCTRL1_SRCCURCH		BIT(7)
++#define CCCTRL1_SRCCUR			GENMASK(6, 5)
++#define CCCTRL1_SRCSNK			BIT(4)	/* source role enabled */
++#define CCCTRL1_SNKSRC			BIT(3)	/* sink role enabled */
++#define CCCTRL1_DBGEN			BIT(2)
++#define CCCTRL1_AUDEN			BIT(1)
++#define CCCTRL1_DETEN			BIT(0)
++#define CCCTRL1_ROLES			(CCCTRL1_SRCSNK | CCCTRL1_SNKSRC)
++/* CCCTRL2 bit 7: force CC error recovery (downstream max77705_set_CCForceError) */
++#define CCCTRL2_FORCE_ERROR		BIT(7)
++/* CTRLREG3 bit 1: keep CC in error (open) after a forced error ("CC open") */
++#define CTRLREG3_LOCK_ERROR_EN		BIT(1)
++
++/* USBC slave register 0x80: write 0x0f = reset the USB-C MCU (downstream max77705_reset_ic) */
++#define MAX77705_USBC_RESET		0x80
++#define  USBC_RESET_VAL			0x0f
++
++#define OPCODE_DATA_LEN			32
++#define OPCODE_TIMEOUT_MS		1000
++
++/* sub-ids for OP_VDM_GET_RESP */
++#define VDM_ID_DISCOVER_IDENTITY	0x01
++#define VDM_ID_DISCOVER_SVIDS		0x02
++#define VDM_ID_DISCOVER_MODES		0x03
++#define VDM_ID_ENTER_MODE		0x04
++#define VDM_ID_EXIT_MODE		0x05
++#define VDM_ID_ATTENTION		0x06
++#define VDM_ID_DP_STATUS		0x10
++#define VDM_ID_DP_CONFIGURE		0x11
++
++/* PD_STATUS0: last PD message / event (downstream enum max77705_pdmsg) */
++#define PDMSG_SNK_PSRDY			0x01
++#define PDMSG_DR_SWAP_RCVD		0x07
++#define PDMSG_PR_SWAP_RCVD		0x08
++#define PDMSG_VCONN_SWAP_RCVD		0x09
++#define PDMSG_SRC_CAP_RCVD		0x0b
++#define PDMSG_REJECT_RCVD		0x12
++#define PDMSG_NOT_SUPPORTED_RCVD	0x13
++#define PDMSG_PRSWAP_SNKTOSRC_SENT	0x14
++#define PDMSG_PRSWAP_SRCTOSNK_SENT	0x15
++#define PDMSG_HARDRESET_RCVD		0x16
++#define PDMSG_VBUS_ON			0x17
++#define PDMSG_VBUS_OFF			0x18
++#define PDMSG_HARDRESET_SENT		0x19
++#define PDMSG_PRSWAP_SRCTOSWAP		0x1a
++#define PDMSG_PRSWAP_SWAPTOSNK		0x1b
++#define PDMSG_PRSWAP_SNKTOSWAP		0x1c
++#define PDMSG_PRSWAP_SWAPTOSRC		0x1d
++
++#define SWAP_TIMEOUT_MS			2000
++#define DR_SWAP_MAX_TRIES		3
++#define GADGET_WAIT_MAX			10	/* x PREFER_HOST_DELAY_MS */
++
++/* MUIC CTRL1: NoBCComp[7] RCPS[6] COMP2SW(D+)[5:3] COMN1SW(D-)[2:0] */
++#define MUIC_COM_USB			0x09	/* D+/D- -> AP USB */
++#define MUIC_COM_OPEN			0x3f
++
++/* interrupt masks written at init (1 = masked), from downstream */
++#define UIC_INT_M_INIT			UIC_FAKVB
++#define CC_INT_M_INIT			CC_DETABRT
++#define PD_INT_M_INIT			0x00
++#define PD_INT_M_NOALT			(PD_DP_ATTENTION | PD_DP_CONFIGURE | PD_DP_STATUS)
++#define VDM_INT_M_INIT			0xf0
++#define VDM_INT_M_NOALT			0xff
++
++static bool altmode;
++module_param(altmode, bool, 0444);
++MODULE_PARM_DESC(altmode, "Enable DisplayPort alternate mode handling (default: off)");
++
++/* Also poll the interrupt registers every N ms */
++#define POLL_MS				1000U
++
++static int prefer_host;
++module_param(prefer_host, int, 0644);
++MODULE_PARM_DESC(prefer_host,
++		 "As PD sink, ask for DR_Swap to become USB host: 0 = never (default), "
++		 "1 = only if no USB host enumerated our gadget, 2 = always");
++
++/* Wait this long after the PD contract before the prefer_host DR_Swap */
++#define PREFER_HOST_DELAY_MS		3000
++
++static unsigned int otg_ma;
++module_param(otg_ma, uint, 0644);
++MODULE_PARM_DESC(otg_ma, "OTG VBUS current limit in mA when we source VBUS (500/900/1200/1500, 0 = charger default)");
++
++static bool chg_icl = true;
++module_param(chg_icl, bool, 0644);
++MODULE_PARM_DESC(chg_icl, "Set the charger input current limit from the PD contract / Type-C Rp current");
++
++static unsigned int chg_icl_max_ma = 3000;
++module_param(chg_icl_max_ma, uint, 0644);
++MODULE_PARM_DESC(chg_icl_max_ma, "Upper bound for the input current limit set from the PD contract (mA)");
++
++struct max77705_usbc {
++	struct device *dev;
++	struct i2c_client *client;
++	struct regmap *regmap;
++	int irq;
++
++	struct mutex op_lock;		/* serializes opcode transactions */
++	struct mutex int_lock;		/* serializes interrupt register reads */
++	struct mutex state_lock;	/* protects the state below */
++	struct completion op_done;
++
++	struct workqueue_struct *wq;
++	struct work_struct sync_work;
++	struct work_struct reinit_work;
++	struct work_struct vdm_work;
++	struct delayed_work poll_work;
++	struct delayed_work swap_work;		/* prefer_host policy, on system_wq */
++	struct delayed_work vbus_restore_work;	/* VBUS back on after a hard reset */
++	DECLARE_KFIFO(pdmsg_fifo, u8, 16);	/* PD_STATUS0 events, from handle_ints */
++	atomic_long_t vdm_pending;	/* BIT(VDM_ID_*) to fetch */
++	bool removing;
++	bool ready;		/* port registered, works may touch typec state */
++
++	struct fwnode_handle *connector;
++	struct typec_port *port;
++	struct typec_capability cap;
++	struct typec_partner *partner;
++	struct typec_partner_desc partner_desc;
++	bool has_role_sw;
++	bool role_checked;	/* set_role() re-check of an unchanged role */
++	unsigned int poll_count;
++	struct regulator *vbus;
++	bool vbus_on;
++	bool vbus_hold;		/* FW asked for VBUS off (PR_Swap, Hard Reset) */
++	bool fw_vbus;
++	struct power_supply *psy;
++	struct dentry *debugfs;
++
++	/* DisplayPort */
++	struct typec_mux *mux;
++	struct typec_altmode *port_dp;
++	struct typec_altmode *partner_dp;
++	struct fwnode_handle *dp_fwnode;
++	bool dp_svid;
++	bool dp_active;
++	bool dp_conf_sent;	/* DP Configure request sent */
++	bool dp_configured;	/* ... and ACKed by the partner */
++	u8 dp_pins;		/* supported pin assignments, BIT(DP_PIN_ASSIGN_x) */
++	u8 dp_pin;		/* selected DP_PIN_ASSIGN_x */
++	u32 dp_status;
++	bool dp_hpd;
++
++	/* cached state */
++	u8 hw_rev, fw_rev, fw_minor;
++	u8 ccstat;
++	u8 cc1;			/* last CC_STATUS1 */
++	int ccctrl1;		/* last CCCTRL1 read/written, -1 = unknown */
++	enum typec_port_type port_type;
++	bool attached;
++	bool pd_dr_valid;	/* PD DataRole interrupt seen during this attach */
++	bool attach_source;	/* CC said we are source at attach (default roles) */
++	int pd_pr;		/* power role after a PR_Swap, -1 = follow CC */
++	bool pd_contract;
++	bool pdo_valid;
++	u32 pdo1;		/* partner's first (vSafe5V) source PDO, has the flags */
++	u8 last_pdmsg;
++	unsigned int dr_swap_tries;
++	bool dr_swap_sent;	/* we sent a DR_Swap request during this attach */
++	unsigned int gadget_waits;
++	bool host_seen;		/* a USB host enumerated our gadget during this attach */
++
++	/* role swap requested by us, completed from the sync/pdmsg path */
++	struct mutex swap_lock;
++	struct completion swap_done;
++	u8 swap_req;		/* SWAP_DR / SWAP_PR while waiting, else 0 */
++	int swap_want;		/* wanted enum typec_data_role / typec_role */
++	int swap_result;
++
++	/* charger input current limit */
++	int icl_saved;		/* uA before we changed it, -1 = untouched */
++	int icl_set;		/* uA we set, 0 = none */
++	u8 chgtyp;
++	bool vbus_present;
++	enum usb_role role;
++	enum typec_role pwr_role;
++	enum typec_data_role data_role;
++	enum typec_orientation orientation;
++	enum typec_pwr_opmode opmode;
++	u32 pdo_mv, pdo_ma;
++	u8 last_sysmsg;
++	unsigned long irq_count;
++	u8 last_ints[4];
++};
++
++static const struct regmap_config max77705_usbc_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = MAX77705_REG_MAX,
++};
++
++static void max77705_handle_ints(struct max77705_usbc *chip, const u8 *ints);
++
++/* read and dispatch the interrupt registers (clear-on-read) */
++static int max77705_poll_ints(struct max77705_usbc *chip)
++{
++	u8 ints[4];
++	int ret;
++
++	mutex_lock(&chip->int_lock);
++	ret = regmap_bulk_read(chip->regmap, MAX77705_UIC_INT, ints, sizeof(ints));
++	if (!ret && (ints[0] | ints[1] | ints[2] | ints[3]))
++		max77705_handle_ints(chip, ints);
++	mutex_unlock(&chip->int_lock);
++
++	return ret;
++}
++
++/*
++ * Execute one opcode: write opcode + data, commit, wait for APCmdResI and
++ * read rlen response bytes (excluding the echoed opcode) into rdata.
++ */
++static int max77705_opcode(struct max77705_usbc *chip, u8 op, const u8 *wdata,
++			   unsigned int wlen, u8 *rdata, unsigned int rlen)
++{
++	u8 buf[OPCODE_DATA_LEN + 1];
++	unsigned long timeout;
++	int ret;
++
++	if (wlen > OPCODE_DATA_LEN || rlen > OPCODE_DATA_LEN)
++		return -EINVAL;
++
++	mutex_lock(&chip->op_lock);
++	reinit_completion(&chip->op_done);
++
++	buf[0] = op;
++	if (wlen)
++		memcpy(&buf[1], wdata, wlen);
++	ret = regmap_bulk_write(chip->regmap, MAX77705_OPCODE, buf, wlen + 1);
++	if (ret)
++		goto out;
++	if (wlen < OPCODE_DATA_LEN) {
++		ret = regmap_write(chip->regmap, MAX77705_OPCODE_END, 0x00);
++		if (ret)
++			goto out;
++	}
++
++	/*
++	 * Wait for APCmdResI. If the interrupt line is not working, poll the
++	 * interrupt registers ourselves (this also dispatches other events).
++	 */
++	timeout = jiffies + msecs_to_jiffies(OPCODE_TIMEOUT_MS);
++	while (!wait_for_completion_timeout(&chip->op_done, msecs_to_jiffies(20))) {
++		max77705_poll_ints(chip);
++		if (completion_done(&chip->op_done))
++			break;
++		if (time_after(jiffies, timeout)) {
++			dev_warn(chip->dev, "opcode 0x%02x: no response (sysmsg 0x%02x)\n",
++				 op, chip->last_sysmsg);
++			ret = -ETIMEDOUT;
++			goto out;
++		}
++	}
++
++	ret = regmap_bulk_read(chip->regmap, MAX77705_OPCODE_RESP, buf, rlen + 1);
++	if (ret)
++		goto out;
++	if (buf[0] != op) {
++		dev_dbg(chip->dev, "opcode 0x%02x: response echoes 0x%02x\n", op, buf[0]);
++		ret = -EIO;
++		goto out;
++	}
++	if (rlen)
++		memcpy(rdata, &buf[1], rlen);
++out:
++	mutex_unlock(&chip->op_lock);
++	if (ret)
++		dev_dbg(chip->dev, "opcode 0x%02x failed: %d\n", op, ret);
++	return ret;
++}
++
++static int max77705_muic_set_usb(struct max77705_usbc *chip)
++{
++	u8 val = MUIC_COM_USB, cur;
++	int ret;
++
++	ret = max77705_opcode(chip, OP_CTRL1_R, NULL, 0, &cur, 1);
++	if (!ret && cur == MUIC_COM_USB)
++		return 0;
++
++	dev_info(chip->dev, "MUIC CTRL1 0x%02x -> 0x%02x (COM_USB)\n",
++		 ret ? 0xff : cur, val);
++	ret = max77705_opcode(chip, OP_CTRL1_W, &val, 1, NULL, 0);
++	if (ret)
++		dev_err(chip->dev, "failed to set MUIC CTRL1: %d\n", ret);
++	return ret;
++}
++
++static void max77705_set_vbus(struct max77705_usbc *chip, bool on)
++{
++	int ret;
++
++	if (chip->vbus_on == on || chip->fw_vbus || !chip->vbus)
++		return;
++
++	/*
++	 * Never drive VBUS against another source. When we become source
++	 * VBUS must be at vSafe0V; if it is still up (e.g. a charger was
++	 * just unplugged and VBUS is decaying) wait for the VBUSDET change
++	 * interrupt, which syncs again.
++	 */
++	if (on && chip->vbus_hold)
++		return;
++	if (on && chip->vbus_present) {
++		dev_warn(chip->dev, "VBUS already present, not enabling VBUS output yet\n");
++		return;
++	}
++
++	if (on && otg_ma) {
++		/* 500..otg_ma: the charger picks the largest step <= otg_ma */
++		ret = regulator_set_current_limit(chip->vbus, 500000, otg_ma * 1000);
++		if (ret)
++			dev_warn(chip->dev, "cannot set OTG current limit %u mA: %d%s\n", otg_ma, ret,
++				 ret == -EPERM ? " (no regulator-max-microamp in DT)" : "");
++	}
++
++	if (on)
++		ret = regulator_enable(chip->vbus);
++	else
++		ret = regulator_disable(chip->vbus);
++	if (ret) {
++		dev_err(chip->dev, "failed to %s VBUS: %d\n", on ? "enable" : "disable", ret);
++		return;
++	}
++	chip->vbus_on = on;
++	if (on)
++		dev_info(chip->dev, "VBUS output on (limit %d mA)\n",
++			 regulator_get_current_limit(chip->vbus) / 1000);
++	else
++		dev_info(chip->dev, "VBUS output off\n");
++}
++
++/*
++ * Charger input current limit (CHGIN ILIM) from what the source offers.
++ * ua == 0 restores the value found before we touched it.
++ */
++static void max77705_update_icl(struct max77705_usbc *chip, int ua)
++{
++	union power_supply_propval val;
++	struct power_supply *chg;
++	int ret;
++
++	if (!chg_icl)
++		ua = 0;
++	if (ua == chip->icl_set)
++		return;
++	if (!ua && chip->icl_saved < 0)
++		return;
++
++	chg = power_supply_get_by_name("max77705-charger");
++	if (!chg) {
++		dev_dbg(chip->dev, "no max77705-charger power supply\n");
++		return;
++	}
++
++	if (chip->icl_saved < 0) {
++		ret = power_supply_get_property(chg, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &val);
++		if (ret)
++			goto out;
++		chip->icl_saved = val.intval;
++	}
++
++	val.intval = ua ?: chip->icl_saved;
++	ret = power_supply_set_property(chg, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT, &val);
++	if (ret) {
++		dev_warn(chip->dev, "failed to set input current limit %d uA: %d\n", val.intval, ret);
++		goto out;
++	}
++	dev_info(chip->dev, "charger input current limit %d mA%s\n", val.intval / 1000,
++		 ua ? "" : " (restored)");
++	chip->icl_set = ua;
++	if (!ua)
++		chip->icl_saved = -1;
++out:
++	power_supply_put(chg);
++}
++
++static int max77705_match_gadget(struct device *dev, const void *data)
++{
++	return dev->bus && dev->bus->name && !strcmp(dev->bus->name, "gadget");
++}
++
++/*
++ * State of our USB gadget (the DWC3 at the other end of connector port@0),
++ * used by prefer_host=1 to leave a partner alone that already uses us as a
++ * USB device (e.g. a PC/Mac with USB networking). Returns the
++ * enum usb_device_state, -ENODEV if there is no gadget, -EAGAIN if no
++ * gadget function driver is bound yet.
++ */
++static int max77705_gadget_state(struct max77705_usbc *chip)
++{
++	struct fwnode_handle *ep, *remote;
++	struct device *dwc = NULL, *gdev = NULL;
++	struct usb_gadget *gadget;
++	int ret = -ENODEV;
++
++	ep = fwnode_graph_get_endpoint_by_id(chip->connector, 0, 0, 0);
++	if (!ep)
++		return -ENODEV;
++	remote = fwnode_graph_get_remote_port_parent(ep);
++	fwnode_handle_put(ep);
++	if (!remote)
++		return -ENODEV;
++
++	dwc = bus_find_device_by_fwnode(&platform_bus_type, remote);
++	fwnode_handle_put(remote);
++	if (!dwc)
++		return -ENODEV;
++
++	gdev = device_find_child(dwc, NULL, max77705_match_gadget);
++	if (gdev) {
++		gadget = container_of(gdev, struct usb_gadget, dev);
++		ret = READ_ONCE(gdev->driver) ? READ_ONCE(gadget->state) : -EAGAIN;
++		put_device(gdev);
++	}
++	put_device(dwc);
++	return ret;
++}
++
++/*
++ * Ask the partner for a DR_Swap or PR_Swap and wait for the result.
++ * Must not run on chip->wq: completion comes from sync_work.
++ */
++static int max77705_swap(struct max77705_usbc *chip, u8 type, int want)
++{
++	const char *name = type == SWAP_DR ? "DR_Swap" : "PR_Swap";
++	u8 resp = 0;
++	int ret;
++
++	mutex_lock(&chip->swap_lock);
++	/* state_lock: the sync path sees want/result/req together */
++	mutex_lock(&chip->state_lock);
++	reinit_completion(&chip->swap_done);
++	chip->swap_want = want;
++	chip->swap_result = -ETIMEDOUT;
++	chip->swap_req = type;
++	if (type == SWAP_DR)
++		chip->dr_swap_sent = true;	/* PD_STATUS1 DataRole is valid from now on */
++	mutex_unlock(&chip->state_lock);
++
++	ret = max77705_opcode(chip, OP_SWAP_REQUEST, &type, 1, &resp, 1);
++	if (ret) {
++		dev_err(chip->dev, "%s request failed: %d\n", name, ret);
++		goto out;
++	}
++	dev_info(chip->dev, "%s requested (to %s, FW resp 0x%02x)\n", name,
++		 type == SWAP_DR ? (want == TYPEC_HOST ? "host" : "device") :
++				   (want == TYPEC_SOURCE ? "source" : "sink"), resp);
++
++	wait_for_completion_timeout(&chip->swap_done, msecs_to_jiffies(SWAP_TIMEOUT_MS));
++	ret = READ_ONCE(chip->swap_result);
++	if (ret)
++		dev_warn(chip->dev, "%s %s: %d\n", name,
++			 ret == -ETIMEDOUT ? "timed out (no role change)" :
++			 ret == -EPROTO ? "rejected by partner" :
++			 ret == -EOPNOTSUPP ? "not supported by partner" : "failed", ret);
++	else
++		dev_info(chip->dev, "%s done\n", name);
++out:
++	mutex_lock(&chip->state_lock);
++	chip->swap_req = 0;
++	chip->swap_want = -1;
++	mutex_unlock(&chip->state_lock);
++	mutex_unlock(&chip->swap_lock);
++	return ret;
++}
++
++/* called from the sync path (state_lock held) */
++static void max77705_swap_complete(struct max77705_usbc *chip, u8 type, int result)
++{
++	if (READ_ONCE(chip->swap_req) != type)
++		return;
++	WRITE_ONCE(chip->swap_result, result);
++	WRITE_ONCE(chip->swap_req, 0);
++	complete(&chip->swap_done);
++}
++
++static void max77705_set_role(struct max77705_usbc *chip, enum usb_role role)
++{
++	struct usb_role_switch *sw;
++	int ret;
++
++	chip->role_checked = chip->role == role;
++	if (chip->role != role)
++		dev_info(chip->dev, "USB data role: %s\n", usb_role_string(role));
++	chip->role = role;
++	if (!chip->has_role_sw)
++		return;
++	/*
++	 * Look the switch up each time instead of holding a reference: the
++	 * DWC3 may be unbound/rebound (usb-gadget-reconnect.sh does that), and
++	 * a stale switch would call into a freed dwc3.
++	 */
++	sw = fwnode_usb_role_switch_get(chip->connector);
++	if (IS_ERR_OR_NULL(sw)) {
++		dev_warn(chip->dev, "USB role switch not available (%ld)\n", PTR_ERR(sw));
++		return;
++	}
++	/*
++	 * Compare with the switch, not with our cache: a DWC3 rebind
++	 * (usb-gadget-reconnect.sh) resets it to its default (device).
++	 * NONE reads back as device, setting it again is a no-op in DWC3.
++	 */
++	ret = 0;
++	if (usb_role_switch_get_role(sw) != role) {
++		if (role == USB_ROLE_HOST && chip->role_checked)
++			dev_info(chip->dev, "USB role switch lost the host role (DWC3 rebind?), re-asserting\n");
++		ret = usb_role_switch_set_role(sw, role);
++	}
++	usb_role_switch_put(sw);
++	if (ret)
++		dev_err(chip->dev, "failed to set USB role: %d\n", ret);
++}
++
++/* ---- DisplayPort alternate mode ---- */
++
++static void max77705_dp_hpd(struct max77705_usbc *chip, bool hpd)
++{
++	if (chip->dp_hpd == hpd)
++		return;
++	chip->dp_hpd = hpd;
++	dev_info(chip->dev, "DP HPD %s\n", hpd ? "high" : "low");
++#if IS_REACHABLE(CONFIG_DRM)
++	if (chip->dp_fwnode)
++		drm_connector_oob_hotplug_event(chip->dp_fwnode,
++						hpd ? connector_status_connected :
++						      connector_status_disconnected);
++#endif
++}
++
++static void max77705_dp_mux(struct max77705_usbc *chip)
++{
++	struct typec_displayport_data dp_data;
++	struct typec_mux_state state = {};
++	int ret;
++
++	if (!chip->mux)
++		return;
++
++	if (chip->dp_active && chip->dp_configured) {
++		dp_data.status = chip->dp_status;
++		dp_data.conf = DP_CONF_SET_PIN_ASSIGN(BIT(chip->dp_pin)) |
++			       DP_CONF_UFP_U_AS_UFP_D |
++			       (DP_CONF_SIGNALLING_HBR3 << DP_CONF_SIGNALLING_SHIFT);
++		state.alt = chip->partner_dp;
++		state.mode = TYPEC_DP_STATE_C + (chip->dp_pin - DP_PIN_ASSIGN_C);
++		state.data = &dp_data;
++	} else if (chip->attached) {
++		state.mode = TYPEC_STATE_USB;
++	} else {
++		state.mode = TYPEC_STATE_SAFE;
++	}
++
++	ret = typec_mux_set(chip->mux, &state);
++	if (ret)
++		dev_err(chip->dev, "typec_mux_set failed: %d\n", ret);
++}
++
++static void max77705_dp_reset(struct max77705_usbc *chip)
++{
++	if (chip->dp_active || chip->partner_dp)
++		dev_info(chip->dev, "DP alt mode exit\n");
++	max77705_dp_hpd(chip, false);
++	chip->dp_svid = false;
++	chip->dp_active = false;
++	chip->dp_conf_sent = false;
++	chip->dp_configured = false;
++	chip->dp_pins = 0;
++	chip->dp_status = 0;
++	if (chip->partner_dp) {
++		typec_unregister_altmode(chip->partner_dp);
++		chip->partner_dp = NULL;
++	}
++}
++
++static int max77705_vdm_send(struct max77705_usbc *chip, u8 cmd, u8 objpos,
++			     const u32 *vdo, int nvdo)
++{
++	u8 buf[1 + 4 + 4 * 6];
++	u32 hdr;
++	int i;
++
++	if (nvdo > 6)
++		return -EINVAL;
++
++	/* byte 0: Num_Of_VDO[2:0] (header included) | Cmd_Type[4:3] = ACK(0) */
++	buf[0] = (1 + nvdo) & 0x7;
++	hdr = VDO(USB_TYPEC_DP_SID, 1, SVDM_VER_1_0, cmd) | VDO_OPOS(objpos);
++	put_unaligned_le32(hdr, &buf[1]);
++	for (i = 0; i < nvdo; i++)
++		put_unaligned_le32(vdo[i], &buf[5 + 4 * i]);
++
++	return max77705_opcode(chip, OP_VDM_SET_REQ, buf, 5 + 4 * nvdo, NULL, 0);
++}
++
++static void max77705_dp_select_pin(struct max77705_usbc *chip, bool multi)
++{
++	static const u8 pref_multi[] = { DP_PIN_ASSIGN_D, DP_PIN_ASSIGN_C, DP_PIN_ASSIGN_E };
++	static const u8 pref_dp[] = { DP_PIN_ASSIGN_C, DP_PIN_ASSIGN_E, DP_PIN_ASSIGN_D };
++	const u8 *pref = multi ? pref_multi : pref_dp;
++	int i;
++
++	for (i = 0; i < 3; i++) {
++		if (chip->dp_pins & BIT(pref[i])) {
++			chip->dp_pin = pref[i];
++			return;
++		}
++	}
++	chip->dp_pin = DP_PIN_ASSIGN_C;
++}
++
++static void max77705_dp_status(struct max77705_usbc *chip, u32 status)
++{
++	u32 conf;
++	int ret;
++
++	chip->dp_status = status;
++	dev_dbg(chip->dev, "DP status 0x%08x\n", status);
++
++	/*
++	 * Downstream max77705_vdm_dp_status_update()/_attention(): the first
++	 * status with a connected UFP_D selects the pin assignment and sends
++	 * DP Configure (once per attach, is_sent_pin_configuration).
++	 */
++	if (DP_STATUS_CONNECTION(status) && !chip->dp_conf_sent) {
++		max77705_dp_select_pin(chip, status & DP_STATUS_PREFER_MULTI_FUNC);
++		conf = DP_CONF_SET_PIN_ASSIGN(BIT(chip->dp_pin)) |
++		       DP_CONF_UFP_U_AS_UFP_D |
++		       (DP_CONF_SIGNALLING_HBR3 << DP_CONF_SIGNALLING_SHIFT);
++		dev_info(chip->dev, "DP configure: pin assignment %c (status 0x%08x)\n",
++			 'A' + chip->dp_pin, status);
++		ret = max77705_vdm_send(chip, DP_CMD_CONFIGURE, 1, &conf, 1);
++		if (!ret)
++			chip->dp_conf_sent = true;
++		else
++			dev_err(chip->dev, "DP configure request failed: %d\n", ret);
++	}
++
++	/*
++	 * Like the generic DP alt mode driver (dp_altmode_notify), pass every
++	 * status update (HPD state, IRQ_HPD) to the muxes: the DP controller
++	 * is one of them and handles HPD even without a DRM connector. Only
++	 * once the partner ACKed Configure (downstream: DP_LINK_CONF, then
++	 * HPD): before that its pins are still in USB/safe state. A status
++	 * that arrived earlier is applied by the Configure ACK.
++	 */
++	if (chip->dp_configured)
++		max77705_dp_mux(chip);
++
++	max77705_dp_hpd(chip, chip->dp_configured && (status & DP_STATUS_HPD_STATE));
++}
++
++/*
++ * Fetch one VDM response. Layout of the opcode response (after the echoed
++ * opcode): [0] sub-id, [1..2] PD message header, [3..6] VDM header,
++ * [7..] VDOs (little endian).
++ */
++static void max77705_vdm_fetch(struct max77705_usbc *chip, u8 id)
++{
++	struct typec_altmode_desc desc = {};
++	u8 resp[OPCODE_DATA_LEN];
++	u32 hdr, vdo;
++	int ret, nobj, i;
++
++	ret = max77705_opcode(chip, OP_VDM_GET_RESP, &id, 1, resp, 31);
++	if (ret)
++		return;
++
++	nobj = pd_header_cnt(get_unaligned_le16(&resp[1]));
++	hdr = get_unaligned_le32(&resp[3]);
++	dev_dbg(chip->dev, "VDM 0x%02x: hdr 0x%08x nobj %d\n", id, hdr, nobj);
++
++	if (PD_VDO_CMDT(hdr) == CMDT_RSP_NAK || PD_VDO_CMDT(hdr) == CMDT_RSP_BUSY) {
++		dev_info(chip->dev, "VDM 0x%02x NAK/BUSY\n", id);
++		return;
++	}
++
++	switch (id) {
++	case VDM_ID_DISCOVER_IDENTITY:
++		vdo = get_unaligned_le32(&resp[7]);
++		dev_info(chip->dev, "partner identity: VID 0x%04x PID 0x%04x\n",
++			 PD_IDH_VID(vdo), get_unaligned_le32(&resp[15]) >> 16);
++		break;
++	case VDM_ID_DISCOVER_SVIDS:
++		for (i = 0; i < (nobj - 1) * 2 && i < 12; i++) {
++			u16 svid = get_unaligned_le16(&resp[7 + 2 * i]);
++
++			if (svid)
++				dev_info(chip->dev, "partner SVID 0x%04x\n", svid);
++			if (svid == USB_TYPEC_DP_SID)
++				chip->dp_svid = true;
++		}
++		break;
++	case VDM_ID_DISCOVER_MODES:
++		if (PD_VDO_VID(hdr) != USB_TYPEC_DP_SID || nobj < 2)
++			break;
++		vdo = get_unaligned_le32(&resp[7]);
++		/*
++		 * Pin assignments supported by a UFP_D (the partner): if the
++		 * partner has a receptacle use the UFP_D field, else DFP_D.
++		 */
++		if (vdo & DP_CAP_RECEPTACLE)
++			chip->dp_pins = DP_CAP_UFP_D_PIN_ASSIGN(vdo);
++		else
++			chip->dp_pins = DP_CAP_DFP_D_PIN_ASSIGN(vdo);
++		dev_info(chip->dev, "DP mode VDO 0x%08x, pins 0x%02x\n", vdo, chip->dp_pins);
++		if (chip->partner && !chip->partner_dp) {
++			desc.svid = USB_TYPEC_DP_SID;
++			desc.mode = 1;
++			desc.vdo = vdo;
++			chip->partner_dp = typec_partner_register_altmode(chip->partner, &desc);
++			if (IS_ERR(chip->partner_dp))
++				chip->partner_dp = NULL;
++		}
++		if (max77705_vdm_send(chip, CMD_ENTER_MODE, 1, NULL, 0))
++			dev_err(chip->dev, "DP enter mode request failed\n");
++		break;
++	case VDM_ID_ENTER_MODE:
++		if (PD_VDO_CMDT(hdr) == CMDT_RSP_ACK && PD_VDO_VID(hdr) == USB_TYPEC_DP_SID) {
++			dev_info(chip->dev, "DP alt mode entered\n");
++			chip->dp_active = true;
++			if (chip->partner_dp)
++				typec_altmode_update_active(chip->partner_dp, true);
++			if (chip->port_dp)
++				typec_altmode_update_active(chip->port_dp, true);
++		}
++		break;
++	case VDM_ID_DP_STATUS:
++	case VDM_ID_ATTENTION:
++		if (nobj >= 2)
++			max77705_dp_status(chip, get_unaligned_le32(&resp[7]));
++		break;
++	case VDM_ID_DP_CONFIGURE:
++		if (PD_VDO_CMDT(hdr) == CMDT_RSP_ACK) {
++			dev_info(chip->dev, "DP configure ACK (pin %c, status 0x%08x)\n",
++				 'A' + chip->dp_pin, chip->dp_status);
++			chip->dp_configured = true;
++			max77705_dp_mux(chip);
++			max77705_dp_hpd(chip, chip->dp_status & DP_STATUS_HPD_STATE);
++		} else {
++			dev_warn(chip->dev, "DP configure not ACKed (hdr 0x%08x)\n", hdr);
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++static void max77705_vdm_work(struct work_struct *work)
++{
++	struct max77705_usbc *chip = container_of(work, struct max77705_usbc, vdm_work);
++	static const u8 order[] = {
++		VDM_ID_DISCOVER_IDENTITY, VDM_ID_DISCOVER_SVIDS, VDM_ID_DISCOVER_MODES,
++		VDM_ID_ENTER_MODE, VDM_ID_DP_STATUS, VDM_ID_DP_CONFIGURE, VDM_ID_ATTENTION,
++	};
++	unsigned long pending;
++	int i;
++
++	pending = atomic_long_xchg(&chip->vdm_pending, 0);
++	mutex_lock(&chip->state_lock);
++	for (i = 0; i < ARRAY_SIZE(order); i++)
++		if ((pending & BIT(order[i])) && chip->ready && chip->attached &&
++		    !chip->removing)
++			max77705_vdm_fetch(chip, order[i]);
++	mutex_unlock(&chip->state_lock);
++}
++
++/* ---- state sync ---- */
++
++static void max77705_read_pdo(struct max77705_usbc *chip)
++{
++	u8 resp[OPCODE_DATA_LEN];
++	unsigned int cur, num;
++	u32 pdo;
++	int ret;
++
++	ret = max77705_opcode(chip, OP_CURRENT_SRCCAP, NULL, 0, resp, 30);
++	if (ret)
++		return;
++
++	cur = (resp[0] >> 3) & 0x7;	/* selected PDO, 1-based */
++	num = resp[0] & 0x7;
++	if (!cur || cur > num || cur > 7)
++		return;
++	chip->pdo1 = get_unaligned_le32(&resp[1]);
++	if (pdo_type(chip->pdo1) == PDO_TYPE_FIXED)
++		dev_info(chip->dev, "partner source caps: %u PDOs, PDO1 0x%08x: DR swap %d, PR swap %d, USB comm %d, ext power %d\n",
++			 num, chip->pdo1, !!(chip->pdo1 & PDO_FIXED_DATA_SWAP),
++			 !!(chip->pdo1 & PDO_FIXED_DUAL_ROLE), !!(chip->pdo1 & PDO_FIXED_USB_COMM),
++			 !!(chip->pdo1 & PDO_FIXED_EXTPOWER));
++	pdo = get_unaligned_le32(&resp[1 + (cur - 1) * 4]);
++	if (pdo_type(pdo) != PDO_TYPE_FIXED)
++		return;
++	chip->pdo_mv = pdo_fixed_voltage(pdo);
++	chip->pdo_ma = pdo_max_current(pdo);
++	chip->pdo_valid = true;
++	dev_info(chip->dev, "PD contract: PDO %u/%u %u mV %u mA\n",
++		 cur, num, chip->pdo_mv, chip->pdo_ma);
++}
++
++static void max77705_partner_detach(struct max77705_usbc *chip)
++{
++	max77705_dp_reset(chip);
++	if (chip->partner) {
++		typec_unregister_partner(chip->partner);
++		chip->partner = NULL;
++	}
++	chip->attached = false;
++	chip->pd_dr_valid = false;
++	chip->pd_pr = -1;
++	chip->pd_contract = false;
++	chip->pdo_valid = false;
++	chip->pdo1 = 0;
++	chip->dr_swap_tries = 0;
++	chip->dr_swap_sent = false;
++	chip->gadget_waits = 0;
++	chip->host_seen = false;
++	chip->vbus_hold = false;
++	cancel_delayed_work(&chip->swap_work);
++	cancel_delayed_work(&chip->vbus_restore_work);
++	max77705_swap_complete(chip, SWAP_DR, -ENOTCONN);
++	max77705_swap_complete(chip, SWAP_PR, -ENOTCONN);
++	max77705_update_icl(chip, 0);
++	chip->orientation = TYPEC_ORIENTATION_NONE;
++	typec_set_orientation(chip->port, TYPEC_ORIENTATION_NONE);
++	typec_set_pwr_role(chip->port, TYPEC_SINK);
++	typec_set_vconn_role(chip->port, TYPEC_SINK);
++	typec_set_data_role(chip->port, TYPEC_DEVICE);
++	typec_set_pwr_opmode(chip->port, TYPEC_PWR_MODE_USB);
++	chip->pwr_role = TYPEC_SINK;
++	chip->data_role = TYPEC_DEVICE;
++	chip->opmode = TYPEC_PWR_MODE_USB;
++	max77705_set_vbus(chip, false);
++	max77705_set_role(chip, USB_ROLE_NONE);
++	max77705_dp_mux(chip);
++	dev_info(chip->dev, "detached\n");
++}
++
++static const char *max77705_pdmsg_name(u8 msg)
++{
++	switch (msg) {
++	case PDMSG_DR_SWAP_RCVD:	return "DR_Swap request received";
++	case PDMSG_PR_SWAP_RCVD:	return "PR_Swap request received";
++	case PDMSG_VCONN_SWAP_RCVD:	return "VCONN_Swap request received";
++	case PDMSG_REJECT_RCVD:		return "Reject received";
++	case PDMSG_NOT_SUPPORTED_RCVD:	return "Not_Supported received";
++	case PDMSG_PRSWAP_SNKTOSRC_SENT: return "PR_Swap sink->source sent";
++	case PDMSG_PRSWAP_SRCTOSNK_SENT: return "PR_Swap source->sink sent";
++	case PDMSG_HARDRESET_RCVD:	return "Hard Reset received";
++	case PDMSG_HARDRESET_SENT:	return "Hard Reset sent";
++	case PDMSG_VBUS_OFF:		return "FW: VBUS off";
++	case PDMSG_PRSWAP_SRCTOSWAP:	return "PR_Swap: source off";
++	case PDMSG_PRSWAP_SWAPTOSNK:	return "PR_Swap: now sink";
++	case PDMSG_PRSWAP_SNKTOSWAP:	return "PR_Swap: sink off";
++	case PDMSG_PRSWAP_SWAPTOSRC:	return "PR_Swap: now source";
++	default:			return NULL;
++	}
++}
++
++/*
++ * PD events the FW reports in PD_STATUS0 (downstream max77705_pd_check_pdmsg).
++ * The FW runs the PD policy engine (it answers swap requests itself), but
++ * with AP-controlled VBUS (opcode 0x54 0x00) the AP has to switch the
++ * boost during PR_Swap and Hard Reset.
++ */
++static void max77705_handle_pdmsg(struct max77705_usbc *chip, u8 msg)
++{
++	const char *name = max77705_pdmsg_name(msg);
++
++	chip->last_pdmsg = msg;
++	if (name)
++		dev_info(chip->dev, "PD: %s (0x%02x)\n", name, msg);
++	else
++		dev_dbg(chip->dev, "PD msg 0x%02x\n", msg);
++
++	if (!chip->attached)
++		return;
++
++	switch (msg) {
++	case PDMSG_DR_SWAP_RCVD:
++		chip->pd_dr_valid = true;
++		break;
++	case PDMSG_REJECT_RCVD:
++		max77705_swap_complete(chip, SWAP_DR, -EPROTO);
++		max77705_swap_complete(chip, SWAP_PR, -EPROTO);
++		break;
++	case PDMSG_NOT_SUPPORTED_RCVD:
++		max77705_swap_complete(chip, SWAP_DR, -EOPNOTSUPP);
++		max77705_swap_complete(chip, SWAP_PR, -EOPNOTSUPP);
++		break;
++	case PDMSG_SRC_CAP_RCVD:
++		chip->pdo_valid = false;	/* re-read after PS_RDY */
++		break;
++	case PDMSG_HARDRESET_RCVD:
++	case PDMSG_HARDRESET_SENT:
++		/* roles go back to the Type-C defaults */
++		chip->pd_dr_valid = false;
++		chip->pd_pr = -1;
++		chip->pdo_valid = false;
++		if (chip->vbus_on) {
++			/* like downstream: VBUS off, back on after ~760 ms */
++			max77705_set_vbus(chip, false);
++			chip->vbus_hold = true;
++			queue_delayed_work(chip->wq, &chip->vbus_restore_work,
++					   msecs_to_jiffies(760));
++		}
++		break;
++	case PDMSG_VBUS_OFF:
++	case PDMSG_PRSWAP_SRCTOSWAP:
++		max77705_set_vbus(chip, false);
++		chip->vbus_hold = true;
++		break;
++	case PDMSG_VBUS_ON:
++		chip->vbus_hold = false;
++		break;
++	case PDMSG_PRSWAP_SWAPTOSNK:
++		chip->pd_pr = TYPEC_SINK;
++		chip->vbus_hold = false;
++		max77705_set_vbus(chip, false);
++		break;
++	case PDMSG_PRSWAP_SWAPTOSRC:
++		chip->pd_pr = TYPEC_SOURCE;
++		chip->vbus_hold = false;
++		/* VBUS is switched on by the sync that follows */
++		break;
++	default:
++		break;
++	}
++}
++
++static void max77705_sync(struct max77705_usbc *chip)
++{
++	u8 st[8];	/* 0x06..0x0d */
++	u8 cc0, cc1, pd1, bc, ccstat;
++	enum typec_orientation orient;
++	enum typec_pwr_opmode opmode;
++	enum usb_role role;
++	bool source, attach_new = false;
++	int ret, icl;
++
++	ret = regmap_bulk_read(chip->regmap, MAX77705_USBC_STATUS1, st, sizeof(st));
++	if (ret) {
++		dev_err(chip->dev, "failed to read status: %d\n", ret);
++		return;
++	}
++	bc = st[MAX77705_BC_STATUS - MAX77705_USBC_STATUS1];
++	cc0 = st[MAX77705_CC_STATUS0 - MAX77705_USBC_STATUS1];
++	cc1 = st[MAX77705_CC_STATUS1 - MAX77705_USBC_STATUS1];
++	pd1 = st[MAX77705_PD_STATUS1 - MAX77705_USBC_STATUS1];
++	ccstat = FIELD_GET(CC0_STAT, cc0);
++
++	chip->vbus_present = bc & BC_VBUSDET;
++	chip->chgtyp = FIELD_GET(BC_CHGTYP, bc);
++
++	if (ccstat != chip->ccstat)
++		dev_dbg(chip->dev, "CC_STATUS0 0x%02x CC_STATUS1 0x%02x PD_STATUS1 0x%02x BC 0x%02x\n",
++			cc0, cc1, pd1, bc);
++	chip->ccstat = ccstat;
++	/* in the WATER state the FW only does sink detection (no OTG) */
++	if ((cc1 ^ chip->cc1) & CC1_CONNSTAT)
++		dev_info(chip->dev, "moisture state: %s (CC_STATUS1 0x%02x)\n",
++			 cc1 & CC1_CONNSTAT ? "WATER" : "dry", cc1);
++	if (((cc1 ^ chip->cc1) & (CC1_SBUSHORT | CC1_ATTACHSRCERR | CC1_VCONNSC | CC1_VCONNOCP)) &&
++	    (cc1 & (CC1_SBUSHORT | CC1_ATTACHSRCERR | CC1_VCONNSC | CC1_VCONNOCP)))
++		dev_warn(chip->dev, "CC_STATUS1 0x%02x:%s%s%s%s\n", cc1,
++			 cc1 & CC1_ATTACHSRCERR ? " attach-as-source error" : "",
++			 FIELD_GET(CC1_SBUSHORT, cc1) == 1 ? " CC-VBUS short" :
++			 FIELD_GET(CC1_SBUSHORT, cc1) == 2 ? " SBU-VBUS short" :
++			 FIELD_GET(CC1_SBUSHORT, cc1) == 3 ? " SBU-GND short" : "",
++			 cc1 & CC1_VCONNSC ? " VCONN short" : "",
++			 cc1 & CC1_VCONNOCP ? " VCONN overcurrent" : "");
++	chip->cc1 = cc1;
++
++	if (ccstat != CCSTAT_SINK && ccstat != CCSTAT_SOURCE &&
++	    ccstat != CCSTAT_AUDIO && ccstat != CCSTAT_DEBUG) {
++		if (chip->attached)
++			max77705_partner_detach(chip);
++		goto out;
++	}
++
++	if (!chip->attached) {
++		chip->attached = true;
++		attach_new = true;
++		chip->attach_source = ccstat == CCSTAT_SOURCE;
++		memset(&chip->partner_desc, 0, sizeof(chip->partner_desc));
++		if (ccstat == CCSTAT_AUDIO)
++			chip->partner_desc.accessory = TYPEC_ACCESSORY_AUDIO;
++		else if (ccstat == CCSTAT_DEBUG)
++			chip->partner_desc.accessory = TYPEC_ACCESSORY_DEBUG;
++		chip->partner = typec_register_partner(chip->port, &chip->partner_desc);
++		if (IS_ERR(chip->partner)) {
++			dev_err(chip->dev, "failed to register partner: %ld\n",
++				PTR_ERR(chip->partner));
++			chip->partner = NULL;
++		}
++		dev_info(chip->dev, "attached: %s\n",
++			 ccstat == CCSTAT_SINK ? "we are sink (UFP)" :
++			 ccstat == CCSTAT_SOURCE ? "we are source (DFP)" :
++			 ccstat == CCSTAT_AUDIO ? "audio accessory" : "debug accessory");
++	}
++
++	if (ccstat == CCSTAT_AUDIO || ccstat == CCSTAT_DEBUG)
++		goto out;
++
++	/* power role: CC, unless a PR_Swap happened during this attach */
++	if (chip->pd_pr >= 0)
++		source = chip->pd_pr == TYPEC_SOURCE;
++	else
++		source = ccstat == CCSTAT_SOURCE;
++
++	/* D+/D- to the AP whenever something is attached */
++	if (attach_new)
++		max77705_muic_set_usb(chip);
++
++	/* orientation (drives the SS lane switch through the typec class) */
++	switch (FIELD_GET(CC0_PINSTAT, cc0)) {
++	case CCPIN_CC1:
++		orient = TYPEC_ORIENTATION_NORMAL;
++		break;
++	case CCPIN_CC2:
++		orient = TYPEC_ORIENTATION_REVERSE;
++		break;
++	default:
++		orient = TYPEC_ORIENTATION_NONE;
++		break;
++	}
++	if (orient != chip->orientation) {
++		chip->orientation = orient;
++		typec_set_orientation(chip->port, orient);
++	}
++
++	/* power role + VBUS */
++	if ((source ? TYPEC_SOURCE : TYPEC_SINK) != chip->pwr_role || attach_new) {
++		if (!attach_new)
++			dev_info(chip->dev, "power role: %s\n", source ? "source" : "sink");
++		chip->pwr_role = source ? TYPEC_SOURCE : TYPEC_SINK;
++		typec_set_pwr_role(chip->port, chip->pwr_role);
++	}
++	if (READ_ONCE(chip->swap_want) == chip->pwr_role)
++		max77705_swap_complete(chip, SWAP_PR, 0);
++	max77705_set_vbus(chip, source);
++	typec_set_vconn_role(chip->port, (cc0 & CC0_VCNSTAT) ? TYPEC_SOURCE : TYPEC_SINK);
++
++	/* PD contract / power operation mode */
++	chip->pd_contract = pd1 & PD1_PSRDY;
++	if (chip->pd_contract)
++		opmode = TYPEC_PWR_MODE_PD;
++	else if (!source && FIELD_GET(CC0_ISTAT, cc0) == CCI_3_0A)
++		opmode = TYPEC_PWR_MODE_3_0A;
++	else if (!source && FIELD_GET(CC0_ISTAT, cc0) == CCI_1_5A)
++		opmode = TYPEC_PWR_MODE_1_5A;
++	else
++		opmode = TYPEC_PWR_MODE_USB;
++	if (opmode != chip->opmode) {
++		chip->opmode = opmode;
++		typec_set_pwr_opmode(chip->port, opmode);
++		if (chip->partner && opmode == TYPEC_PWR_MODE_PD)
++			typec_partner_set_pd_revision(chip->partner, 0x300);
++	}
++	if (chip->pd_contract && !source && !chip->pdo_valid)
++		max77705_read_pdo(chip);
++
++	/* charger input current from the contract / Rp, only while sink */
++	icl = 0;
++	if (!source && chip->vbus_present) {
++		if (chip->pd_contract && chip->pdo_valid)
++			icl = chip->pdo_ma * 1000;
++		else if (!chip->pd_contract && opmode == TYPEC_PWR_MODE_3_0A)
++			icl = 3000000;
++		else if (!chip->pd_contract && opmode == TYPEC_PWR_MODE_1_5A)
++			icl = 1500000;
++		icl = min_t(int, icl, chg_icl_max_ma * 1000);
++	}
++	max77705_update_icl(chip, icl);
++
++	/*
++	 * data role: PD DataRole if PD told us (DataRole interrupt, DR_Swap),
++	 * else the Type-C default for the role we attached with.
++	 */
++	if (chip->pd_dr_valid || (chip->pd_contract && chip->dr_swap_sent))
++		role = (pd1 & PD1_DATAROLE_DFP) ? USB_ROLE_HOST : USB_ROLE_DEVICE;
++	else
++		role = chip->attach_source ? USB_ROLE_HOST : USB_ROLE_DEVICE;
++	if ((role == USB_ROLE_HOST ? TYPEC_HOST : TYPEC_DEVICE) != chip->data_role &&
++	    !attach_new)
++		dev_info(chip->dev, "PD data role: %s\n", role == USB_ROLE_HOST ? "host (DFP)" : "device (UFP)");
++	chip->data_role = role == USB_ROLE_HOST ? TYPEC_HOST : TYPEC_DEVICE;
++	typec_set_data_role(chip->port, chip->data_role);
++	if (READ_ONCE(chip->swap_want) == chip->data_role)
++		max77705_swap_complete(chip, SWAP_DR, 0);
++
++	/* prefer_host: sink with a PD contract but USB device -> try DR_Swap */
++	if (prefer_host && !source && chip->pd_contract && chip->data_role == TYPEC_DEVICE &&
++	    !chip->host_seen && chip->dr_swap_tries < DR_SWAP_MAX_TRIES)
++		queue_delayed_work(system_wq, &chip->swap_work,
++				   msecs_to_jiffies(PREFER_HOST_DELAY_MS));
++
++	max77705_set_role(chip, role);
++
++	if (attach_new)
++		max77705_dp_mux(chip);
++out:
++	if (chip->psy)
++		power_supply_changed(chip->psy);
++}
++
++static void max77705_sync_work(struct work_struct *work)
++{
++	struct max77705_usbc *chip = container_of(work, struct max77705_usbc, sync_work);
++
++	u8 msg;
++
++	mutex_lock(&chip->state_lock);
++	while (kfifo_get(&chip->pdmsg_fifo, &msg))
++		if (chip->ready && !chip->removing)
++			max77705_handle_pdmsg(chip, msg);
++	if (chip->ready && !chip->removing)
++		max77705_sync(chip);
++	mutex_unlock(&chip->state_lock);
++}
++
++static void max77705_vbus_restore_work(struct work_struct *work)
++{
++	struct max77705_usbc *chip = container_of(to_delayed_work(work),
++						  struct max77705_usbc, vbus_restore_work);
++
++	mutex_lock(&chip->state_lock);
++	chip->vbus_hold = false;
++	if (chip->ready && !chip->removing && chip->attached)
++		max77705_sync(chip);
++	mutex_unlock(&chip->state_lock);
++}
++
++/* prefer_host policy: we are PD sink + USB device, try to become host */
++static void max77705_swap_work(struct work_struct *work)
++{
++	struct max77705_usbc *chip = container_of(to_delayed_work(work),
++						  struct max77705_usbc, swap_work);
++	int st = 0, ret;
++	bool go;
++
++	mutex_lock(&chip->state_lock);
++	go = prefer_host && chip->ready && !chip->removing && chip->attached &&
++	     chip->pwr_role == TYPEC_SINK && chip->pd_contract &&
++	     chip->data_role == TYPEC_DEVICE && !chip->host_seen &&
++	     chip->dr_swap_tries < DR_SWAP_MAX_TRIES;
++	if (go && prefer_host == 1) {
++		st = max77705_gadget_state(chip);
++		if (st >= USB_STATE_DEFAULT) {
++			/* a USB host (PC, Mac) talks to our gadget: leave it */
++			dev_info(chip->dev, "prefer_host: USB host is using our gadget (%s), staying device\n",
++				 usb_state_string(st));
++			chip->host_seen = true;
++			go = false;
++		} else if (st < 0 && chip->gadget_waits < GADGET_WAIT_MAX) {
++			/* gadget not up yet (boot, DWC3 rebind): look again later */
++			chip->gadget_waits++;
++			dev_dbg(chip->dev, "prefer_host: gadget not ready (%d), waiting\n", st);
++			queue_delayed_work(system_wq, &chip->swap_work,
++					   msecs_to_jiffies(PREFER_HOST_DELAY_MS));
++			go = false;
++		}
++	}
++	if (go) {
++		chip->dr_swap_tries++;
++		if (chip->pdo1 && !(chip->pdo1 & PDO_FIXED_DATA_SWAP))
++			dev_info(chip->dev, "prefer_host: partner does not advertise DR swap, trying anyway\n");
++		dev_info(chip->dev, "prefer_host: PD sink as USB device (gadget %s), requesting DR_Swap (try %u)\n",
++			 st >= 0 ? usb_state_string(st) : "absent", chip->dr_swap_tries);
++	}
++	mutex_unlock(&chip->state_lock);
++	if (!go)
++		return;
++
++	ret = max77705_swap(chip, SWAP_DR, TYPEC_HOST);
++	if (ret && ret != -ENOTCONN && chip->dr_swap_tries < DR_SWAP_MAX_TRIES)
++		queue_delayed_work(system_wq, &chip->swap_work, msecs_to_jiffies(5000));
++}
++
++static u8 max77705_cc_role_bits(enum typec_port_type type)
++{
++	switch (type) {
++	case TYPEC_PORT_SRC:
++		return CCCTRL1_SRCSNK;
++	case TYPEC_PORT_SNK:
++		return CCCTRL1_SNKSRC;
++	default:
++		return CCCTRL1_ROLES;
++	}
++}
++
++static int max77705_ccctrl1_read(struct max77705_usbc *chip, u8 *val)
++{
++	int ret = max77705_opcode(chip, OP_CCCTRL1_R, NULL, 0, val, 1);
++
++	if (!ret)
++		chip->ccctrl1 = *val;
++	return ret;
++}
++
++static int max77705_ccctrl1_write(struct max77705_usbc *chip, u8 val)
++{
++	int ret = max77705_opcode(chip, OP_CCCTRL1_W, &val, 1, NULL, 0);
++
++	if (ret) {
++		chip->ccctrl1 = -1;
++		return ret;
++	}
++	chip->ccctrl1 = val;
++	return 0;
++}
++
++/*
++ * Program the CC role bits (CCCTRL1) for chip->port_type, with detection and
++ * the debug/audio accessory bits on (downstream support-audio: 0x1f).  The Rp
++ * current bits keep the FW value, so for
++ * DRP on a FW that already toggles (0x1d) this writes nothing.
++ */
++static int max77705_cc_apply(struct max77705_usbc *chip)
++{
++	u8 cur, val, reg3;
++	int ret;
++
++	ret = max77705_ccctrl1_read(chip, &cur);
++	if (ret) {
++		dev_warn(chip->dev, "failed to read CCCTRL1: %d\n", ret);
++		return ret;
++	}
++
++	val = (cur & ~CCCTRL1_ROLES) | max77705_cc_role_bits(chip->port_type) |
++	      CCCTRL1_DETEN | CCCTRL1_DBGEN | CCCTRL1_AUDEN;
++
++	if (val != cur) {
++		ret = max77705_ccctrl1_write(chip, val);
++		if (ret) {
++			dev_warn(chip->dev, "failed to write CCCTRL1 0x%02x: %d\n", val, ret);
++			return ret;
++		}
++		/* read back: does the FW accept/keep the value? */
++		if (!max77705_ccctrl1_read(chip, &cur) && cur != val)
++			dev_warn(chip->dev, "CCCTRL1 reads 0x%02x after writing 0x%02x\n",
++				 cur, val);
++	}
++	dev_info(chip->dev, "CCCTRL1 0x%02x (%s%s%s%s%s)\n", cur,
++		 cur & CCCTRL1_SRCSNK ? "src " : "", cur & CCCTRL1_SNKSRC ? "snk " : "",
++		 cur & CCCTRL1_DETEN ? "det" : "NO-DET",
++		 cur & CCCTRL1_DBGEN ? " dbg" : "", cur & CCCTRL1_AUDEN ? " aud" : "");
++
++	/* "CC open" lock (downstream clears it at probe): blocks attach in any role */
++	if (!max77705_opcode(chip, OP_CTRLREG3_R, NULL, 0, &reg3, 1) &&
++	    (reg3 & CTRLREG3_LOCK_ERROR_EN))
++		dev_warn(chip->dev, "CTRLREG3 0x%02x: CC lock-error (CC open) is enabled\n", reg3);
++	return 0;
++}
++
++/* downstream pdic_manual_ccopen_request(0): CTRLREG3 lock-error off */
++static void max77705_ccopen_clear(struct max77705_usbc *chip)
++{
++	u8 reg3;
++	int ret;
++
++	ret = max77705_opcode(chip, OP_CTRLREG3_R, NULL, 0, &reg3, 1);
++	if (ret) {
++		dev_warn(chip->dev, "failed to read CTRLREG3: %d\n", ret);
++		return;
++	}
++	if (!(reg3 & CTRLREG3_LOCK_ERROR_EN)) {
++		dev_info(chip->dev, "CTRLREG3 0x%02x: CC lock-error already off\n", reg3);
++		return;
++	}
++	reg3 &= ~CTRLREG3_LOCK_ERROR_EN;
++	ret = max77705_opcode(chip, OP_CTRLREG3_W, &reg3, 1, NULL, 0);
++	dev_info(chip->dev, "CTRLREG3: CC lock-error cleared (-> 0x%02x): %d\n", reg3, ret);
++}
++
++/*
++ * Init / FW-restart sequence.  The extra opcodes are sent in
++ * downstream's probe order (G975F max77705_usbc_probe):
++ *   muic_probe -> init_detect: 0x56 0x07 (CC/SBU short detection)
++ *   pd_init: 0x57 0x01 (AUTOIBUS: FW on, auto off)
++ *   PD_INT_M/VDM_INT_M, init_opcode: 0x54 0x00 (AP VBUS), 0x0c 0x1f (support-audio)
++ *   pdic_manual_ccopen_request(0): 0x1c, 0x1d if lock-error is set
++ *   boot complete (framework, ALTERNATE_MODE_START/STOP): 0x55 0x03 / 0x01
++ * On the device the alt-mode opcode (0x55 0x01, SRCCAP) is what makes the
++ * firmware toggle to source and attach OTG adapters.
++ */
++static int max77705_hw_init(struct max77705_usbc *chip)
++{
++	u8 val;
++	int ret;
++
++	ret = regmap_write(chip->regmap, MAX77705_UIC_INT_M, UIC_INT_M_INIT);
++	ret = ret ?: regmap_write(chip->regmap, MAX77705_CC_INT_M,
++				  CC_INT_M_INIT);
++	ret = ret ?: regmap_write(chip->regmap, MAX77705_PD_INT_M,
++				  altmode ? PD_INT_M_INIT : PD_INT_M_NOALT);
++	ret = ret ?: regmap_write(chip->regmap, MAX77705_VDM_INT_M,
++				  altmode ? VDM_INT_M_INIT : VDM_INT_M_NOALT);
++	if (ret)
++		return ret;
++
++	max77705_muic_set_usb(chip);
++
++	val = 0x07;
++	ret = max77705_opcode(chip, OP_CCSBU_SHORT, &val, 1, NULL, 0);
++	dev_info(chip->dev, "init: CC/SBU short detection 0x56 0x07: %d\n", ret);
++
++	/* AUTOIBUS 0x57 0x01 as downstream pd_init */
++	val = 1;
++	ret = max77705_opcode(chip, OP_FW_AUTOIBUS, &val, 1, NULL, 0);
++	if (ret)
++		dev_warn(chip->dev, "failed to set AUTOIBUS 1: %d\n", ret);
++
++	/* VBUS: by the AP (charger OTG regulator) or, without one, by the FW */
++	val = chip->fw_vbus ? 0x02 : 0x00;
++	ret = max77705_opcode(chip, OP_FACTORY_TEST, &val, 1, NULL, 0);
++	if (ret)
++		dev_warn(chip->dev, "failed to set %s VBUS control: %d\n",
++			 chip->fw_vbus ? "FW" : "AP", ret);
++
++	max77705_cc_apply(chip);
++
++	max77705_ccopen_clear(chip);
++
++	val = altmode ? ALTMODE_SRC_VDM : ALTMODE_SRCCAP;
++	ret = max77705_opcode(chip, OP_SET_ALTERNATEMODE, &val, 1, NULL, 0);
++	if (ret)
++		dev_warn(chip->dev, "failed to set alternate mode 0x%02x: %d\n", val, ret);
++	else if (!altmode)
++		dev_info(chip->dev, "init: alternate mode opcode 0x55 0x%02x\n", val);
++
++	return 0;
++}
++
++static void max77705_reinit_work(struct work_struct *work)
++{
++	struct max77705_usbc *chip = container_of(work, struct max77705_usbc, reinit_work);
++
++	dev_warn(chip->dev, "firmware restarted (sysmsg 0x%02x), re-initialising\n",
++		 chip->last_sysmsg);
++	mutex_lock(&chip->state_lock);
++	if (chip->ready && !chip->removing) {
++		/* like downstream on SYSERROR_BOOT_WDT: VBUS off, then re-init */
++		max77705_set_vbus(chip, false);
++		max77705_hw_init(chip);
++		max77705_sync(chip);
++	}
++	mutex_unlock(&chip->state_lock);
++}
++
++/* called with int_lock held; must not issue opcodes */
++static void max77705_handle_ints(struct max77705_usbc *chip, const u8 *ints)
++{
++	u8 uic = ints[0], cc = ints[1], pd = ints[2], vdm = ints[3];
++	unsigned int sysmsg;
++
++	chip->irq_count++;
++	memcpy(chip->last_ints, ints, 4);
++	dev_dbg(chip->dev, "ints UIC 0x%02x CC 0x%02x PD 0x%02x VDM 0x%02x\n",
++		uic, cc, pd, vdm);
++
++	if (uic & UIC_APCMDRES)
++		complete(&chip->op_done);
++
++	if (uic & UIC_SYSMSG) {
++		if (!regmap_read(chip->regmap, MAX77705_USBC_STATUS2, &sysmsg)) {
++			chip->last_sysmsg = sysmsg;
++			if ((sysmsg >= SYSMSG_CCX_5V_SHORT && sysmsg <= SYSMSG_PD_GENDER_SHORT) ||
++			    sysmsg == SYSMSG_CCRP_HIGH || sysmsg == SYSMSG_CCRP_LOW)
++				dev_info(chip->dev, "sysmsg 0x%02x%s\n", sysmsg,
++					 sysmsg >= SYSMSG_CCX_5V_SHORT && sysmsg <= SYSMSG_PD_GENDER_SHORT ?
++					 " (CC/SBU short report)" :
++					 sysmsg == SYSMSG_CCRP_HIGH || sysmsg == SYSMSG_CCRP_LOW ?
++					 " (Rp change while WATER)" : "");
++			else
++				dev_dbg(chip->dev, "sysmsg 0x%02x\n", sysmsg);
++			if (sysmsg == SYSMSG_BOOT_POR || sysmsg == SYSMSG_BOOT_WDT)
++				queue_work(chip->wq, &chip->reinit_work);
++			/* an opcode error will not be followed by APCmdResI */
++			if (sysmsg == SYSMSG_APCMD_UNKNOWN || sysmsg == SYSMSG_APCMD_FAIL)
++				complete(&chip->op_done);
++		}
++	}
++
++	if (pd & PD_DATAROLE)
++		chip->pd_dr_valid = true;
++
++	if ((pd & PD_PDMSG) && !regmap_read(chip->regmap, MAX77705_PD_STATUS0, &sysmsg))
++		kfifo_put(&chip->pdmsg_fifo, (u8)sysmsg);
++
++	if ((uic & (UIC_VBUSDET | UIC_CHGTYP)) || cc ||
++	    (pd & (PD_PSRDY | PD_DATAROLE | PD_PDMSG)))
++		queue_work(chip->wq, &chip->sync_work);
++
++	if (altmode) {
++		unsigned long ids = 0;
++
++		if (vdm & VDM_DISCOVER_ID)
++			ids |= BIT(VDM_ID_DISCOVER_IDENTITY);
++		if (vdm & VDM_DISCOVER_SVIDS)
++			ids |= BIT(VDM_ID_DISCOVER_SVIDS);
++		if (vdm & VDM_DISCOVER_MODES)
++			ids |= BIT(VDM_ID_DISCOVER_MODES);
++		if (vdm & VDM_ENTER_MODE)
++			ids |= BIT(VDM_ID_ENTER_MODE);
++		if (pd & PD_DP_STATUS)
++			ids |= BIT(VDM_ID_DP_STATUS);
++		if (pd & PD_DP_CONFIGURE)
++			ids |= BIT(VDM_ID_DP_CONFIGURE);
++		if (pd & PD_DP_ATTENTION)
++			ids |= BIT(VDM_ID_ATTENTION);
++		if (ids) {
++			atomic_long_or(ids, &chip->vdm_pending);
++			queue_work(chip->wq, &chip->vdm_work);
++		}
++	}
++}
++
++static irqreturn_t max77705_usbc_irq(int irq, void *data)
++{
++	struct max77705_usbc *chip = data;
++
++	max77705_poll_ints(chip);
++	return IRQ_HANDLED;
++}
++
++static void max77705_poll_work(struct work_struct *work)
++{
++	struct max77705_usbc *chip = container_of(to_delayed_work(work),
++						  struct max77705_usbc, poll_work);
++
++	max77705_poll_ints(chip);
++
++	/*
++	 * A DWC3 unbind/rebind (usb-gadget-reconnect.sh) resets it to device
++	 * mode without telling us; re-assert the host role every ~5 s.
++	 */
++	if (++chip->poll_count >= DIV_ROUND_UP(5000, POLL_MS)) {
++		chip->poll_count = 0;
++		mutex_lock(&chip->state_lock);
++		if (chip->ready && !chip->removing && chip->attached && chip->role == USB_ROLE_HOST)
++			max77705_set_role(chip, chip->role);
++		mutex_unlock(&chip->state_lock);
++	}
++
++	if (!chip->removing)
++		queue_delayed_work(chip->wq, &chip->poll_work, msecs_to_jiffies(POLL_MS));
++}
++
++/* ---- typec ops ---- */
++
++/* echo host|device > /sys/class/typec/port0/data_role */
++static int max77705_dr_set(struct typec_port *port, enum typec_data_role role)
++{
++	struct max77705_usbc *chip = typec_get_drvdata(port);
++
++	if (!chip->attached || !chip->pd_contract)
++		return -EOPNOTSUPP;	/* DR_Swap needs a PD contract */
++	if (role == chip->data_role)
++		return 0;
++	return max77705_swap(chip, SWAP_DR, role);
++}
++
++/* echo source|sink > /sys/class/typec/port0/power_role */
++static int max77705_pr_set(struct typec_port *port, enum typec_role role)
++{
++	struct max77705_usbc *chip = typec_get_drvdata(port);
++
++	if (!chip->attached || !chip->pd_contract)
++		return -EOPNOTSUPP;
++	if (role == chip->pwr_role)
++		return 0;
++	if (role == TYPEC_SOURCE && !chip->vbus && !chip->fw_vbus)
++		return -EPERM;
++	return max77705_swap(chip, SWAP_PR, role);
++}
++
++/* echo dual|source|sink > /sys/class/typec/port0/port_type */
++static int max77705_port_type_set(struct typec_port *port, enum typec_port_type type)
++{
++	struct max77705_usbc *chip = typec_get_drvdata(port);
++	enum typec_port_type old;
++	int ret;
++
++	if (!chip->ready || chip->removing)
++		return -EAGAIN;
++
++	mutex_lock(&chip->state_lock);
++	old = chip->port_type;
++	chip->port_type = type;
++	ret = max77705_cc_apply(chip);
++	if (ret) {
++		chip->port_type = old;
++		goto out;
++	}
++
++	if (chip->attached &&
++	    ((type == TYPEC_PORT_SRC && chip->pwr_role == TYPEC_SINK) ||
++	     (type == TYPEC_PORT_SNK && chip->pwr_role == TYPEC_SOURCE))) {
++		dev_info(chip->dev, "port type %d applies on the next attach (replug)\n",
++			 type);
++	}
++out:
++	mutex_unlock(&chip->state_lock);
++	return ret;
++}
++
++static const struct typec_operations max77705_typec_ops = {
++	.dr_set = max77705_dr_set,
++	.pr_set = max77705_pr_set,
++	.port_type_set = max77705_port_type_set,
++};
++
++/* ---- power supply: what the port partner offers us ---- */
++
++static const enum power_supply_property max77705_psy_props[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_USB_TYPE,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX,
++	POWER_SUPPLY_PROP_CURRENT_MAX,
++};
++
++static int max77705_psy_get(struct power_supply *psy, enum power_supply_property psp,
++			    union power_supply_propval *val)
++{
++	struct max77705_usbc *chip = power_supply_get_drvdata(psy);
++	bool sink = chip->attached && chip->pwr_role == TYPEC_SINK && chip->vbus_present;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_ONLINE:
++		val->intval = sink;
++		break;
++	case POWER_SUPPLY_PROP_USB_TYPE:
++		if (!sink)
++			val->intval = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++		else if (chip->pd_contract)
++			val->intval = POWER_SUPPLY_USB_TYPE_PD;
++		else if (chip->chgtyp == CHGTYP_SDP)
++			val->intval = POWER_SUPPLY_USB_TYPE_SDP;
++		else if (chip->chgtyp == CHGTYP_CDP)
++			val->intval = POWER_SUPPLY_USB_TYPE_CDP;
++		else if (chip->chgtyp == CHGTYP_DCP)
++			val->intval = POWER_SUPPLY_USB_TYPE_DCP;
++		else
++			val->intval = POWER_SUPPLY_USB_TYPE_C;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
++		val->intval = sink ? (chip->pdo_valid ? chip->pdo_mv * 1000 : 5000000) : 0;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		if (!sink)
++			val->intval = 0;
++		else if (chip->pdo_valid)
++			val->intval = chip->pdo_ma * 1000;
++		else if (chip->opmode == TYPEC_PWR_MODE_3_0A)
++			val->intval = 3000000;
++		else if (chip->opmode == TYPEC_PWR_MODE_1_5A)
++			val->intval = 1500000;
++		else if (chip->chgtyp == CHGTYP_CDP || chip->chgtyp == CHGTYP_DCP)
++			val->intval = 1500000;
++		else
++			val->intval = 500000;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static const struct power_supply_desc max77705_psy_desc = {
++	.name = "max77705-typec",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) | BIT(POWER_SUPPLY_USB_TYPE_SDP) |
++		     BIT(POWER_SUPPLY_USB_TYPE_CDP) | BIT(POWER_SUPPLY_USB_TYPE_DCP) |
++		     BIT(POWER_SUPPLY_USB_TYPE_C) | BIT(POWER_SUPPLY_USB_TYPE_PD),
++	.properties = max77705_psy_props,
++	.num_properties = ARRAY_SIZE(max77705_psy_props),
++	.get_property = max77705_psy_get,
++};
++
++/* ---- debugfs ---- */
++
++static int max77705_regs_show(struct seq_file *s, void *unused)
++{
++	struct max77705_usbc *chip = s->private;
++	u8 regs[MAX77705_VDM_INT_M + 1];
++	int i;
++
++	/* skip the clear-on-read interrupt registers 0x02..0x05 */
++	if (regmap_bulk_read(chip->regmap, 0, regs, 2) ||
++	    regmap_bulk_read(chip->regmap, MAX77705_USBC_STATUS1, &regs[6],
++			     sizeof(regs) - 6))
++		return -EIO;
++	for (i = 0; i < sizeof(regs); i++)
++		if (i < 2 || i > 5)
++			seq_printf(s, "0x%02x: 0x%02x\n", i, regs[i]);
++	seq_printf(s, "ccstat %u attached %d role %s pwr %s data %s orient %d opmode %d\n",
++		   chip->ccstat, chip->attached, usb_role_string(chip->role),
++		   chip->pwr_role == TYPEC_SOURCE ? "source" : "sink",
++		   chip->data_role == TYPEC_HOST ? "host" : "device",
++		   chip->orientation, chip->opmode);
++	seq_printf(s, "vbus_out %d fw_vbus %d pd %d pdo %u mV %u mA pdo1 0x%08x last_pdmsg 0x%02x\n",
++		   chip->vbus_on, chip->fw_vbus, chip->pd_contract, chip->pdo_mv, chip->pdo_ma,
++		   chip->pdo1, chip->last_pdmsg);
++	seq_printf(s, "pd_dr_valid %d pd_pr %d attach_source %d dr_swap_tries %u host_seen %d gadget %d icl_set %d uA icl_saved %d uA\n",
++		   chip->pd_dr_valid, chip->pd_pr, chip->attach_source, chip->dr_swap_tries,
++		   chip->host_seen, max77705_gadget_state(chip), chip->icl_set, chip->icl_saved);
++	seq_printf(s, "dp svid %d active %d conf_sent %d configured %d pins 0x%02x pin %c status 0x%08x hpd %d\n",
++		   chip->dp_svid, chip->dp_active, chip->dp_conf_sent, chip->dp_configured, chip->dp_pins,
++		   'A' + chip->dp_pin, chip->dp_status, chip->dp_hpd);
++	seq_printf(s, "port_type %d ccctrl1 %d (0x%02x) cc_status1 0x%02x%s\n",
++		   chip->port_type, chip->ccctrl1, chip->ccctrl1 & 0xff, chip->cc1,
++		   chip->cc1 & CC1_CONNSTAT ? " WATER" : "");
++	seq_printf(s, "int events %lu last %*ph sysmsg 0x%02x irq %d poll %u ms\n",
++		   chip->irq_count, 4, chip->last_ints, chip->last_sysmsg, chip->irq, POLL_MS);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(max77705_regs);
++
++/* ---- probe ---- */
++
++static void max77705_usbc_teardown(void *data)
++{
++	struct max77705_usbc *chip = data;
++
++	/* the (devm) IRQ is already freed at this point */
++	chip->removing = true;
++	cancel_delayed_work_sync(&chip->poll_work);
++	cancel_delayed_work_sync(&chip->swap_work);
++	cancel_delayed_work_sync(&chip->vbus_restore_work);
++	cancel_work_sync(&chip->sync_work);
++	cancel_work_sync(&chip->reinit_work);
++	cancel_work_sync(&chip->vdm_work);
++	debugfs_remove_recursive(chip->debugfs);
++
++	mutex_lock(&chip->state_lock);
++	if (chip->attached)
++		max77705_partner_detach(chip);
++	max77705_set_vbus(chip, false);
++	max77705_update_icl(chip, 0);
++	mutex_unlock(&chip->state_lock);
++	cancel_delayed_work_sync(&chip->swap_work);
++
++	if (chip->port_dp)
++		typec_unregister_altmode(chip->port_dp);
++	typec_unregister_port(chip->port);
++	typec_mux_put(chip->mux);
++	fwnode_handle_put(chip->dp_fwnode);
++	fwnode_handle_put(chip->connector);
++}
++
++static int max77705_typec_init(struct max77705_usbc *chip)
++{
++	struct device *dev = chip->dev;
++	struct typec_altmode_desc desc = {};
++	struct usb_role_switch *sw;
++	int ret;
++
++	chip->connector = device_get_named_child_node(dev, "connector");
++	if (!chip->connector)
++		return dev_err_probe(dev, -ENODEV, "no connector node\n");
++
++	/* defer until the DWC3 role switch exists; see max77705_set_role() */
++	sw = fwnode_usb_role_switch_get(chip->connector);
++	if (IS_ERR(sw))
++		return dev_err_probe(dev, PTR_ERR(sw), "failed to get USB role switch\n");
++	chip->has_role_sw = !!sw;
++	if (!sw)
++		dev_warn(dev, "no USB role switch connected, data role is not controlled\n");
++	usb_role_switch_put(sw);
++
++	if (altmode) {
++		chip->mux = fwnode_typec_mux_get(chip->connector);
++		if (IS_ERR(chip->mux)) {
++			ret = PTR_ERR(chip->mux);
++			chip->mux = NULL;
++			if (ret == -EPROBE_DEFER)
++				return ret;
++			dev_warn(dev, "no typec mux: %d\n", ret);
++		}
++		chip->dp_fwnode = fwnode_find_reference(chip->connector, "displayport", 0);
++		if (IS_ERR(chip->dp_fwnode))
++			chip->dp_fwnode = NULL;
++	}
++
++	chip->cap.type = TYPEC_PORT_DRP;
++	chip->cap.data = TYPEC_PORT_DRD;
++	chip->cap.revision = USB_TYPEC_REV_1_2;
++	chip->cap.pd_revision = 0x300;
++	chip->cap.svdm_version = SVDM_VER_1_0;
++	chip->cap.prefer_role = TYPEC_SINK;
++	chip->cap.accessory[0] = TYPEC_ACCESSORY_AUDIO;
++	chip->cap.orientation_aware = 1;
++	chip->cap.fwnode = chip->connector;
++	chip->cap.driver_data = chip;
++	chip->cap.ops = &max77705_typec_ops;
++
++	chip->port = typec_register_port(dev, &chip->cap);
++	if (IS_ERR(chip->port))
++		return dev_err_probe(dev, PTR_ERR(chip->port), "failed to register port\n");
++
++	if (altmode) {
++		desc.svid = USB_TYPEC_DP_SID;
++		desc.mode = 1;
++		desc.vdo = DP_CAP_DFP_D | DP_CAP_RECEPTACLE |
++			   (DP_CAP_SIGNALLING_HBR3 << 2) |
++			   ((BIT(DP_PIN_ASSIGN_C) | BIT(DP_PIN_ASSIGN_D) |
++			     BIT(DP_PIN_ASSIGN_E)) << 8);
++		chip->port_dp = typec_port_register_altmode(chip->port, &desc);
++		if (IS_ERR(chip->port_dp)) {
++			dev_warn(dev, "failed to register DP altmode: %ld\n",
++				 PTR_ERR(chip->port_dp));
++			chip->port_dp = NULL;
++		}
++	}
++
++	return 0;
++}
++
++static int max77705_usbc_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct power_supply_config psy_cfg = {};
++	struct max77705_usbc *chip;
++	unsigned int hw, fw, minor;
++	int ret;
++
++	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++	chip->dev = dev;
++	chip->client = client;
++	chip->irq = client->irq;
++	chip->role = USB_ROLE_NONE;
++	chip->ccstat = 0xff;
++	chip->ccctrl1 = -1;
++	chip->port_type = TYPEC_PORT_DRP;
++	chip->pwr_role = TYPEC_SINK;
++	chip->data_role = TYPEC_DEVICE;
++	chip->opmode = TYPEC_PWR_MODE_USB;
++	chip->pd_pr = -1;
++	chip->icl_saved = -1;
++	chip->swap_want = -1;
++	mutex_init(&chip->swap_lock);
++	init_completion(&chip->swap_done);
++	INIT_KFIFO(chip->pdmsg_fifo);
++	INIT_DELAYED_WORK(&chip->swap_work, max77705_swap_work);
++	INIT_DELAYED_WORK(&chip->vbus_restore_work, max77705_vbus_restore_work);
++	mutex_init(&chip->op_lock);
++	mutex_init(&chip->int_lock);
++	mutex_init(&chip->state_lock);
++	init_completion(&chip->op_done);
++	INIT_WORK(&chip->sync_work, max77705_sync_work);
++	INIT_WORK(&chip->reinit_work, max77705_reinit_work);
++	INIT_WORK(&chip->vdm_work, max77705_vdm_work);
++	INIT_DELAYED_WORK(&chip->poll_work, max77705_poll_work);
++	i2c_set_clientdata(client, chip);
++
++	chip->regmap = devm_regmap_init_i2c(client, &max77705_usbc_regmap_config);
++	if (IS_ERR(chip->regmap))
++		return PTR_ERR(chip->regmap);
++
++	ret = regmap_read(chip->regmap, MAX77705_UIC_HW_REV, &hw);
++	ret = ret ?: regmap_read(chip->regmap, MAX77705_UIC_FW_REV, &fw);
++	ret = ret ?: regmap_read(chip->regmap, MAX77705_UIC_FW_MINOR, &minor);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to read revision\n");
++	chip->hw_rev = hw;
++	chip->fw_rev = fw;
++	chip->fw_minor = minor;
++
++	/*
++	 * Freezable: the 1 s poll (and the other works on it) must not run while
++	 * the I2C adapter is suspended ("i2c-4: Transfer while suspended" in about
++	 * one suspend in five); a freezable queue holds them from the task freeze
++	 * until after resume.
++	 */
++	chip->wq = devm_alloc_ordered_workqueue(dev, "%s", WQ_FREEZABLE, dev_name(dev));
++	if (!chip->wq)
++		return -ENOMEM;
++
++	/*
++	 * Route D+/D- to the AP first, before anything that may defer:
++	 * after a warm reboot the switch is left open (CTRL1 = 0x3f) and the
++	 * USB gadget link would not come up.
++	 */
++	max77705_muic_set_usb(chip);
++
++	chip->vbus = devm_regulator_get_optional(dev, "vbus");
++	if (IS_ERR(chip->vbus)) {
++		ret = PTR_ERR(chip->vbus);
++		chip->vbus = NULL;
++		if (ret != -ENODEV)
++			return dev_err_probe(dev, ret, "failed to get vbus regulator\n");
++		dev_info(dev, "no vbus-supply, letting the firmware drive VBUS\n");
++		chip->fw_vbus = true;
++	}
++
++	ret = max77705_typec_init(chip);
++	if (ret) {
++		fwnode_handle_put(chip->dp_fwnode);
++		typec_mux_put(chip->mux);
++			fwnode_handle_put(chip->connector);
++		return ret;
++	}
++
++	ret = devm_add_action_or_reset(dev, max77705_usbc_teardown, chip);
++	if (ret)
++		return ret;
++
++	psy_cfg.drv_data = chip;
++	psy_cfg.fwnode = dev_fwnode(dev);
++	chip->psy = devm_power_supply_register(dev, &max77705_psy_desc, &psy_cfg);
++	if (IS_ERR(chip->psy)) {
++		dev_warn(dev, "failed to register power supply: %ld\n", PTR_ERR(chip->psy));
++		chip->psy = NULL;
++	}
++
++	chip->ready = true;
++	ret = max77705_hw_init(chip);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to init\n");
++
++	/* drop stale events, then take the current state */
++	max77705_poll_ints(chip);
++	mutex_lock(&chip->state_lock);
++	max77705_sync(chip);
++	mutex_unlock(&chip->state_lock);
++
++	if (chip->irq > 0) {
++		ret = devm_request_threaded_irq(dev, chip->irq, NULL, max77705_usbc_irq,
++						IRQF_ONESHOT, "max77705-usbc", chip);
++		if (ret) {
++			dev_warn(dev, "failed to request IRQ %d (%d), polling\n", chip->irq, ret);
++			chip->irq = 0;
++		}
++	} else {
++		dev_warn(dev, "no IRQ, polling\n");
++	}
++	queue_delayed_work(chip->wq, &chip->poll_work, msecs_to_jiffies(POLL_MS));
++
++	chip->debugfs = debugfs_create_dir(dev_name(dev), NULL);
++	debugfs_create_file("state", 0444, chip->debugfs, chip, &max77705_regs_fops);
++
++	dev_info(dev, "MAX77705 USB-C: HW rev 0x%02x FW %02x.%02x, irq %d, VBUS by %s%s, prefer_host %d\n",
++		 chip->hw_rev, chip->fw_rev, chip->fw_minor, chip->irq,
++		 chip->fw_vbus ? "firmware" : "charger OTG regulator",
++		 altmode ? ", DP alt mode enabled" : "", prefer_host);
++	return 0;
++}
++
++static void max77705_usbc_shutdown(struct i2c_client *client)
++{
++	struct max77705_usbc *chip = i2c_get_clientdata(client);
++
++	/* don't leave the boost on across reboot; keep D+/D- on the AP */
++	if (chip && chip->vbus_on && chip->vbus)
++		regulator_disable(chip->vbus);
++}
++
++static const struct of_device_id max77705_usbc_of_match[] = {
++	{ .compatible = "maxim,max77705-usbc" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, max77705_usbc_of_match);
++
++static struct i2c_driver max77705_usbc_driver = {
++	.driver = {
++		.name = "max77705-usbc",
++		.of_match_table = max77705_usbc_of_match,
++	},
++	.probe = max77705_usbc_probe,
++	.shutdown = max77705_usbc_shutdown,
++};
++module_i2c_driver(max77705_usbc_driver);
++
++MODULE_DESCRIPTION("Maxim MAX77705 USB Type-C/PD and MUIC driver");
++MODULE_LICENSE("GPL");

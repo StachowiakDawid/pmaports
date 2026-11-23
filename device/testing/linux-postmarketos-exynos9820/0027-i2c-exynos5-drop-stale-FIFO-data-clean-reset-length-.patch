@@ -1,0 +1,174 @@
+From 577322083140271e3d5501e4e48c85843bb00c8e Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] i2c: exynos5: drop stale FIFO data, clean reset,
+ length-scaled timeout
+
+- A read the driver gave up on can still be completed by the
+  controller; its bytes stay in the RX FIFO and every later read
+  returns the data of the read before it. Before every message and
+  after an error, drop what is left in the RX FIFO and reset the
+  controller if the TX FIFO is not empty (rate-limited warning).
+- On an error, mask the controller interrupts and wait for a running
+  IRQ handler before the reset, so that a late handler cannot write
+  into the buffer of a message that has already returned. The timeout
+  warning prints the message and the status registers.
+- resume_noirq does a full software reset, as the vendor driver does.
+- The transfer timeout is the fixed 100 ms plus twice the message's
+  bus time: long writes (firmware blocks of several KiB at 400 kHz)
+  did not fit into 100 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/i2c/busses/i2c-exynos5.c | 102 ++++++++++++++++++++++++++++---
+ 1 file changed, 95 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-exynos5.c b/drivers/i2c/busses/i2c-exynos5.c
+index 9686a7b5cb..1e7dd9112c 100644
+--- a/drivers/i2c/busses/i2c-exynos5.c
++++ b/drivers/i2c/busses/i2c-exynos5.c
+@@ -491,6 +491,46 @@ static void exynos5_i2c_reset(struct exynos5_i2c *i2c)
+ 	exynos5_i2c_init(i2c);
+ }
+ 
++/*
++ * exynos5_i2c_flush: drop data left in the FIFOs
++ *
++ * A message that the driver gave up on (timeout, e.g. the completion IRQ
++ * delayed past EXYNOS5_I2C_TIMEOUT by a stalled CPU) can still be completed
++ * by the controller, leaving its bytes in the RX FIFO. The IRQ handler only
++ * reads as many bytes as the current message wants, so every later read
++ * returns the bytes of the read before it, for good: no error is ever seen
++ * again, so nothing resets the controller.
++ *
++ * Reading RX_DATA pops a byte while the FIFO is enabled. The TX FIFO cannot
++ * be drained by software: a non-empty one gets a software reset.
++ */
++static void exynos5_i2c_flush(struct exynos5_i2c *i2c, const char *when)
++{
++	const u32 empty = HSI2C_RX_FIFO_EMPTY | HSI2C_TX_FIFO_EMPTY;
++	unsigned int n = 0;
++	u32 st, st2;
++
++	st = readl(i2c->regs + HSI2C_FIFO_STATUS);
++	if ((st & empty) == empty)
++		return;
++
++	writel(HSI2C_RXFIFO_EN | HSI2C_TXFIFO_EN, i2c->regs + HSI2C_FIFO_CTL);
++	while (!(readl(i2c->regs + HSI2C_FIFO_STATUS) & HSI2C_RX_FIFO_EMPTY) &&
++	       n < 2 * i2c->variant->fifo_depth) {
++		readl(i2c->regs + HSI2C_RX_DATA);
++		n++;
++	}
++
++	st2 = readl(i2c->regs + HSI2C_FIFO_STATUS);
++	if (!(st2 & HSI2C_TX_FIFO_EMPTY))
++		exynos5_i2c_reset(i2c);
++
++	dev_warn_ratelimited(i2c->dev,
++			     "stale FIFO data %s: FIFO_STATUS %#x, dropped %u RX bytes%s\n",
++			     when, st, n,
++			     (st2 & HSI2C_TX_FIFO_EMPTY) ? "" : ", TX FIFO not empty: reset");
++}
++
+ /*
+  * exynos5_i2c_irq: top level IRQ servicing routine
+  *
+@@ -787,6 +827,23 @@ static bool exynos5_i2c_poll_irqs_timeout(struct exynos5_i2c *i2c,
+ 	return time_before(jiffies, time_left);
+ }
+ 
++/*
++ * EXYNOS5_I2C_TIMEOUT plus twice the time the message needs on the bus
++ * (9 clocks per byte, address byte included; x2 for clock stretching).
++ * A fixed 100 ms is too short for long writes: a 6 KiB CS35L41/CS35L40 DSP
++ * firmware block takes ~140 ms at 400 kHz and failed with -ETIMEDOUT.
++ */
++static unsigned long exynos5_i2c_msg_timeout(struct exynos5_i2c *i2c,
++					     struct i2c_msg *msg)
++{
++	u64 us;
++
++	if (!i2c->op_clock)
++		return EXYNOS5_I2C_TIMEOUT;
++	us = div_u64((u64)(msg->len + 1) * 9 * 2 * USEC_PER_SEC, i2c->op_clock);
++	return EXYNOS5_I2C_TIMEOUT + usecs_to_jiffies(us);
++}
++
+ static int exynos5_i2c_xfer_msg(struct exynos5_i2c *i2c,
+ 			      struct i2c_msg *msgs, int stop)
+ {
+@@ -799,14 +856,17 @@ static int exynos5_i2c_xfer_msg(struct exynos5_i2c *i2c,
+ 
+ 	reinit_completion(&i2c->msg_complete);
+ 
++	exynos5_i2c_flush(i2c, "before a message");
++
+ 	exynos5_i2c_message_start(i2c, stop);
+ 
+-	if (!i2c->atomic)
++	if (!i2c->atomic) {
+ 		time_left = wait_for_completion_timeout(&i2c->msg_complete,
+-							EXYNOS5_I2C_TIMEOUT);
+-	else
++							exynos5_i2c_msg_timeout(i2c, msgs));
++	} else {
+ 		time_left = exynos5_i2c_poll_irqs_timeout(i2c,
+-							  EXYNOS5_I2C_TIMEOUT);
++							  exynos5_i2c_msg_timeout(i2c, msgs));
++	}
+ 
+ 	if (time_left == 0)
+ 		ret = -ETIMEDOUT;
+@@ -821,10 +881,31 @@ static int exynos5_i2c_xfer_msg(struct exynos5_i2c *i2c,
+ 		ret = exynos5_i2c_wait_bus_idle(i2c);
+ 
+ 	if (ret < 0) {
++		u32 int_st = 0, trans_st = 0, fifo_st = 0;
++
++		/* a late IRQ handler must not touch msgs any more */
++		writel(0, i2c->regs + HSI2C_INT_ENABLE);
++		if (!i2c->atomic)
++			synchronize_irq(i2c->irq);
++
++		if (ret == -ETIMEDOUT) {
++			int_st = readl(i2c->regs + HSI2C_INT_STATUS);
++			trans_st = readl(i2c->regs + HSI2C_TRANS_STATUS);
++			fifo_st = readl(i2c->regs + HSI2C_FIFO_STATUS);
++		}
++
+ 		exynos5_i2c_reset(i2c);
++
+ 		if (ret == -ETIMEDOUT)
+-			dev_warn(i2c->dev, "%s timeout\n",
+-				 (msgs->flags & I2C_M_RD) ? "rx" : "tx");
++			dev_warn(i2c->dev,
++				 "%s timeout: addr 0x%02x len %u got %u, INT_STATUS %#x TRANS_STATUS %#x FIFO_STATUS %#x (%#x after reset)\n",
++				 (msgs->flags & I2C_M_RD) ? "rx" : "tx",
++				 msgs->addr, msgs->len, i2c->msg_ptr, int_st,
++				 trans_st, fifo_st,
++				 readl(i2c->regs + HSI2C_FIFO_STATUS));
++
++		exynos5_i2c_flush(i2c, "after an error");
++		exynos5_i2c_clr_pend_irq(i2c);
+ 	}
+ 
+ 	/* Return the state as in interrupt routine */
+@@ -1015,7 +1096,14 @@ static int exynos5_i2c_resume_noirq(struct device *dev)
+ 	if (ret)
+ 		goto err_clk;
+ 
+-	exynos5_i2c_init(i2c);
++	/*
++	 * Start from a clean controller like the downstream driver does: a
++	 * software reset (timings and configuration again), then drop
++	 * anything left in the FIFOs.
++	 */
++	exynos5_i2c_reset(i2c);
++	exynos5_i2c_flush(i2c, "at resume");
++	exynos5_i2c_clr_pend_irq(i2c);
+ 	clk_disable(i2c->clk);
+ 	clk_disable(i2c->pclk);
+ 	i2c_mark_adapter_resumed(&i2c->adap);

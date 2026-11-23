@@ -1,0 +1,221 @@
+From 1eb6f741747d8beb612c98dd374b5e90443a6b68 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] nfc: s3fwrn5: S3NRN82: no firmware update, vdd supply, clock
+ gating, fw_cfg
+
+S3NRN82 NFC controller of the Galaxy S10 family on the s3fwrn5 driver:
+
+ - The firmware update is never run: the update path only knows the
+   S3FWRN5 bootloader and would rewrite the chip's flash. The chip
+   runs on the firmware in its flash.
+ - i2c: optional "vdd" supply, kept on while the driver is bound. The
+   clock input is enabled only while the chip is out of reset and
+   gated when the device is closed.
+ - The proprietary notification 0x3f, sent right after RF_DISCOVER, is
+   logged instead of being reported as unsupported.
+ - fw_cfg= (default: nothing): payload of an NCI_PROP_FW_CFG command
+   (clock configuration) sent at every open, followed by
+   CORE_RESET/INIT, as the vendor HAL does. The S3NRN82 needs 0x12
+   (26 MHz from the AP) or the RF field stays off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/nfc/s3fwrn5/core.c | 45 ++++++++++++++++++++++++++++++++++++++
+ drivers/nfc/s3fwrn5/i2c.c  | 37 ++++++++++++++++++++++++++++---
+ drivers/nfc/s3fwrn5/nci.c  | 18 ++++++++++++++-
+ drivers/nfc/s3fwrn5/nci.h  |  2 +-
+ 4 files changed, 97 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/nfc/s3fwrn5/core.c b/drivers/nfc/s3fwrn5/core.c
+index b46cfdd226..c68bc2bd6a 100644
+--- a/drivers/nfc/s3fwrn5/core.c
++++ b/drivers/nfc/s3fwrn5/core.c
+@@ -13,6 +13,28 @@
+ #include "firmware.h"
+ #include "nci.h"
+ 
++/*
++ * The firmware update path enters the chip's bootloader and can rewrite its
++ * flash. It only knows the S3FWRN5 (hw 05.00.00.xx) bootloader and signs
++ * with SHA-1, so on other parts of the family (e.g. the S3NRN82 of the
++ * Galaxy S10) it must never run. It is compiled out: the chip always runs
++ * on the firmware already in its flash, whatever is in /lib/firmware.
++ */
++static const bool s3fwrn5_fw_update_allowed;
++
++/*
++ * NCI_PROP_FW_CFG (clock configuration) payload to send at every open,
++ * before NCI CORE_RESET/INIT, as the Samsung HAL does for newer chips
++ * (1 byte: clock speed, e.g. 0x12 = 26 MHz from the AP; older chips take
++ * 3 bytes: type, speed, request). Empty (default): nothing is sent.
++ * Load-time only. Whether the chip stores this setting persistently is
++ * not known: only use with explicit approval.
++ */
++static u8 fw_cfg[3];
++static int fw_cfg_len;
++module_param_array(fw_cfg, byte, &fw_cfg_len, 0444);
++MODULE_PARM_DESC(fw_cfg, "NCI_PROP_FW_CFG payload sent at open (1 or 3 bytes; default: not sent)");
++
+ #define S3FWRN5_NFC_PROTOCOLS  (NFC_PROTO_JEWEL_MASK | \
+ 				NFC_PROTO_MIFARE_MASK | \
+ 				NFC_PROTO_FELICA_MASK | \
+@@ -127,6 +149,29 @@ static int s3fwrn5_nci_post_setup(struct nci_dev *ndev)
+ 	struct s3fwrn5_info *info = nci_get_drvdata(ndev);
+ 	int ret;
+ 
++	if (fw_cfg_len > 0) {
++		ret = nci_prop_cmd(ndev, NCI_PROP_FW_CFG, fw_cfg_len, fw_cfg);
++		dev_info(&ndev->nfc_dev->dev, "FW_CFG %*ph: %d\n",
++			 fw_cfg_len, fw_cfg, ret);
++		if (ret < 0)
++			return ret;
++
++		/* Same order as the vendor HAL: FW_CFG, then RESET/INIT */
++		ret = nci_core_reset(ndev);
++		if (ret < 0)
++			return ret;
++		ret = nci_core_init(ndev);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (!s3fwrn5_fw_update_allowed) {
++		/* Run on the firmware already in the chip, no bootloader */
++		dev_info(&ndev->nfc_dev->dev,
++			 "firmware update disabled, using the chip's firmware\n");
++		return 0;
++	}
++
+ 	if (s3fwrn5_firmware_init(info)) {
+ 		//skip bootloader mode
+ 		return 0;
+diff --git a/drivers/nfc/s3fwrn5/i2c.c b/drivers/nfc/s3fwrn5/i2c.c
+index 783c874254..bc997492d8 100644
+--- a/drivers/nfc/s3fwrn5/i2c.c
++++ b/drivers/nfc/s3fwrn5/i2c.c
+@@ -11,6 +11,7 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/delay.h>
+ #include <linux/module.h>
++#include <linux/regulator/consumer.h>
+ 
+ #include <net/nfc/nfc.h>
+ 
+@@ -24,6 +25,7 @@ struct s3fwrn5_i2c_phy {
+ 	struct clk *clk;
+ 
+ 	unsigned int irq_skip:1;
++	unsigned int clk_on:1;
+ };
+ 
+ static void s3fwrn5_i2c_set_mode(void *phy_id, enum s3fwrn5_mode mode)
+@@ -32,11 +34,26 @@ static void s3fwrn5_i2c_set_mode(void *phy_id, enum s3fwrn5_mode mode)
+ 
+ 	mutex_lock(&phy->common.mutex);
+ 
++	/* The clock must run before the chip leaves reset */
++	if (mode != S3FWRN5_MODE_COLD && !phy->clk_on) {
++		if (clk_prepare_enable(phy->clk)) {
++			dev_err(&phy->i2c_dev->dev, "failed to enable clock\n");
++			goto out;
++		}
++		phy->clk_on = true;
++	}
++
+ 	if (s3fwrn5_phy_power_ctrl(&phy->common, mode) == false)
+-		goto out;
++		goto gate;
+ 
+ 	phy->irq_skip = true;
+ 
++gate:
++	/* Chip held in reset: no need for its clock */
++	if (mode == S3FWRN5_MODE_COLD && phy->clk_on) {
++		clk_disable_unprepare(phy->clk);
++		phy->clk_on = false;
++	}
+ out:
+ 	mutex_unlock(&phy->common.mutex);
+ }
+@@ -168,13 +185,27 @@ static int s3fwrn5_i2c_probe(struct i2c_client *client)
+ 	if (IS_ERR(phy->common.gpio_fw_wake))
+ 		return PTR_ERR(phy->common.gpio_fw_wake);
+ 
++	/*
++	 * Optional I/O supply (PVDD). Some boards (Galaxy S10, S3NRN82) feed
++	 * it from a PMIC LDO that is off at boot. It stays on while the
++	 * driver is bound; the chip itself is held in reset by "en" above.
++	 */
++	ret = devm_regulator_get_enable_optional(&client->dev, "vdd");
++	if (ret && ret != -ENODEV)
++		return dev_err_probe(&client->dev, ret,
++				     "failed to enable vdd supply\n");
++	if (!ret)
++		usleep_range(1000, 1100);
++
+ 	/*
+ 	 * S3FWRN5 depends on a clock input ("XI" pin) to function properly.
+ 	 * Depending on the hardware configuration this could be an always-on
+ 	 * oscillator or some external clock that must be explicitly enabled.
+-	 * Make sure the clock is running before starting S3FWRN5.
++	 * Make sure the clock is running before starting S3FWRN5: it is
++	 * enabled whenever the chip is out of reset (see set_mode), and gated
++	 * while the device is closed.
+ 	 */
+-	phy->clk = devm_clk_get_optional_enabled(&client->dev, NULL);
++	phy->clk = devm_clk_get_optional(&client->dev, NULL);
+ 	if (IS_ERR(phy->clk))
+ 		return dev_err_probe(&client->dev, PTR_ERR(phy->clk),
+ 				     "failed to get clock\n");
+diff --git a/drivers/nfc/s3fwrn5/nci.c b/drivers/nfc/s3fwrn5/nci.c
+index 5a9de11bbe..6b22a3adc7 100644
+--- a/drivers/nfc/s3fwrn5/nci.c
++++ b/drivers/nfc/s3fwrn5/nci.c
+@@ -20,7 +20,19 @@ static int s3fwrn5_nci_prop_rsp(struct nci_dev *ndev, struct sk_buff *skb)
+ 	return 0;
+ }
+ 
+-const struct nci_driver_ops s3fwrn5_nci_prop_ops[4] = {
++/*
++ * Proprietary notification 0x3f: seen right after RF_DISCOVER_RSP on the
++ * S3NRN82 (Galaxy S10), meaning unknown. Log its payload instead of the
++ * core's "unsupported ntf opcode".
++ */
++static int s3fwrn5_nci_prop_ntf_3f(struct nci_dev *ndev, struct sk_buff *skb)
++{
++	dev_info_ratelimited(&ndev->nfc_dev->dev, "prop ntf 0x3f: %*ph\n",
++			     min_t(int, skb->len, 32), skb->data);
++	return 0;
++}
++
++const struct nci_driver_ops s3fwrn5_nci_prop_ops[5] = {
+ 	{
+ 		.opcode = nci_opcode_pack(NCI_GID_PROPRIETARY,
+ 				NCI_PROP_SET_RFREG),
+@@ -41,6 +53,10 @@ const struct nci_driver_ops s3fwrn5_nci_prop_ops[4] = {
+ 				NCI_PROP_FW_CFG),
+ 		.rsp = s3fwrn5_nci_prop_rsp,
+ 	},
++	{
++		.opcode = nci_opcode_pack(NCI_GID_PROPRIETARY, 0x3f),
++		.ntf = s3fwrn5_nci_prop_ntf_3f,
++	},
+ };
+ 
+ #define S3FWRN5_RFREG_SECTION_SIZE 252
+diff --git a/drivers/nfc/s3fwrn5/nci.h b/drivers/nfc/s3fwrn5/nci.h
+index bc4bce2bbc..196acf94f1 100644
+--- a/drivers/nfc/s3fwrn5/nci.h
++++ b/drivers/nfc/s3fwrn5/nci.h
+@@ -50,7 +50,7 @@ struct nci_prop_fw_cfg_rsp {
+ 	__u8 status;
+ };
+ 
+-extern const struct nci_driver_ops s3fwrn5_nci_prop_ops[4];
++extern const struct nci_driver_ops s3fwrn5_nci_prop_ops[5];
+ int s3fwrn5_nci_rf_configure(struct s3fwrn5_info *info, const char *fw_name);
+ 
+ #endif /* __LOCAL_S3FWRN5_NCI_H_ */

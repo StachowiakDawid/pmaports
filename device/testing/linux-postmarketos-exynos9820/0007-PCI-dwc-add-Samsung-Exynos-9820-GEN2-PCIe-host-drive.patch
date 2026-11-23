@@ -1,0 +1,1147 @@
+From 5cc3dfce7f0b40cdfc3c982d3c534b2267230693 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] PCI: dwc: add Samsung Exynos 9820 GEN2 PCIe host driver
+
+DesignWare based host driver for the GEN2 PCIe controller of the
+Exynos 9820, which carries the BCM4375 Wi-Fi chip on the Galaxy S10
+family, with its binding.
+
+System sleep (sleep_off): the link is powered off over suspend-to-RAM
+(2, default), always (1) or never (0); with 3 the Wi-Fi chip supply is
+kept on over suspend-to-RAM so that its firmware survives. If the link
+does not come back after a sleep, the chip is power-cycled once
+(resume_repower_ms).
+
+While the link stays up in suspend-to-idle, the chip's wake pins
+(wlan-host-wake-gpios, wake-gpios) are armed as wakeup interrupts: the
+chip sits in D3 and raises them when it needs the host.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ .../bindings/pci/samsung,exynos9820-pcie.yaml | 121 +++
+ drivers/pci/controller/dwc/Kconfig            |  14 +
+ drivers/pci/controller/dwc/Makefile           |   1 +
+ drivers/pci/controller/dwc/pcie-exynos9820.c  | 947 ++++++++++++++++++
+ 4 files changed, 1083 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/pci/samsung,exynos9820-pcie.yaml
+ create mode 100644 drivers/pci/controller/dwc/pcie-exynos9820.c
+
+diff --git a/Documentation/devicetree/bindings/pci/samsung,exynos9820-pcie.yaml b/Documentation/devicetree/bindings/pci/samsung,exynos9820-pcie.yaml
+new file mode 100644
+index 0000000000..8ff679609a
+--- /dev/null
++++ b/Documentation/devicetree/bindings/pci/samsung,exynos9820-pcie.yaml
+@@ -0,0 +1,121 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/pci/samsung,exynos9820-pcie.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Samsung Exynos 9820 GEN2 PCIe Host Controller
++
++maintainers:
++  - StachowiakDawid <dawidos234@gmail.com>
++
++description:
++  The Exynos 9820 GEN2 (Wi-Fi) PCIe root complex is based on the Synopsys
++  DesignWare PCIe IP with Samsung glue logic (ELBI), a Samsung PHY (PMA and
++  PCS blocks) and an I/A sequencer. It inherits the common properties
++  defined in snps,dw-pcie.yaml.
++
++allOf:
++  - $ref: /schemas/pci/snps,dw-pcie.yaml#
++
++properties:
++  compatible:
++    const: samsung,exynos9820-pcie
++
++  reg:
++    minItems: 5
++    items:
++      - description: External Local Bus interface (ELBI) registers.
++      - description: Data Bus Interface (DBI) registers.
++      - description: PHY PMA registers.
++      - description: PHY PCS registers.
++      - description: PCIe configuration space region.
++      - description: I/A sequencer registers.
++
++  reg-names:
++    minItems: 5
++    items:
++      - const: elbi
++      - const: dbi
++      - const: phy
++      - const: pcs
++      - const: config
++      - const: ia
++
++  interrupts:
++    maxItems: 1
++
++  clocks:
++    minItems: 1
++    maxItems: 8
++
++  reset-gpios:
++    maxItems: 1
++    description: PERST# line.
++
++  vpcie3v3-supply:
++    description: Endpoint power (e.g. a fixed regulator on WLAN_REG_ON).
++
++  samsung,sysreg:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: Phandle to the SYSREG_FSYS1 syscon.
++
++  samsung,pmu-syscon:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: Phandle to the PMU syscon (PHY isolation control).
++
++  dma-coherent: true
++
++  num-lanes:
++    const: 1
++
++required:
++  - reg
++  - reg-names
++  - interrupts
++  - "#address-cells"
++  - "#size-cells"
++  - "#interrupt-cells"
++  - interrupt-map
++  - interrupt-map-mask
++  - ranges
++  - device_type
++  - clocks
++  - reset-gpios
++  - samsung,sysreg
++  - samsung,pmu-syscon
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/exynos9820.h>
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++
++    pcie@13ed0000 {
++        compatible = "samsung,exynos9820-pcie";
++        reg = <0x13ed0000 0x1000>, <0x13f00000 0x1000>,
++              <0x13ef0000 0x1000>, <0x13ee0000 0x1fc>,
++              <0x14ffe000 0x2000>, <0x13ec0000 0x1000>;
++        reg-names = "elbi", "dbi", "phy", "pcs", "config", "ia";
++        #address-cells = <3>;
++        #size-cells = <2>;
++        #interrupt-cells = <1>;
++        device_type = "pci";
++        interrupts = <GIC_SPI 253 IRQ_TYPE_LEVEL_HIGH>;
++        interrupt-map-mask = <0 0 0 0>;
++        interrupt-map = <0 0 0 0 &gic GIC_SPI 253 IRQ_TYPE_LEVEL_HIGH>;
++        clocks = <&cmu_fsys1 CLK_GOUT_FSYS1_PCIE_GEN2_DBI_ACLK>,
++                 <&cmu_fsys1 CLK_GOUT_FSYS1_PCIE_GEN2_MSTR_ACLK>,
++                 <&cmu_fsys1 CLK_GOUT_FSYS1_PCIE_GEN2_SLV_ACLK>;
++        ranges = <0x82000000 0 0x14000000 0x14000000 0 0xff0000>;
++        bus-range = <0x00 0xff>;
++        num-lanes = <1>;
++        max-link-speed = <1>;
++        reset-gpios = <&gpf2 2 GPIO_ACTIVE_LOW>;
++        samsung,sysreg = <&sysreg_fsys1>;
++        samsung,pmu-syscon = <&pmu_system_controller>;
++        dma-coherent;
++    };
++...
+diff --git a/drivers/pci/controller/dwc/Kconfig b/drivers/pci/controller/dwc/Kconfig
+index 0a0d56fcf0..a1b09d90e8 100644
+--- a/drivers/pci/controller/dwc/Kconfig
++++ b/drivers/pci/controller/dwc/Kconfig
+@@ -403,6 +403,20 @@ config PCI_EXYNOS
+ 	  hardware and therefore the driver re-uses the DesignWare core
+ 	  functions to implement the driver.
+ 
++config PCIE_EXYNOS9820
++	tristate "Samsung Exynos 9820 PCIe controller"
++	depends on ARCH_EXYNOS || COMPILE_TEST
++	depends on PCI_MSI
++	depends on OF
++	select MFD_SYSCON
++	select PCIE_DW_HOST
++	help
++	  Enables support for the GEN2 PCIe root complex of the Samsung
++	  Exynos 9820 SoC, which connects the on-board Broadcom Wi-Fi chip
++	  on the Galaxy S10 series. The PHY setup is done by this driver.
++	  Say Y or M here if you want Wi-Fi on these phones; the module will
++	  be called pcie-exynos9820.
++
+ config PCIE_FU740
+ 	bool "SiFive FU740 PCIe controller"
+ 	depends on PCI_MSI
+diff --git a/drivers/pci/controller/dwc/Makefile b/drivers/pci/controller/dwc/Makefile
+index d4f88cfc62..4663d4de56 100644
+--- a/drivers/pci/controller/dwc/Makefile
++++ b/drivers/pci/controller/dwc/Makefile
+@@ -9,6 +9,7 @@ obj-$(CONFIG_PCIE_ANDES_QILAI) += pcie-andes-qilai.o
+ obj-$(CONFIG_PCIE_ESWIN) += pcie-eswin.o
+ obj-$(CONFIG_PCI_DRA7XX) += pci-dra7xx.o
+ obj-$(CONFIG_PCI_EXYNOS) += pci-exynos.o
++obj-$(CONFIG_PCIE_EXYNOS9820) += pcie-exynos9820.o
+ obj-$(CONFIG_PCIE_FU740) += pcie-fu740.o
+ obj-$(CONFIG_PCI_IMX6) += pci-imx6.o
+ obj-$(CONFIG_PCIE_NXP_S32G) += pcie-nxp-s32g.o
+diff --git a/drivers/pci/controller/dwc/pcie-exynos9820.c b/drivers/pci/controller/dwc/pcie-exynos9820.c
+new file mode 100644
+index 0000000000..5b5cc71092
+--- /dev/null
++++ b/drivers/pci/controller/dwc/pcie-exynos9820.c
+@@ -0,0 +1,947 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * PCIe host controller driver for the Samsung Exynos 9820 GEN2 ("WIFI")
++ * root complex, which hosts the on-board Broadcom BCM4375 Wi-Fi chip on
++ * the Galaxy S10 series.
++ *
++ * The controller is a Synopsys DesignWare core wrapped by Samsung glue
++ * (ELBI), with a Samsung PHY (PMA + PCS) and an "I/A" micro-sequencer.
++ * The init sequence and PHY tuning tables are taken from Samsung's
++ * downstream pcie-exynos-host-v0.c and pci-exynos9820_cal.c
++ * (SM-G975F kernel, ip-ver 0x982000, channel 0).
++ *
++ * The PHY setup is interleaved with ELBI resets, so it is kept in this
++ * driver rather than in a separate generic PHY driver for now.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/kernel.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include <linux/suspend.h>
++
++#include "pcie-designware.h"
++
++/* ELBI (Samsung glue) registers */
++#define PCIE_IRQ_PULSE			0x000
++#define IRQ_INTA_ASSERT			BIT(0)
++#define IRQ_INTB_ASSERT			BIT(2)
++#define IRQ_INTC_ASSERT			BIT(4)
++#define IRQ_INTD_ASSERT			BIT(6)
++#define IRQ_RADM_PM_TO_ACK		BIT(18)
++#define IRQ_LINK_DOWN			BIT(30)
++#define PCIE_IRQ_LEVEL			0x004
++#define PCIE_IRQ_SPECIAL		0x008
++#define PCIE_IRQ_EN_PULSE		0x00c
++#define PCIE_IRQ_EN_LEVEL		0x010
++#define PCIE_IRQ_EN_SPECIAL		0x014
++#define PCIE_SW_WAKE			0x018
++#define PCIE_BUS_EN			BIT(1)
++#define PCIE_APP_LTSSM_ENABLE		0x02c
++#define PCIE_APP_REQ_EXIT_L1		0x040
++#define XMIT_PME_TURNOFF		0x04c
++#define PCIE_ELBI_LTSSM_ENABLE		0x1
++#define PCIE_IRQ_TOE_EN_PULSE2		0x034
++#define PCIE_IRQ_TOE_EN_LEVEL		0x038
++#define PCIE_ELBI_RDLH_LINKUP		0x074
++#define PCIE_LTSSM_STATE		GENMASK(4, 0)
++#define PCIE_LTSSM_L0			0x11
++#define PCIE_LTSSM_L2_IDLE		0x15
++#define PCIE_PM_DSTATE			0x088
++#define PCIE_APP_REQ_EXIT_L1_MODE	0x0f4
++#define APP_REQ_EXIT_L1_MODE		BIT(0)
++#define L1_REQ_NAK_CONTROL_MASTER	BIT(4)
++#define PCIE_LINKDOWN_RST_CTRL_SEL	0x1b8
++#define PCIE_LINKDOWN_RST_MANUAL	BIT(1)
++#define PCIE_SOFT_CORE_RESET		0x1d0
++#define PCIE_PHY_GLOBAL_RESET		0x288	/* pcs_g_rst */
++#define PCIE_PHY_COMMON_RESET		0x28c	/* PCS & PMA(CMN) reset */
++#define PCIE_PHY_MAC_RESET		0x290
++#define PCIE_QCH_SEL			0x2c8
++#define CLOCK_GATING_ALL_MASK		GENMASK(11, 0)
++
++/* PHY PCS registers */
++#define PCS_L1SS_TIMEOUT		0x00c
++#define PCS_CDR_CTRL			0x0d0
++#define PCS_CDR_EN			GENMASK(7, 6)
++#define PCS_RX_ELECIDLE_CTRL		0x0ec
++#define PCS_IGNORE_ELECIDLE		BIT(3)
++#define PCS_TX_LATENCY			0x0f8
++#define PCS_REFCLK_OUT_CTRL0		0x100
++#define PCS_PWRDN_CTRL0			BIT(6)
++#define PCS_REFCLK_OUT_CTRL1		0x104
++#define PCS_PWRDN_CTRL1			BIT(7)
++
++/* PHY PMA registers (byte-wide registers on a 32-bit stride) */
++#define PMA_REG(n)			((n) * 4)
++#define PMA_CMN_PWR			PMA_REG(0x20)
++#define PMA_TRSV_PWR			PMA_REG(0x57)
++#define PMA_TRSV_BASE			0x30
++
++/* SYSREG_FSYS1 registers */
++#define SYSREG_PCIE_SHARABILITY		0x0700
++#define SYSREG_PCIE_SHARABLE_SHIFT	8
++#define SYSREG_PCIE_SHARABLE_MASK	GENMASK(9, 8)
++#define SYSREG_PCIE_PHY_CON0		0x1044
++#define PCS_HIGH_SPEED			BIT(1)
++#define SYSREG_PCIE_PHY_CON3		0x1050
++#define PHY_CON3_MODE_MASK		GENMASK(7, 1)
++#define PHY_CON3_MODE_CH0		(0x3 << 2)
++#define PHY_CON3_LANE0_EN		BIT(12)
++
++/* PMU */
++#define PMU_PCIE_PHY_CONTROL		0x071c
++#define PMU_PCIE_PHY_ISO_RELEASE	BIT(0)
++
++/* DBI (DesignWare port logic, Samsung specific defaults) */
++#define PCIE_AUX_CLK_FREQ_OFF		0xb40
++#define PCIE_AUX_CLK_FREQ_26MHZ		0x1a
++#define PCIE_L1_SUBSTATES_OFF		0xb44
++#define PCIE_L1_SUB_VAL			0xea
++
++#define LINK_POLL_TIMEOUT_US		20000
++#define LINK_RETRIES			3
++#define PME_TO_TIMEOUT_US		20000
++#define PME_TO_RETRIES			3
++
++/*
++ * What to do with the link and the Wi-Fi chip over system sleep:
++ *  0 = nothing (the link stays up; only works when the SoC keeps power, i.e. s2idle)
++ *  1 = always power the link and the endpoint off (PME_Turn_Off, PERST#, PHY down, WLAN_REG_ON off)
++ *  2 = auto: power off only for suspend-to-RAM ("deep"), where the SoC loses the controller state
++ *  3 = like 2, but keep WLAN_REG_ON (the endpoint's power) on: the link goes to L2/L3 Ready,
++ *      PERST# is asserted and the PHY goes down, the Wi-Fi chip keeps its firmware running
++ *      in D3 (what Samsung's exynos_pcie_host_v1_poweroff() + bcmdhd do in every suspend).
++ *      brcmfmac then needs pcie_warm_resume=1 to pick the firmware up again instead of
++ *      re-probing.  Only useful if the WLAN_REG_ON pad keeps its level in SLEEP
++ *      (samsung,pin-con-pdn = <EXYNOS_PIN_PDN_PREV> on gpg0-5, like Samsung's DT).
++ */
++static int sleep_off = 2;
++module_param(sleep_off, int, 0644);
++MODULE_PARM_DESC(sleep_off, "power the link off over system sleep: 0 never, 1 always, 2 deep only (default), 3 deep only, Wi-Fi chip kept powered");
++
++/*
++ * If the link does not come back after a sleep, cut WLAN_REG_ON for this long and try once
++ * more from a cold chip (0 = no power cycle, old behaviour).
++ */
++static unsigned int resume_repower_ms = 100;
++module_param(resume_repower_ms, uint, 0644);
++MODULE_PARM_DESC(resume_repower_ms, "on a failed link after sleep: power-cycle the Wi-Fi chip (off time in ms, 0 = never, default 100)");
++
++/* 26 MHz reference, Gen2 x1, channel 0 (Samsung CAL "Ch0 HS1 Gen2") */
++static const u8 exynos9820_pma_cmn[48] = {
++	0x01, 0xe1, 0x05, 0x00, 0x88, 0x88, 0x88, 0x0c,
++	0x61, 0x45, 0x65, 0x24, 0x33, 0x18, 0xe3, 0xfc,
++	0xd8, 0x05, 0xe6, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0x60, 0x11, 0x00, 0xa0, 0x05, 0x04, 0x18, 0x88,
++	0xc0, 0xff, 0x9b, 0x52, 0x22, 0x30, 0x4f, 0xdc,
++	0x40, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x80,
++};
++
++static const u8 exynos9820_pma_trsv[80] = {
++	0x31, 0x40, 0x37, 0x99, 0x85, 0x00, 0xc0, 0xff,
++	0xff, 0x3f, 0x8c, 0xc8, 0x02, 0x01, 0x88, 0x80,
++	0x06, 0x90, 0x6c, 0x66, 0x09, 0x61, 0x42, 0x44,
++	0xc6, 0x50, 0x0a, 0x33, 0x58, 0xe7, 0x20, 0x22,
++	0x80, 0x38, 0x05, 0x85, 0x00, 0x00, 0x00, 0x7e,
++	0x00, 0x00, 0x55, 0x15, 0xac, 0xaa, 0x3e, 0x00,
++	0x00, 0x00, 0x20, 0x3f, 0x00, 0x03, 0x01, 0x00,
++	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
++	0x05, 0x85, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++struct exynos9820_pcie {
++	struct dw_pcie		pci;
++	void __iomem		*pma_base;
++	void __iomem		*pcs_base;
++	void __iomem		*ia_base;
++	phys_addr_t		elbi_phys, pma_phys, pcs_phys, ia_phys;
++	struct regmap		*sysreg;
++	struct regmap		*pmu;
++	struct clk_bulk_data	*clks;
++	int			num_clks;
++	struct gpio_desc	*perst;
++	struct regulator	*vpcie;
++	bool			link_ok;
++	bool			slept_off;
++	bool			kept_power;	/* slept with WLAN_REG_ON on (sleep_off=3) */
++	/* s2idle wake pins of the endpoint (WLAN_HOST_WAKE, PCIe WAKE#), optional */
++	struct exynos9820_pcie_wake {
++		const char	*name;
++		int		irq;
++		atomic_t	count;
++	} wake[2];
++	bool			wake_armed;
++};
++
++#define to_exynos9820_pcie(x)	dev_get_drvdata((x)->dev)
++
++static void elbi_writel(struct exynos9820_pcie *ep, u32 val, u32 reg)
++{
++	writel(val, ep->pci.elbi_base + reg);
++}
++
++static u32 elbi_readl(struct exynos9820_pcie *ep, u32 reg)
++{
++	return readl(ep->pci.elbi_base + reg);
++}
++
++static void elbi_pulse(struct exynos9820_pcie *ep, u32 reg, unsigned int us)
++{
++	elbi_writel(ep, 1, reg);
++	udelay(10);
++	elbi_writel(ep, 0, reg);
++	udelay(10);
++	elbi_writel(ep, 1, reg);
++	udelay(us);
++}
++
++static void pcs_update(struct exynos9820_pcie *ep, u32 reg, u32 clr, u32 set)
++{
++	u32 val = readl(ep->pcs_base + reg);
++
++	writel((val & ~clr) | set, ep->pcs_base + reg);
++}
++
++/*
++ * The DBI is not reachable while the PHY reports electrical idle on the
++ * RX lane (i.e. before the link is up); Samsung's driver masks that check
++ * around every DBI access done while the link is down.
++ */
++static void exynos9820_pcie_ignore_elecidle(struct exynos9820_pcie *ep,
++					    bool ignore)
++{
++	pcs_update(ep, PCS_RX_ELECIDLE_CTRL, PCS_IGNORE_ELECIDLE,
++		   ignore ? PCS_IGNORE_ELECIDLE : 0);
++}
++
++static u32 exynos9820_pcie_read_dbi(struct dw_pcie *pci, void __iomem *base,
++				    u32 reg, size_t size)
++{
++	struct exynos9820_pcie *ep = to_exynos9820_pcie(pci);
++	u32 val;
++
++	if (!ep->link_ok)
++		exynos9820_pcie_ignore_elecidle(ep, true);
++	dw_pcie_read(base + reg, size, &val);
++	if (!ep->link_ok)
++		exynos9820_pcie_ignore_elecidle(ep, false);
++
++	return val;
++}
++
++static void exynos9820_pcie_write_dbi(struct dw_pcie *pci, void __iomem *base,
++				      u32 reg, size_t size, u32 val)
++{
++	struct exynos9820_pcie *ep = to_exynos9820_pcie(pci);
++
++	if (!ep->link_ok)
++		exynos9820_pcie_ignore_elecidle(ep, true);
++	dw_pcie_write(base + reg, size, val);
++	if (!ep->link_ok)
++		exynos9820_pcie_ignore_elecidle(ep, false);
++}
++
++static void exynos9820_pcie_phy_pwrdn_clear(struct exynos9820_pcie *ep)
++{
++	pcs_update(ep, PCS_REFCLK_OUT_CTRL0, PCS_PWRDN_CTRL0, 0);
++	pcs_update(ep, PCS_REFCLK_OUT_CTRL1, PCS_PWRDN_CTRL1, 0);
++	writel(0xc0, ep->pma_base + PMA_CMN_PWR);
++	writel(0x7e, ep->pma_base + PMA_TRSV_PWR);
++}
++
++static void exynos9820_pcie_phy_pwrdn(struct exynos9820_pcie *ep)
++{
++	writel(0xfe, ep->pma_base + PMA_TRSV_PWR);
++	writel(0xc1, ep->pma_base + PMA_CMN_PWR);
++	pcs_update(ep, PCS_REFCLK_OUT_CTRL0, 0, PCS_PWRDN_CTRL0);
++	pcs_update(ep, PCS_REFCLK_OUT_CTRL1, 0, PCS_PWRDN_CTRL1);
++}
++
++static void exynos9820_pcie_phy_config(struct exynos9820_pcie *ep)
++{
++	int i;
++
++	/* PCS high speed mode, channel 0 PHY mode, lane 0 enable */
++	regmap_set_bits(ep->sysreg, SYSREG_PCIE_PHY_CON0, PCS_HIGH_SPEED);
++	regmap_update_bits(ep->sysreg, SYSREG_PCIE_PHY_CON3,
++			   PHY_CON3_MODE_MASK, PHY_CON3_MODE_CH0);
++	regmap_set_bits(ep->sysreg, SYSREG_PCIE_PHY_CON3, PHY_CON3_LANE0_EN);
++
++	elbi_pulse(ep, PCIE_PHY_GLOBAL_RESET, 10);
++
++	for (i = 0; i < ARRAY_SIZE(exynos9820_pma_cmn); i++)
++		writel(exynos9820_pma_cmn[i], ep->pma_base + PMA_REG(i));
++	for (i = 0; i < ARRAY_SIZE(exynos9820_pma_trsv); i++)
++		writel(exynos9820_pma_trsv[i],
++		       ep->pma_base + PMA_REG(PMA_TRSV_BASE + i));
++
++	/* TX latency, refclk out control, L1SS timeout */
++	writel(0x70, ep->pcs_base + PCS_TX_LATENCY);
++	writel(0x87, ep->pcs_base + PCS_REFCLK_OUT_CTRL0);
++	writel(0x50, ep->pcs_base + PCS_REFCLK_OUT_CTRL1);
++	pcs_update(ep, PCS_L1SS_TIMEOUT, BIT(1), BIT(4));
++
++	elbi_pulse(ep, PCIE_PHY_MAC_RESET, 10);
++	elbi_pulse(ep, PCIE_PHY_COMMON_RESET, 100);
++
++	/* CDR reset */
++	pcs_update(ep, PCS_CDR_CTRL, 0, PCS_CDR_EN);
++	udelay(20);
++	pcs_update(ep, PCS_CDR_CTRL, PCS_CDR_EN, FIELD_PREP(PCS_CDR_EN, 2));
++	pcs_update(ep, PCS_CDR_CTRL, PCS_CDR_EN, 0);
++}
++
++static void ia_writel(struct exynos9820_pcie *ep, u32 val, u32 reg)
++{
++	writel(val, ep->ia_base + reg);
++}
++
++/*
++ * Program the I/A sequencer that resets the CDR when the PHY reports
++ * AFC_DONE after an L1.2 exit. Only needed once L1 substates are used,
++ * but Samsung always programs it.
++ */
++static void exynos9820_pcie_ia_config(struct exynos9820_pcie *ep)
++{
++	if (!ep->ia_base)
++		return;
++
++	elbi_writel(ep, 0x10, PCIE_IRQ_TOE_EN_PULSE2);
++
++	ia_writel(ep, ep->elbi_phys, 0x30);
++	ia_writel(ep, ep->pma_phys, 0x34);
++	ia_writel(ep, ep->pcs_phys, 0x38);
++	ia_writel(ep, ep->ia_phys, 0x3c);
++
++	ia_writel(ep, 0xb, 0x10);
++	ia_writel(ep, 0x2ffff, 0x40);
++
++	ia_writel(ep, 0x50000004, 0x100);
++	ia_writel(ep, 0xffff, 0x104);
++	ia_writel(ep, 0x20930014, 0x108);
++	ia_writel(ep, 0xa, 0x10c);
++	ia_writel(ep, 0x40030044, 0x110);
++	ia_writel(ep, 0x1, 0x114);
++	ia_writel(ep, 0x50000004, 0x118);
++	ia_writel(ep, 0x20, 0x11c);
++	ia_writel(ep, 0x209101ec, 0x120);
++	ia_writel(ep, 0x20, 0x124);
++	ia_writel(ep, 0x400200d0, 0x128);
++	ia_writel(ep, 0xc0, 0x12c);
++	ia_writel(ep, 0x400200d0, 0x130);
++	ia_writel(ep, 0x80, 0x134);
++	ia_writel(ep, 0x400200d0, 0x138);
++	ia_writel(ep, 0x0, 0x13c);
++	ia_writel(ep, 0x100101ec, 0x140);
++	ia_writel(ep, 0x20, 0x144);
++	ia_writel(ep, 0x70000004, 0x148);
++	ia_writel(ep, 0x10, 0x14c);
++	ia_writel(ep, 0x40030010, 0x150);
++	ia_writel(ep, 0x1000b, 0x154);
++	ia_writel(ep, 0x80000000, 0x158);
++	ia_writel(ep, 0x0, 0x15c);
++
++	ia_writel(ep, 0x1, 0x0);
++}
++
++static void exynos9820_pcie_enable_irqs(struct exynos9820_pcie *ep)
++{
++	elbi_writel(ep, IRQ_INTA_ASSERT | IRQ_INTB_ASSERT |
++			IRQ_INTC_ASSERT | IRQ_INTD_ASSERT, PCIE_IRQ_EN_PULSE);
++	elbi_writel(ep, 0, PCIE_IRQ_TOE_EN_PULSE2);
++	elbi_writel(ep, 0, PCIE_IRQ_TOE_EN_LEVEL);
++	elbi_writel(ep, 0, PCIE_IRQ_EN_LEVEL);
++	elbi_writel(ep, 0, PCIE_IRQ_EN_SPECIAL);
++}
++
++static irqreturn_t exynos9820_pcie_irq_handler(int irq, void *arg)
++{
++	struct exynos9820_pcie *ep = arg;
++	u32 val;
++
++	val = elbi_readl(ep, PCIE_IRQ_PULSE);
++	elbi_writel(ep, val, PCIE_IRQ_PULSE);
++	if (val & IRQ_LINK_DOWN)
++		dev_warn_ratelimited(ep->pci.dev, "link down (ltssm 0x%lx)\n",
++				     FIELD_GET(PCIE_LTSSM_STATE,
++					       elbi_readl(ep, PCIE_ELBI_RDLH_LINKUP)));
++
++	val = elbi_readl(ep, PCIE_IRQ_LEVEL);
++	elbi_writel(ep, val, PCIE_IRQ_LEVEL);
++	val = elbi_readl(ep, PCIE_IRQ_SPECIAL);
++	elbi_writel(ep, val, PCIE_IRQ_SPECIAL);
++
++	return IRQ_HANDLED;
++}
++
++/* Everything from "PHY power-down clear" up to (not including) LTSSM enable */
++static void exynos9820_pcie_hw_init(struct exynos9820_pcie *ep)
++{
++	u32 val;
++
++	ep->link_ok = false;
++
++	regmap_set_bits(ep->pmu, PMU_PCIE_PHY_CONTROL,
++			PMU_PCIE_PHY_ISO_RELEASE);
++	exynos9820_pcie_phy_pwrdn_clear(ep);
++	exynos9820_pcie_enable_irqs(ep);
++
++	exynos9820_pcie_ignore_elecidle(ep, true);
++
++	elbi_writel(ep, 0, PCIE_SOFT_CORE_RESET);
++	udelay(20);
++	elbi_writel(ep, 1, PCIE_SOFT_CORE_RESET);
++
++	/* Release PERST# */
++	gpiod_set_value_cansleep(ep->perst, 0);
++	usleep_range(18000, 20000);
++
++	val = elbi_readl(ep, PCIE_APP_REQ_EXIT_L1_MODE);
++	val |= APP_REQ_EXIT_L1_MODE | L1_REQ_NAK_CONTROL_MASTER;
++	elbi_writel(ep, val, PCIE_APP_REQ_EXIT_L1_MODE);
++	elbi_writel(ep, PCIE_LINKDOWN_RST_MANUAL, PCIE_LINKDOWN_RST_CTRL_SEL);
++
++	/* Q-channel: no automatic clock gating of AXI/APB/PMU clocks */
++	val = elbi_readl(ep, PCIE_QCH_SEL);
++	val &= ~CLOCK_GATING_ALL_MASK;
++	elbi_writel(ep, val, PCIE_QCH_SEL);
++
++	exynos9820_pcie_phy_config(ep);
++	exynos9820_pcie_ia_config(ep);
++
++	/* Bus number enable */
++	val = elbi_readl(ep, PCIE_SW_WAKE);
++	val &= ~PCIE_BUS_EN;
++	elbi_writel(ep, val, PCIE_SW_WAKE);
++
++	exynos9820_pcie_ignore_elecidle(ep, false);
++}
++
++static void exynos9820_pcie_setup_rc_extra(struct exynos9820_pcie *ep)
++{
++	struct dw_pcie *pci = &ep->pci;
++	u8 cap = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++	u32 val;
++
++	dw_pcie_dbi_ro_wr_en(pci);
++
++	/*
++	 * L1 exit latency 64us (Samsung default). Samsung only ever enables L1
++	 * (+ L1 substates) on this link, never L0s, so don't advertise L0s:
++	 * the PCI core enables all advertised ASPM states on DT platforms.
++	 */
++	val = dw_pcie_readl_dbi(pci, cap + PCI_EXP_LNKCAP);
++	val &= ~(PCI_EXP_LNKCAP_L1EL | PCI_EXP_LNKCAP_ASPM_L0S);
++	val |= FIELD_PREP(PCI_EXP_LNKCAP_L1EL, 7);
++	dw_pcie_writel_dbi(pci, cap + PCI_EXP_LNKCAP, val);
++
++	dw_pcie_writel_dbi(pci, PCIE_AUX_CLK_FREQ_OFF, PCIE_AUX_CLK_FREQ_26MHZ);
++	dw_pcie_writel_dbi(pci, PCIE_L1_SUBSTATES_OFF, PCIE_L1_SUB_VAL);
++
++	dw_pcie_dbi_ro_wr_dis(pci);
++}
++
++static bool exynos9820_pcie_ltssm_l0(struct exynos9820_pcie *ep)
++{
++	u32 state = FIELD_GET(PCIE_LTSSM_STATE,
++			      elbi_readl(ep, PCIE_ELBI_RDLH_LINKUP));
++
++	/* L0 .. L2 idle, as accepted by Samsung's driver */
++	return state >= 0x0d && state <= 0x15;
++}
++
++static bool exynos9820_pcie_link_up(struct dw_pcie *pci)
++{
++	struct exynos9820_pcie *ep = to_exynos9820_pcie(pci);
++
++	if (!ep->link_ok)
++		return false;
++
++	return exynos9820_pcie_ltssm_l0(ep);
++}
++
++static int exynos9820_pcie_start_link(struct dw_pcie *pci)
++{
++	struct exynos9820_pcie *ep = to_exynos9820_pcie(pci);
++	struct device *dev = pci->dev;
++	int try, ret;
++	bool up;
++
++	for (try = 0; try < LINK_RETRIES; try++) {
++		if (try) {
++			dev_info(dev, "link training failed (ltssm 0x%lx), retrying\n",
++				 FIELD_GET(PCIE_LTSSM_STATE,
++					   elbi_readl(ep, PCIE_ELBI_RDLH_LINKUP)));
++			elbi_writel(ep, 0, PCIE_APP_LTSSM_ENABLE);
++			gpiod_set_value_cansleep(ep->perst, 1);
++			usleep_range(1000, 2000);
++			exynos9820_pcie_hw_init(ep);
++			ret = dw_pcie_setup_rc(&pci->pp);
++			if (ret)
++				return ret;
++		}
++
++		exynos9820_pcie_setup_rc_extra(ep);
++
++		dev_dbg(dev, "D state %x, linkup reg %x\n",
++			elbi_readl(ep, PCIE_PM_DSTATE) & 0x7,
++			elbi_readl(ep, PCIE_ELBI_RDLH_LINKUP));
++
++		elbi_writel(ep, PCIE_ELBI_LTSSM_ENABLE, PCIE_APP_LTSSM_ENABLE);
++
++		ret = read_poll_timeout_atomic(exynos9820_pcie_ltssm_l0, up, up,
++					       10, LINK_POLL_TIMEOUT_US, false,
++					       ep);
++		if (!ret) {
++			ep->link_ok = true;
++			/* Clear stale pulse IRQs and enable link-down IRQ */
++			elbi_writel(ep, elbi_readl(ep, PCIE_IRQ_PULSE),
++				    PCIE_IRQ_PULSE);
++			elbi_writel(ep, elbi_readl(ep, PCIE_IRQ_EN_PULSE) |
++				    IRQ_LINK_DOWN, PCIE_IRQ_EN_PULSE);
++			return 0;
++		}
++	}
++
++	dev_err(dev, "link did not come up\n");
++	return 0;	/* let dw_pcie_wait_for_link() report the timeout */
++}
++
++static void exynos9820_pcie_stop_link(struct dw_pcie *pci)
++{
++	struct exynos9820_pcie *ep = to_exynos9820_pcie(pci);
++
++	elbi_writel(ep, 0, PCIE_APP_LTSSM_ENABLE);
++	ep->link_ok = false;
++}
++
++static int exynos9820_pcie_host_init(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct exynos9820_pcie *ep = to_exynos9820_pcie(pci);
++
++	if (of_dma_is_coherent(pci->dev->of_node))
++		regmap_update_bits(ep->sysreg, SYSREG_PCIE_SHARABILITY,
++				   SYSREG_PCIE_SHARABLE_MASK,
++				   3 << SYSREG_PCIE_SHARABLE_SHIFT);
++
++	exynos9820_pcie_hw_init(ep);
++
++	return 0;
++}
++
++static void exynos9820_pcie_host_deinit(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct exynos9820_pcie *ep = to_exynos9820_pcie(pci);
++
++	gpiod_set_value_cansleep(ep->perst, 1);
++	ep->link_ok = false;
++	exynos9820_pcie_phy_pwrdn(ep);
++	regmap_clear_bits(ep->pmu, PMU_PCIE_PHY_CONTROL,
++			  PMU_PCIE_PHY_ISO_RELEASE);
++}
++
++/* MSI is not wired up (Samsung uses legacy INTx for the Wi-Fi chip) */
++static int exynos9820_pcie_msi_init(struct dw_pcie_rp *pp)
++{
++	return 0;
++}
++
++static const struct dw_pcie_host_ops exynos9820_pcie_host_ops = {
++	.init		= exynos9820_pcie_host_init,
++	.deinit		= exynos9820_pcie_host_deinit,
++	.msi_init	= exynos9820_pcie_msi_init,
++};
++
++static const struct dw_pcie_ops exynos9820_dw_pcie_ops = {
++	.read_dbi	= exynos9820_pcie_read_dbi,
++	.write_dbi	= exynos9820_pcie_write_dbi,
++	.link_up	= exynos9820_pcie_link_up,
++	.start_link	= exynos9820_pcie_start_link,
++	.stop_link	= exynos9820_pcie_stop_link,
++};
++
++/*
++ * Samsung's sequence (pcie-exynos-host-v0.c exynos_pcie_send_pme_turn_off()):
++ * leave L1, broadcast PME_Turn_Off from the ELBI, wait for PME_TO_Ack and
++ * for the LTSSM to reach L2 idle (Enter_L23_Ready received).
++ */
++static int exynos9820_pcie_pme_turn_off(struct exynos9820_pcie *ep)
++{
++	struct device *dev = ep->pci.dev;
++	u32 val, ltssm = 0;
++	int try, ack;
++
++	elbi_writel(ep, 1, PCIE_APP_REQ_EXIT_L1);
++	val = elbi_readl(ep, PCIE_APP_REQ_EXIT_L1_MODE);
++	val &= ~APP_REQ_EXIT_L1_MODE;
++	val |= L1_REQ_NAK_CONTROL_MASTER;
++	elbi_writel(ep, val, PCIE_APP_REQ_EXIT_L1_MODE);
++
++	for (try = 0; try < PME_TO_RETRIES; try++) {
++		elbi_writel(ep, IRQ_RADM_PM_TO_ACK, PCIE_IRQ_PULSE);
++		elbi_writel(ep, 1, XMIT_PME_TURNOFF);
++		ack = readl_poll_timeout_atomic(ep->pci.elbi_base + PCIE_IRQ_PULSE,
++						val, val & IRQ_RADM_PM_TO_ACK,
++						10, PME_TO_TIMEOUT_US);
++		elbi_writel(ep, 0, XMIT_PME_TURNOFF);
++
++		if (!readl_poll_timeout_atomic(ep->pci.elbi_base + PCIE_ELBI_RDLH_LINKUP,
++					       val, (ltssm = FIELD_GET(PCIE_LTSSM_STATE, val)) ==
++					       PCIE_LTSSM_L2_IDLE, 10, PME_TO_TIMEOUT_US)) {
++			dev_info(dev, "sleep: L2/L3 ready (PME_TO_Ack %s, try %d)\n",
++				 ack ? "missing" : "ok", try);
++			return 0;
++		}
++	}
++
++	dev_warn(dev, "sleep: no L2/L3 ready after PME_Turn_Off (ltssm 0x%x), powering off anyway\n",
++		 ltssm);
++	return -ETIMEDOUT;
++}
++
++static bool exynos9820_pcie_want_sleep_off(void)
++{
++	switch (sleep_off) {
++	case 0:
++		return false;
++	case 1:
++		return true;
++	case 3:
++	default:
++		return pm_suspend_target_state == PM_SUSPEND_MEM;
++	}
++}
++
++static int exynos9820_pcie_suspend_noirq(struct device *dev)
++{
++	struct exynos9820_pcie *ep = dev_get_drvdata(dev);
++	struct dw_pcie *pci = &ep->pci;
++
++	if (!exynos9820_pcie_want_sleep_off())
++		return 0;
++
++	if (ep->link_ok && exynos9820_pcie_ltssm_l0(ep))
++		exynos9820_pcie_pme_turn_off(ep);
++	/* Downstream order: PERST#, LTSSM disable, PHY power-down */
++	gpiod_set_value_cansleep(ep->perst, 1);
++	dw_pcie_stop_link(pci);
++	exynos9820_pcie_host_deinit(&pci->pp);
++	ep->kept_power = sleep_off == 3 && ep->vpcie;
++	if (ep->vpcie && !ep->kept_power)
++		regulator_disable(ep->vpcie);
++
++	pci->suspended = true;
++	ep->slept_off = true;
++	dev_info(dev, "sleep: link off, Wi-Fi chip %s\n",
++		 ep->kept_power ? "kept powered (D3, PERST#)" : "powered off");
++
++	return 0;
++}
++
++static int exynos9820_pcie_resume_noirq(struct device *dev)
++{
++	struct exynos9820_pcie *ep = dev_get_drvdata(dev);
++	int ret;
++
++	if (!ep->slept_off)
++		return 0;
++	ep->slept_off = false;
++
++	if (ep->vpcie && !ep->kept_power) {
++		/* the fixed regulator waits its 200 ms startup delay */
++		ret = regulator_enable(ep->vpcie);
++		if (ret) {
++			dev_err(dev, "resume: vpcie3v3 enable failed: %d\n", ret);
++			return ret;
++		}
++	}
++
++	ret = dw_pcie_resume_noirq(&ep->pci);
++	dev_info(dev, "resume: link %s (%d)%s\n", ret ? "failed" : "up", ret,
++		 ep->kept_power ? ", chip was kept powered" : "");
++
++	if (ret && ep->vpcie && resume_repower_ms) {
++		/*
++		 * The retries in start_link only toggle PERST#. A chip that is
++		 * wedged (or lost power under a kept WLAN_REG_ON) needs a real
++		 * power cycle; brcmfmac then re-probes it as after a cold sleep.
++		 */
++		dev_warn(dev, "resume: link failed, power-cycling the Wi-Fi chip\n");
++		/* dw_pcie_resume_noirq() already stopped the link and deinit the host */
++		regulator_disable(ep->vpcie);
++		msleep(resume_repower_ms);
++		ret = regulator_enable(ep->vpcie);
++		if (ret) {
++			dev_err(dev, "resume: vpcie3v3 enable failed: %d\n", ret);
++			return ret;
++		}
++		ret = dw_pcie_resume_noirq(&ep->pci);	/* still ->suspended */
++		dev_info(dev, "resume: link %s after the power cycle (%d)\n",
++			 ret ? "failed" : "up", ret);
++	}
++	ep->kept_power = false;
++
++	return ret;
++}
++
++/*
++ * In s2idle the link stays up and brcmfmac puts the chip into D3.  When the
++ * chip needs the host it raises its wake line and waits for the host to answer
++ * ("Host ready"); without a wake source the SoC sleeps on and the firmware
++ * traps (pciedev_host_wake_asserted_for_too_long).  Arm the wake pins as
++ * wakeup interrupts while the link stays up.  Deep sleep resets the chip, so
++ * nothing is armed there.
++ */
++static irqreturn_t exynos9820_pcie_wake_irq(int irq, void *arg)
++{
++	struct exynos9820_pcie_wake *w = arg;
++
++	atomic_inc(&w->count);
++	pm_system_wakeup();
++	return IRQ_HANDLED;
++}
++
++static int exynos9820_pcie_init_wake(struct exynos9820_pcie *ep)
++{
++	static const char * const ids[] = { "wlan-host-wake", "wake" };
++	struct device *dev = ep->pci.dev;
++	int i, irq, ret;
++
++	for (i = 0; i < ARRAY_SIZE(ids); i++) {
++		struct exynos9820_pcie_wake *w = &ep->wake[i];
++		struct gpio_desc *gpio;
++
++		w->irq = -ENOENT;
++		gpio = devm_gpiod_get_optional(dev, ids[i], GPIOD_IN);
++		if (IS_ERR(gpio))
++			return dev_err_probe(dev, PTR_ERR(gpio), "%s gpio\n", ids[i]);
++		if (!gpio)
++			continue;
++		irq = gpiod_to_irq(gpio);
++		if (irq < 0)
++			return dev_err_probe(dev, irq, "%s irq\n", ids[i]);
++		w->name = ids[i];
++		ret = devm_request_irq(dev, irq, exynos9820_pcie_wake_irq,
++				       IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
++				       IRQF_NO_AUTOEN, ids[i], w);
++		if (ret)
++			return dev_err_probe(dev, ret, "%s request irq\n", ids[i]);
++		w->irq = irq;
++		dev_info(dev, "s2idle wake pin %s: irq %d\n", ids[i], w->irq);
++	}
++	return 0;
++}
++
++static int exynos9820_pcie_suspend(struct device *dev)
++{
++	struct exynos9820_pcie *ep = dev_get_drvdata(dev);
++	int i;
++
++	if (exynos9820_pcie_want_sleep_off())
++		return 0;
++	for (i = 0; i < ARRAY_SIZE(ep->wake); i++) {
++		struct exynos9820_pcie_wake *w = &ep->wake[i];
++
++		if (w->irq < 0)
++			continue;
++		atomic_set(&w->count, 0);
++		enable_irq(w->irq);
++		enable_irq_wake(w->irq);
++		ep->wake_armed = true;
++	}
++	return 0;
++}
++
++static int exynos9820_pcie_resume(struct device *dev)
++{
++	struct exynos9820_pcie *ep = dev_get_drvdata(dev);
++	int i;
++
++	if (!ep->wake_armed)
++		return 0;
++	ep->wake_armed = false;
++	for (i = 0; i < ARRAY_SIZE(ep->wake); i++) {
++		struct exynos9820_pcie_wake *w = &ep->wake[i];
++		int n;
++
++		if (w->irq < 0)
++			continue;
++		disable_irq_wake(w->irq);
++		disable_irq(w->irq);
++		n = atomic_read(&w->count);
++		if (n)
++			dev_info(dev, "s2idle: woken by %s (%d edges)\n", w->name, n);
++	}
++	return 0;
++}
++
++static const struct dev_pm_ops exynos9820_pcie_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(exynos9820_pcie_suspend, exynos9820_pcie_resume)
++	NOIRQ_SYSTEM_SLEEP_PM_OPS(exynos9820_pcie_suspend_noirq,
++				  exynos9820_pcie_resume_noirq)
++};
++
++static void __iomem *exynos9820_pcie_map(struct platform_device *pdev,
++					 const char *name, phys_addr_t *phys,
++					 bool optional)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return optional ? NULL : IOMEM_ERR_PTR(-EINVAL);
++	if (phys)
++		*phys = res->start;
++
++	return devm_ioremap_resource(&pdev->dev, res);
++}
++
++static int exynos9820_pcie_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct exynos9820_pcie *ep;
++	struct dw_pcie_rp *pp;
++	struct resource *res;
++	int ret, irq;
++
++	ep = devm_kzalloc(dev, sizeof(*ep), GFP_KERNEL);
++	if (!ep)
++		return -ENOMEM;
++
++	ep->pci.dev = dev;
++	ep->pci.ops = &exynos9820_dw_pcie_ops;
++	pp = &ep->pci.pp;
++	pp->ops = &exynos9820_pcie_host_ops;
++	platform_set_drvdata(pdev, ep);
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "elbi");
++	if (!res)
++		return dev_err_probe(dev, -EINVAL, "missing elbi region\n");
++	ep->elbi_phys = res->start;
++	ep->pci.elbi_base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(ep->pci.elbi_base))
++		return PTR_ERR(ep->pci.elbi_base);
++
++	ep->pma_base = exynos9820_pcie_map(pdev, "phy", &ep->pma_phys, false);
++	if (IS_ERR(ep->pma_base))
++		return PTR_ERR(ep->pma_base);
++
++	ep->pcs_base = exynos9820_pcie_map(pdev, "pcs", &ep->pcs_phys, false);
++	if (IS_ERR(ep->pcs_base))
++		return PTR_ERR(ep->pcs_base);
++
++	ep->ia_base = exynos9820_pcie_map(pdev, "ia", &ep->ia_phys, true);
++	if (IS_ERR(ep->ia_base))
++		return PTR_ERR(ep->ia_base);
++
++	ep->sysreg = syscon_regmap_lookup_by_phandle(np, "samsung,sysreg");
++	if (IS_ERR(ep->sysreg))
++		return dev_err_probe(dev, PTR_ERR(ep->sysreg),
++				     "failed to get sysreg\n");
++
++	ep->pmu = syscon_regmap_lookup_by_phandle(np, "samsung,pmu-syscon");
++	if (IS_ERR(ep->pmu))
++		return dev_err_probe(dev, PTR_ERR(ep->pmu),
++				     "failed to get PMU\n");
++
++	/* PERST# is asserted until the PHY is configured */
++	ep->perst = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(ep->perst))
++		return dev_err_probe(dev, PTR_ERR(ep->perst),
++				     "failed to get reset GPIO\n");
++
++	/* WLAN_REG_ON: powers the endpoint, needs ~200 ms before training */
++	ep->vpcie = devm_regulator_get_optional(dev, "vpcie3v3");
++	if (IS_ERR(ep->vpcie)) {
++		if (PTR_ERR(ep->vpcie) != -ENODEV)
++			return dev_err_probe(dev, PTR_ERR(ep->vpcie),
++					     "failed to get vpcie3v3\n");
++		ep->vpcie = NULL;
++	}
++
++	ep->num_clks = devm_clk_bulk_get_all_enabled(dev, &ep->clks);
++	if (ep->num_clks < 0)
++		return dev_err_probe(dev, ep->num_clks,
++				     "failed to enable clocks\n");
++
++	if (ep->vpcie) {
++		ret = regulator_enable(ep->vpcie);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "failed to enable vpcie3v3\n");
++	}
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		ret = irq;
++		goto err_regulator;
++	}
++
++	ret = devm_request_irq(dev, irq, exynos9820_pcie_irq_handler,
++			       IRQF_SHARED, "exynos9820-pcie", ep);
++	if (ret)
++		goto err_regulator;
++
++	ret = exynos9820_pcie_init_wake(ep);
++	if (ret)
++		goto err_regulator;
++
++	ret = dw_pcie_host_init(pp);
++	if (ret) {
++		dev_err(dev, "failed to initialize host: %d\n", ret);
++		goto err_regulator;
++	}
++
++	return 0;
++
++err_regulator:
++	if (ep->vpcie)
++		regulator_disable(ep->vpcie);
++	return ret;
++}
++
++static void exynos9820_pcie_remove(struct platform_device *pdev)
++{
++	struct exynos9820_pcie *ep = platform_get_drvdata(pdev);
++
++	dw_pcie_host_deinit(&ep->pci.pp);
++	if (ep->vpcie)
++		regulator_disable(ep->vpcie);
++}
++
++static const struct of_device_id exynos9820_pcie_of_match[] = {
++	{ .compatible = "samsung,exynos9820-pcie" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, exynos9820_pcie_of_match);
++
++static struct platform_driver exynos9820_pcie_driver = {
++	.probe		= exynos9820_pcie_probe,
++	.remove		= exynos9820_pcie_remove,
++	.driver = {
++		.name		= "exynos9820-pcie",
++		.of_match_table	= exynos9820_pcie_of_match,
++		.pm		= pm_sleep_ptr(&exynos9820_pcie_pm_ops),
++		.suppress_bind_attrs = true,
++	},
++};
++module_platform_driver(exynos9820_pcie_driver);
++
++MODULE_DESCRIPTION("Samsung Exynos 9820 PCIe host controller driver");
++MODULE_LICENSE("GPL");

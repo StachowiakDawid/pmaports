@@ -1,0 +1,82 @@
+From 365951db045f449d5c4cd4afc4e7a5d4da48ac0e Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] power: supply: max17042: max77705: disable the stale alerts
+
+The MAX77705 fuel gauge comes out of the bootloader with TALRT_Th and
+the current alert threshold (0xB4) set to 0x0003. The driver only
+programs SOC alerts, so a normal battery current keeps the alert
+asserted: the interrupt fires again right after the handler cleared
+STATUS, several hundred times per second, each time with a
+power_supply uevent.
+
+Reset both thresholds to the POR "disabled" value 0x7F80 at probe, as
+the vendor driver does for TALRT_Th.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/power/supply/max17042_battery.c | 43 +++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/drivers/power/supply/max17042_battery.c b/drivers/power/supply/max17042_battery.c
+index ae7e9b4257..e02685c143 100644
+--- a/drivers/power/supply/max17042_battery.c
++++ b/drivers/power/supply/max17042_battery.c
+@@ -1431,6 +1431,46 @@ static const struct power_supply_desc max17042_no_current_sense_psy_desc = {
+ 	.num_properties	= ARRAY_SIZE(max17042_battery_props) - 2,
+ };
+ 
++/*
++ * MAX77705: the bootloader/stock firmware leaves alert thresholds behind that
++ * this driver never programs. On the Galaxy S10 (beyond2lte) TALRT_Th reads
++ * 0x0003 (alert above 0 degC) and the current alert threshold at 0xB4 reads
++ * 0x0003 as well, so a normal battery current keeps STATUS bit 4 and the ALRT
++ * line asserted: the thread handler clears STATUS and the alert fires again at
++ * once (~450 interrupts and ~37 power_supply uevents per second at idle).
++ * The driver only uses SOC alerts, so disable the temperature and current
++ * alerts (0x7F80 = max +127 / min -128, the POR "disabled" value; the stock
++ * Samsung driver resets TALRT_Th the same way).
++ */
++static bool max17042_is_max77705(struct device *dev)
++{
++	const struct platform_device_id *id;
++
++	if (of_device_is_compatible(dev->of_node, "maxim,max77705-battery"))
++		return true;
++	if (!dev_is_platform(dev))
++		return false;
++	id = platform_get_device_id(to_platform_device(dev));
++	return id && !strcmp(id->name, "max77705-battery");
++}
++
++static void max77705_disable_extra_alerts(struct max17042_chip *chip)
++{
++	static const u8 regs[] = { MAX17042_TALRT_Th, MAX17055_IAlrtTh };
++	unsigned int old;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		if (regmap_read(chip->regmap, regs[i], &old))
++			continue;
++		if (old == 0x7f80)
++			continue;
++		regmap_write(chip->regmap, regs[i], 0x7f80);
++		dev_info(chip->dev, "alert threshold 0x%02x: 0x%04x -> 0x7f80 (disabled)\n",
++			 regs[i], old);
++	}
++}
++
+ static int max17042_probe(struct i2c_client *client, struct device *dev, int irq,
+ 			  enum max170xx_chip_type chip_type)
+ {
+@@ -1521,6 +1561,9 @@ static int max17042_probe(struct i2c_client *client, struct device *dev, int irq
+ 		regmap_write(chip->regmap, MAX17047_FullSOCThr,
+ 			     MAX17042_BATTERY_FULL << 8);
+ 
++	if (max17042_is_max77705(dev))
++		max77705_disable_extra_alerts(chip);
++
+ 	if (irq) {
+ 		unsigned int flags = IRQF_ONESHOT | IRQF_SHARED | IRQF_PROBE_SHARED;
+ 

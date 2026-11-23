@@ -1,0 +1,727 @@
+From 76951f5a5115bf846e571950794489d6561642e2 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] usb: dwc3: Exynos9820 quirks: Gen1, host clocking,
+ SuperSpeed-first connect
+
+Quirks of the DWC_usb31 1.70a core of the Exynos 9820, all keyed on
+the "samsung,exynos9820" machine compatible:
+
+ - Gen1 only: the combo PHY runs USB at 5 Gb/s, but the link is
+   synthesised Gen2 capable and never trains when it offers Gen2. Cap
+   maximum_speed at SuperSpeed and keep LLUCTL.FORCE_GEN1 set whenever
+   the gadget speed is programmed, as the vendor kernel does.
+ - Host clocking: the core runs from a 66.67 MHz ref_clk, but
+   GUCTL.REFCLKPER resets to 41 ns and GFLADJ.REFCLK_LPM_SEL is set.
+   Program REFCLKPER 15 ns, GFLADJ PLS1 / 240MHZ_DECR 3 without
+   REFCLK_LPM_SEL, and keep USB2 PHY suspend, ENBLSLPM and USB2
+   hardware LPM off, at every core (re)init, after the soft reset of
+   a role switch and when the xHCI has been started. Without it
+   high-speed bulk transfers in host mode fail with transaction
+   errors. snps,ref-clock-period-ns is ignored.
+ - SuperSpeed-first connect (exynos9820_ss_first, default: hold with
+   fallbacks): the SuperSpeed link only trains if the high-speed
+   pull-up is held off while the receiver detection runs. The hold is
+   taken at pullup(on) and released if there is no Connect Done within
+   1 s, if a SuperSpeed connection is not addressed by the host within
+   3 s, or when the SuperSpeed link is lost; the gadget then
+   reconnects at high-speed only. SuperSpeed is re-armed on every
+   Type-C attach, and role "none" is reported after a detach.
+ - The vendor GUSB3PIPECTL bits (0x1a000001: DISRXDETINP3, UX_EXIT_PX,
+   U1U2EXITFAIL_TO_RECOV, ElasticBufferMode); without them the link
+   goes Recovery -> SS.Inactive with the pull-up held.
+ - The combo PHY lanes are re-targeted (phy_set_mode() on the USB3
+   PHY) before a new host or device role starts and in the re-attach
+   work between disconnect and connect, so a cable flip after boot
+   gets the right lanes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/usb/dwc3/core.c   | 133 ++++++++++++++++++
+ drivers/usb/dwc3/core.h   |  31 +++++
+ drivers/usb/dwc3/drd.c    |  10 ++
+ drivers/usb/dwc3/gadget.c | 285 ++++++++++++++++++++++++++++++++++++++
+ drivers/usb/dwc3/host.c   |   3 +
+ 5 files changed, 462 insertions(+)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 372737f475..91f896dd43 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -46,6 +46,99 @@
+ 
+ #define DWC3_DEFAULT_AUTOSUSPEND_DELAY	5000 /* ms */
+ 
++/*
++ * Exynos9820: the USB/DP combo PHY runs USB at 5 Gb/s only, but the DWC_usb31
++ * link is synthesised Gen2 capable (GHWPARAMS3.SSPHY_IFC = 2), so with no
++ * maximum-speed in the DT it goes for SuperSpeedPlus and never trains (LTSSM
++ * history Rx.Detect -> Polling -> Rx.Detect -> Polling -> SS.Disabled, then
++ * USB 2.0). The vendor kernel sets LLUCTL.FORCE_GEN1 for every DWC_usb31 >
++ * 1.20a. On for "samsung,exynos9820".
++ */
++bool dwc3_force_gen1(void)
++{
++	return of_machine_is_compatible("samsung,exynos9820");
++}
++
++/*
++ * Exynos9820 host fix. The DWC_usb31 core runs from a 66.67 MHz ref_clk
++ * (FSYS0A USB31DRD_REF_CLK_40) but GUCTL.REFCLKPER resets to 41 ns (24 MHz)
++ * and GFLADJ.REFCLK_LPM_SEL is set, so the SOF/ITP counters run on a
++ * wrongly scaled ref_clk; with USB2 PHY suspend and hardware LPM on top,
++ * high-speed bulk transfers to a LimeSDR Mini (FT601) fail with transaction
++ * errors. Verified good on the device (probe with 0 errors):
++ *   GUCTL.REFCLKPER = 15 ns,
++ *   GFLADJ: 240MHZDECR_PLS1 = 1, 240MHZ_DECR = 3, REFCLK_FLADJ = 0,
++ *           REFCLK_LPM_SEL = 0 (30MHZ field kept),
++ *   GUSB2PHYCFG: SUSPHY = 0, ENBLSLPM = 0, xHCI USB2 hardware LPM off.
++ * snps,ref-clock-period-ns cannot be used for this: with it the xHCI dies
++ * when the LimeSDR enumerates. The registers are programmed at every core
++ * (re)init, after the GCTL soft reset of every role switch and when the
++ * xHCI has been started. On for "samsung,exynos9820".
++ */
++#define DWC3_EXYNOS9820_REFCLKPER	15
++
++void dwc3_exynos9820_hostfix_apply(struct dwc3 *dwc)
++{
++	u32 guctl, gfladj, reg;
++	int i;
++
++	if (!dwc->exynos9820_hostfix)
++		return;
++
++	guctl = dwc3_readl(dwc, DWC3_GUCTL);
++	FIELD_MODIFY(DWC3_GUCTL_REFCLKPER_MASK, &guctl,
++		     DWC3_EXYNOS9820_REFCLKPER);
++	dwc3_writel(dwc, DWC3_GUCTL, guctl);
++
++	gfladj = dwc3_readl(dwc, DWC3_GFLADJ);
++	gfladj &= ~(DWC3_GFLADJ_240MHZDECR_PLS1 | DWC3_GFLADJ_240MHZDECR |
++		    DWC3_GFLADJ_REFCLK_LPM_SEL | DWC3_GFLADJ_REFCLK_FLADJ_MASK);
++	gfladj |= DWC3_GFLADJ_240MHZDECR_PLS1 |
++		  FIELD_PREP(DWC3_GFLADJ_240MHZDECR, 3);
++	dwc3_writel(dwc, DWC3_GFLADJ, gfladj);
++
++	for (i = 0; i < dwc->num_usb2_ports; i++) {
++		reg = dwc3_readl(dwc, DWC3_GUSB2PHYCFG(i));
++		reg &= ~(DWC3_GUSB2PHYCFG_SUSPHY | DWC3_GUSB2PHYCFG_ENBLSLPM);
++		dwc3_writel(dwc, DWC3_GUSB2PHYCFG(i), reg);
++	}
++
++	dev_dbg(dwc->dev, "exynos9820_hostfix: GUCTL %08x GFLADJ %08x\n",
++		guctl, gfladj);
++}
++
++static void dwc3_exynos9820_hostfix_init(struct dwc3 *dwc)
++{
++	if (!of_machine_is_compatible("samsung,exynos9820"))
++		return;
++
++	dwc->exynos9820_hostfix = true;
++	/* keep mainline from touching what the fix owns */
++	dwc->dis_u2_susphy_quirk = true;
++	dwc->dis_enblslpm_quirk = true;
++	dwc->usb2_lpm_disable = true;
++	dwc->gfladj_refclk_lpm_sel = false;
++	if (dwc->ref_clk_per)
++		dev_warn(dwc->dev,
++			 "exynos9820_hostfix: ignoring snps,ref-clock-period-ns\n");
++	dwc->ref_clk_per = 0;
++
++	dev_info(dwc->dev,
++		 "exynos9820_hostfix: REFCLKPER %u ns, GFLADJ PLS1/DECR 3, U2 SUSPHY/ENBLSLPM/LPM off\n",
++		 DWC3_EXYNOS9820_REFCLKPER);
++}
++
++/*
++ * The vendor Exynos9820 GUSB3PIPECTL bits. Downstream
++ * dwc3_core_config() sets DISRXDETINP3 (bit 28, rev >= 2.50a branch, taken
++ * for DWC_usb31) and, from the beyond2lte DT, UX_EXIT_PX (27,
++ * snps,ux_exit_in_px_quirk), U1U2EXITFAIL_TO_RECOV (25, snps,u1u2_exitfail_quirk)
++ * and ElasticBufferMode (0, snps,elastic_buf_mode_quirk) = 0x1a000001.
++ * Only with these bits did the SuperSpeed link stay in U0; without them
++ * it went Recovery -> SS.Inactive. Set on "samsung,exynos9820" only.
++ */
++#define DWC3_EXYNOS9820_PIPECTL		0x1a000001
++
+ /**
+  * dwc3_get_dr_mode - Validates and sets dr_mode
+  * @dwc: pointer to our context structure
+@@ -239,6 +332,26 @@ static void __dwc3_set_mode(struct work_struct *work)
+ 
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++	/*
++	 * GCTL.CORESOFTRESET above loses GUCTL/GFLADJ/GUSB2PHYCFG and
++	 * dwc3_core_init() is not run again: re-program the Exynos9820 set
++	 * before the xHCI (or the gadget) is brought up.
++	 */
++	dwc3_exynos9820_hostfix_apply(dwc);
++
++	/*
++	 * Exynos9820 picks the combo PHY lanes from the cable
++	 * orientation at its init only; re-target them before the new role
++	 * starts (xHCI / gadget not running yet). The PIPE3 phy_set_mode()
++	 * calls below then find the lanes already right.
++	 */
++	if (of_machine_is_compatible("samsung,exynos9820") &&
++	    (desired_dr_role == DWC3_GCTL_PRTCAP_HOST ||
++	     desired_dr_role == DWC3_GCTL_PRTCAP_DEVICE))
++		phy_set_mode(dwc->usb3_generic_phy[0],
++			     desired_dr_role == DWC3_GCTL_PRTCAP_HOST ?
++			     PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
++
+ 	switch (desired_dr_role) {
+ 	case DWC3_GCTL_PRTCAP_HOST:
+ 		ret = dwc3_host_init(dwc);
+@@ -262,6 +375,7 @@ static void __dwc3_set_mode(struct work_struct *work)
+ 		break;
+ 	case DWC3_GCTL_PRTCAP_DEVICE:
+ 		dwc3_core_soft_reset(dwc);
++		dwc3_exynos9820_hostfix_apply(dwc);
+ 
+ 		dwc3_event_buffers_setup(dwc);
+ 
+@@ -702,6 +816,14 @@ static int dwc3_ss_phy_setup(struct dwc3 *dwc, int index)
+ 	if (dwc->dis_del_phy_power_chg_quirk)
+ 		reg &= ~DWC3_GUSB3PIPECTL_DEPOCHANGE;
+ 
++	if (of_machine_is_compatible("samsung,exynos9820")) {
++		u32 bits = DWC3_EXYNOS9820_PIPECTL;
++
++		reg |= bits & ~DWC3_GUSB3PIPECTL_SUSPHY;
++		dev_info(dwc->dev, "GUSB3PIPECTL(%d) Exynos9820 vendor bits %#x -> %#x\n",
++			 index, bits, reg);
++	}
++
+ 	dwc3_writel(dwc, DWC3_GUSB3PIPECTL(index), reg);
+ 
+ 	return 0;
+@@ -1406,6 +1528,9 @@ int dwc3_core_init(struct dwc3 *dwc)
+ 	/* Adjust Reference Clock Period */
+ 	dwc3_ref_clk_period(dwc);
+ 
++	/* Exynos9820: overrides the two above */
++	dwc3_exynos9820_hostfix_apply(dwc);
++
+ 	dwc3_set_incr_burst_type(dwc);
+ 
+ 	dwc3_config_soc_bus(dwc);
+@@ -1894,6 +2019,8 @@ static void dwc3_get_properties(struct dwc3 *dwc)
+ 	dwc->tx_fifo_resize_max_num = tx_fifo_resize_max_num;
+ 
+ 	dwc->num_hc_interrupters = num_hc_interrupters;
++
++	dwc3_exynos9820_hostfix_init(dwc);
+ }
+ 
+ /* check whether the core supports IMOD */
+@@ -1966,6 +2093,12 @@ static void dwc3_check_params(struct dwc3 *dwc)
+ 		break;
+ 	}
+ 
++	if (dwc->maximum_speed > USB_SPEED_SUPER && !DWC3_IP_IS(DWC3) &&
++	    dwc3_force_gen1()) {
++		dev_info(dev, "SuperSpeed limited to Gen1\n");
++		dwc->maximum_speed = USB_SPEED_SUPER;
++	}
++
+ 	/*
+ 	 * Currently the controller does not have visibility into the HW
+ 	 * parameter to determine the maximum number of lanes the HW supports.
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index f3dabb37f8..cb6c37cbf5 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1167,6 +1167,20 @@ struct dwc3_glue_ops {
+  *			instances in park mode.
+  * @parkmode_disable_hs_quirk: set if we need to disable all HighSpeed
+  *			instances in park mode.
++ * @exynos9820_hostfix: program the Exynos9820 ref clock / USB2 PHY set
++ *			at every core (re)init
++ * @hs_hold_mode: Exynos9820 SuperSpeed-first HS pull-up hold policy
++ *			(dwc3.exynos9820_ss_first): 0 off, 1 vendor, 2 SS only
++ * @hs_hold_want: requested hold state, applied by @hs_hold_work
++ * @hs_hold_armed: hold taken at pullup(on), no Connect Done yet
++ * @hs_hold_ss: Connect Done was at SuperSpeed (mode 3 enumeration watch)
++ * @hs_hold_hs_only: mode 3 fallback: this attach runs USB 2.0 only
++ * @hs_hold_detached: TypeC role went to none since the last attach
++ * @hs_hold_rearm: hs_fallback_work runs for an attach (re-arm SS)
++ * @hs_hold_inited: hold works initialised (gadget exists)
++ * @hs_fallback_work: high-speed-only reconnect / SuperSpeed re-arm
++ * @hs_hold_work: applies @hs_hold_want through phy_set_mode_ext()
++ * @hs_hold_timeout: releases a pullup(on) hold that saw no Connect Done
+  * @gfladj_refclk_lpm_sel: set if we need to enable SOF/ITP counter
+  *                          running based on ref_clk
+  * @tx_de_emphasis_quirk: set if we enable Tx de-emphasis quirk
+@@ -1426,6 +1440,18 @@ struct dwc3 {
+ 	unsigned		parkmode_disable_ss_quirk:1;
+ 	unsigned		parkmode_disable_hs_quirk:1;
+ 	unsigned		gfladj_refclk_lpm_sel:1;
++	unsigned		exynos9820_hostfix:1;
++	unsigned		hs_hold_mode:2;
++	bool			hs_hold_want;
++	bool			hs_hold_armed;
++	bool			hs_hold_ss;
++	bool			hs_hold_hs_only;
++	bool			hs_hold_detached;
++	bool			hs_hold_rearm;
++	bool			hs_hold_inited;
++	struct work_struct	hs_fallback_work;
++	struct work_struct	hs_hold_work;
++	struct delayed_work	hs_hold_timeout;
+ 
+ 	unsigned		tx_de_emphasis_quirk:1;
+ 	unsigned		tx_de_emphasis:2;
+@@ -1661,6 +1687,8 @@ void dwc3_event_buffers_cleanup(struct dwc3 *dwc);
+ 
+ int dwc3_core_soft_reset(struct dwc3 *dwc);
+ void dwc3_enable_susphy(struct dwc3 *dwc, bool enable);
++void dwc3_exynos9820_hostfix_apply(struct dwc3 *dwc);
++bool dwc3_force_gen1(void);
+ 
+ static inline void dwc3_pre_set_role(struct dwc3 *dwc, enum usb_role role)
+ {
+@@ -1696,7 +1724,10 @@ int dwc3_send_gadget_generic_command(struct dwc3 *dwc, unsigned int cmd,
+ 		u32 param);
+ void dwc3_gadget_clear_tx_fifos(struct dwc3 *dwc);
+ void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep, int status);
++void dwc3_gadget_role_event(struct dwc3 *dwc, enum usb_role role);
+ #else
++static inline void dwc3_gadget_role_event(struct dwc3 *dwc, enum usb_role role)
++{ }
+ static inline int dwc3_gadget_init(struct dwc3 *dwc)
+ { return 0; }
+ static inline void dwc3_gadget_exit(struct dwc3 *dwc)
+diff --git a/drivers/usb/dwc3/drd.c b/drivers/usb/dwc3/drd.c
+index f3e37d3836..8617c2389c 100644
+--- a/drivers/usb/dwc3/drd.c
++++ b/drivers/usb/dwc3/drd.c
+@@ -468,6 +468,7 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw,
+ 		break;
+ 	}
+ 
++	dwc3_gadget_role_event(dwc, role);
+ 	dwc3_pre_set_role(dwc, role);
+ 	dwc3_set_mode(dwc, mode);
+ 	return 0;
+@@ -497,6 +498,15 @@ static enum usb_role dwc3_usb_role_switch_get(struct usb_role_switch *sw)
+ 			role = USB_ROLE_DEVICE;
+ 		break;
+ 	}
++	/*
++	 * Exynos9820 SS-first (mode 3) needs to see the next attach: report
++	 * "none" after a detach instead of the default device role, so a TypeC
++	 * driver that compares before setting (max77705-usbc) sets DEVICE
++	 * again on the next plug.
++	 */
++	if (role == USB_ROLE_DEVICE && dwc->hs_hold_mode == 3 &&
++	    dwc->hs_hold_detached)
++		role = USB_ROLE_NONE;
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 	return role;
+ }
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index ee83723563..390c6ddb12 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -18,6 +18,9 @@
+ #include <linux/io.h>
+ #include <linux/list.h>
+ #include <linux/dma-mapping.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/workqueue.h>
+ 
+ #include <linux/usb/ch9.h>
+ #include <linux/usb/gadget.h>
+@@ -27,6 +30,196 @@
+ #include "gadget.h"
+ #include "io.h"
+ 
++/*
++ * Exynos9820 SuperSpeed-first connect. The SoC has no VBUS pad,
++ * and the HS PHY's VBUS valid (which gates the D+ pull-up) is software
++ * controlled. Mainline leaves it on, so the host sees the device on USB 2.0
++ * while the SuperSpeed link trains, resets the USB 2.0 port, and the link
++ * drops SS (LTSSM Polling -> U0 -> Recovery -> U0 -> SS.Disabled, gadget at
++ * high-speed). Policies (dwc3.exynos9820_ss_first):
++ *  1 vendor (is_not_vbus_pad): hold (pull-up off) at pullup(on), Connect Done
++ *    at HS/SS and wakeup; release at USB reset and link state U0 / Rx.Detect /
++ *    Resume. On mainline the Rx.Detect event right after Run/Stop releases
++ *    the hold at once, so this is a race (seen with both outcomes).
++ *  2 SS only: hold after Connect Done at SuperSpeed; release on disconnect or
++ *    SS link loss.
++ *  3 hold (default on 9820): hold from pullup(on); release if no Connect Done
++ *    within DWC3_SS_FIRST_MS, if Connect Done was at SuperSpeed but the
++ *    host has not addressed the device within DWC3_SS_FIRST_ENUM_MS,
++ *    or when the SuperSpeed link is lost (SS.Inactive / SS.Disabled,
++ *    disconnect). Each release lets the host fall back to USB 2.0.
++ * All keep the link state change event (DEVTEN.ULSTCNGEN) on. 0 = off
++ * (mainline). -1 = auto: 3 on "samsung,exynos9820", else 0. The PHY ignores a
++ * hold while its SS part is down (exynos9820_ss=0), so USB 2.0-only
++ * operation does not change. Read at gadget init (next DWC3 bind).
++ */
++static int exynos9820_ss_first = -1;
++module_param(exynos9820_ss_first, int, 0644);
++MODULE_PARM_DESC(exynos9820_ss_first,
++		 "Exynos9820 HS pull-up hold for SS-first connect: -1 auto (3 on 9820), 0 off, 1 vendor, 2 SS-only, 3 hold with fallbacks; next bind");
++/* release the pullup(on) HS hold after this many ms without Connect Done */
++#define DWC3_SS_FIRST_MS	1000
++/* mode 3: ... or without the host addressing the device after a SS Connect Done */
++#define DWC3_SS_FIRST_ENUM_MS	3000
++
++/*
++ * Mode 3: when SuperSpeed does not get enumerated, reconnect at
++ * high-speed only. The gadget also reconnects (re-arming the SS-first hold at
++ * the right time) on every TypeC attach, not only after a fallback:
++ * the gadget is connected all the time on this board, so the pullup(on) hold
++ * and its timers would otherwise run long before a later plug.
++ */
++
++static void dwc3_hs_hold_work(struct work_struct *work)
++{
++	struct dwc3 *dwc = container_of(work, struct dwc3, hs_hold_work);
++	bool hold = READ_ONCE(dwc->hs_hold_want);
++	int ret;
++
++	ret = phy_set_mode(dwc->usb2_generic_phy[0], hold ?
++			   PHY_MODE_USB_DEVICE_SS : PHY_MODE_USB_DEVICE_HS);
++	if (ret)
++		dev_warn(dwc->dev, "HS pull-up %s failed: %d\n",
++			 hold ? "hold" : "release", ret);
++	else
++		dev_dbg(dwc->dev, "HS pull-up %s\n", hold ? "hold" : "release");
++}
++
++/*
++ * Releasing the HS pull-up is not enough while the SuperSpeed
++ * link sits in U0 (the host keeps the SS port and never looks at USB 2.0;
++ * seen after a reboot: "not addressed", then "not attached" for good). The
++ * fallback reconnects the gadget USB 2.0-only: soft disconnect, DCFG.DEVSPD =
++ * high-speed (the SS LTSSM goes to SS.Disabled, the host sees the SS device
++ * leave), soft connect with the pull-up on. SuperSpeed is re-armed on the
++ * next TypeC attach (role switch none -> device) or DWC3 rebind.
++ * Called with dwc->lock held: the reconnect runs from hs_fallback_work.
++ */
++static void dwc3_hs_fallback(struct dwc3 *dwc, const char *why)
++{
++	if (dwc->hs_hold_hs_only)
++		return;
++
++	dwc->hs_hold_hs_only = true;
++	dwc->hs_hold_ss = false;
++	WRITE_ONCE(dwc->hs_hold_rearm, false);
++	schedule_work(&dwc->hs_fallback_work);
++	dev_info(dwc->dev, "SS-first: %s, reconnecting at high-speed (SS again at the next attach)\n",
++		 why);
++}
++
++static void dwc3_hs_fallback_work(struct work_struct *work)
++{
++	struct dwc3 *dwc = container_of(work, struct dwc3, hs_fallback_work);
++	struct usb_gadget *g = dwc->gadget;
++	bool attach = READ_ONCE(dwc->hs_hold_rearm);
++	bool connected = g->connected || dwc->softconnect;
++
++	if (attach) {
++		WRITE_ONCE(dwc->hs_hold_rearm, false);
++		dwc->hs_hold_hs_only = false;
++		dev_info(dwc->dev, "SS-first: attach, reconnecting with SuperSpeed\n");
++	}
++
++	if (connected)
++		usb_gadget_disconnect(g);
++	/*
++	 * A re-attach may come with the other cable orientation;
++	 * re-target the combo PHY lanes while Run/Stop is off.
++	 */
++	if (attach)
++		phy_set_mode(dwc->usb3_generic_phy[0], PHY_MODE_USB_DEVICE);
++	if (connected)
++		usb_gadget_connect(g);
++}
++
++/* TypeC role switch: re-arm SuperSpeed on a fresh attach (mode 3) */
++void dwc3_gadget_role_event(struct dwc3 *dwc, enum usb_role role)
++{
++	if (dwc->hs_hold_mode != 3 || !dwc->hs_hold_inited)
++		return;
++
++	if (role == USB_ROLE_NONE) {
++		dwc->hs_hold_detached = true;
++		return;
++	}
++
++	if (role == USB_ROLE_DEVICE && dwc->hs_hold_detached &&
++	    dwc->current_dr_role == DWC3_GCTL_PRTCAP_DEVICE) {
++		dwc->hs_hold_detached = false;
++		WRITE_ONCE(dwc->hs_hold_rearm, true);
++		schedule_work(&dwc->hs_fallback_work);
++	}
++}
++
++static void dwc3_hs_hold_timeout(struct work_struct *work)
++{
++	struct dwc3 *dwc = container_of(to_delayed_work(work), struct dwc3,
++					hs_hold_timeout);
++	unsigned long flags;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	if (dwc->hs_hold_armed) {
++		dwc->hs_hold_armed = false;
++		WRITE_ONCE(dwc->hs_hold_want, false);
++		schedule_work(&dwc->hs_hold_work);
++		dev_info(dwc->dev, "SS-first: no Connect Done in %u ms, HS pull-up released\n",
++			 DWC3_SS_FIRST_MS);
++		/* mode 3: SS may still sit in U0 without a host: go HS-only */
++		if (dwc->hs_hold_mode == 3)
++			dwc3_hs_fallback(dwc, "no Connect Done");
++	} else if (dwc->hs_hold_ss && READ_ONCE(dwc->hs_hold_want) &&
++		   dwc->gadget->state < USB_STATE_ADDRESS) {
++		WRITE_ONCE(dwc->hs_hold_want, false);
++		schedule_work(&dwc->hs_hold_work);
++		dev_info(dwc->dev, "SS-first: SuperSpeed link up but not addressed in %u ms (state %s, DSTS %08x), HS pull-up released\n",
++			 DWC3_SS_FIRST_ENUM_MS,
++			 usb_state_string(dwc->gadget->state),
++			 dwc3_readl(dwc, DWC3_DSTS));
++		dwc3_hs_fallback(dwc, "not addressed");
++	}
++	spin_unlock_irqrestore(&dwc->lock, flags);
++}
++
++/* may be called in atomic context (event handler, dwc->lock held) */
++static void dwc3_hs_hold(struct dwc3 *dwc, bool hold)
++{
++	if (!dwc->hs_hold_mode)
++		return;
++
++	WRITE_ONCE(dwc->hs_hold_want, hold);
++	schedule_work(&dwc->hs_hold_work);
++}
++
++static void dwc3_hs_hold_init(struct dwc3 *dwc)
++{
++	int mode = exynos9820_ss_first;
++
++	INIT_WORK(&dwc->hs_hold_work, dwc3_hs_hold_work);
++	INIT_DELAYED_WORK(&dwc->hs_hold_timeout, dwc3_hs_hold_timeout);
++	INIT_WORK(&dwc->hs_fallback_work, dwc3_hs_fallback_work);
++	dwc->hs_hold_hs_only = false;
++	dwc->hs_hold_detached = false;
++
++	if (mode < 0)
++		mode = of_machine_is_compatible("samsung,exynos9820") ? 3 : 0;
++	if (mode > 3 || !dwc->usb2_generic_phy[0])
++		mode = 0;
++	dwc->hs_hold_mode = mode;
++	dwc->hs_hold_inited = true;
++	if (mode)
++		dev_info(dwc->dev, "SS-first HS pull-up hold: %s (dwc3.exynos9820_ss_first)\n",
++			 mode == 1 ? "vendor" : mode == 2 ? "SS only" : "hold");
++}
++
++static void dwc3_hs_hold_exit(struct dwc3 *dwc)
++{
++	dwc->hs_hold_inited = false;
++	cancel_work_sync(&dwc->hs_fallback_work);
++	cancel_delayed_work_sync(&dwc->hs_hold_timeout);
++	cancel_work_sync(&dwc->hs_hold_work);
++}
++
+ #define DWC3_ALIGN_FRAME(d, n)	(((d)->frame_number + ((d)->interval * (n))) \
+ 					& ~((d)->interval - 1))
+ 
+@@ -2372,6 +2565,10 @@ static void dwc3_gadget_enable_linksts_evts(struct dwc3 *dwc, bool set)
+ 	if (DWC3_VER_IS_PRIOR(DWC3, 250A))
+ 		return;
+ 
++	/* the SS-first HS pull-up hold needs every link state change */
++	if (!set && dwc->hs_hold_mode)
++		return;
++
+ 	reg = dwc3_readl(dwc, DWC3_DEVTEN);
+ 	if (set)
+ 		reg |= DWC3_DEVTEN_ULSTCNGEN;
+@@ -2584,6 +2781,10 @@ static void __dwc3_gadget_set_speed(struct dwc3 *dwc)
+ 	if (speed == USB_SPEED_UNKNOWN || speed > dwc->maximum_speed)
+ 		speed = dwc->maximum_speed;
+ 
++	/* Exynos9820 SS-first fallback: this attach is USB 2.0 only */
++	if (dwc->hs_hold_hs_only && speed > USB_SPEED_HIGH)
++		speed = USB_SPEED_HIGH;
++
+ 	if (speed == USB_SPEED_SUPER_PLUS &&
+ 	    DWC3_IP_IS(DWC32)) {
+ 		__dwc3_gadget_set_ssp_rate(dwc);
+@@ -2642,6 +2843,17 @@ static void __dwc3_gadget_set_speed(struct dwc3 *dwc)
+ 		reg &= ~DWC3_DCFG_NUMLANES(~0);
+ 
+ 	dwc3_writel(dwc, DWC3_DCFG, reg);
++
++	/*
++	 * Gen1-only PHY (dwc3_force_gen1()): also keep LLUCTL.FORCE_GEN1 set
++	 * after the soft reset done on every soft connect, like the vendor
++	 * kernel, so the link never offers Gen2 in Polling.
++	 */
++	if (DWC3_IP_IS(DWC31) && speed == USB_SPEED_SUPER && dwc3_force_gen1()) {
++		reg = dwc3_readl(dwc, DWC3_LLUCTL(0));
++		if (!(reg & DWC3_LLUCTL_FORCE_GEN1))
++			dwc3_writel(dwc, DWC3_LLUCTL(0), reg | DWC3_LLUCTL_FORCE_GEN1);
++	}
+ }
+ 
+ static int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on)
+@@ -2857,6 +3069,23 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
+ 
+ 	synchronize_irq(dwc->irq_gadget);
+ 
++	if (dwc->hs_hold_mode) {
++		/*
++		 * Vendor: HS pull-up off before Run/Stop, so the SuperSpeed
++		 * link gets the first go. Always released on disconnect.
++		 */
++		cancel_delayed_work_sync(&dwc->hs_hold_timeout);
++		dwc->hs_hold_armed = is_on && dwc->hs_hold_mode != 2 &&
++				     !dwc->hs_hold_hs_only;
++		dwc->hs_hold_ss = false;
++		WRITE_ONCE(dwc->hs_hold_want, dwc->hs_hold_armed);
++		schedule_work(&dwc->hs_hold_work);
++		flush_work(&dwc->hs_hold_work);
++		if (dwc->hs_hold_armed)
++			schedule_delayed_work(&dwc->hs_hold_timeout,
++					      msecs_to_jiffies(DWC3_SS_FIRST_MS));
++	}
++
+ 	/* Serialize against dwc3_err_recovery_work() */
+ 	mutex_lock(&dwc->connect_mutex);
+ 	if (!is_on)
+@@ -2886,6 +3115,10 @@ static void dwc3_gadget_enable_irq(struct dwc3 *dwc)
+ 	if (DWC3_VER_IS_PRIOR(DWC3, 250A))
+ 		reg |= DWC3_DEVTEN_ULSTCNGEN;
+ 
++	/* Exynos9820 SS-first HS pull-up hold follows the link states */
++	if (dwc->hs_hold_mode)
++		reg |= DWC3_DEVTEN_ULSTCNGEN;
++
+ 	/* On 2.30a and above this bit enables U3/L2-L1 Suspend Events */
+ 	if (!DWC3_VER_IS_PRIOR(DWC3, 230A))
+ 		reg |= DWC3_DEVTEN_U3L2L1SUSPEN;
+@@ -4147,6 +4380,9 @@ static void dwc3_gadget_disconnect_interrupt(struct dwc3 *dwc)
+ 
+ 	dwc->suspended = false;
+ 
++	if (dwc->hs_hold_mode >= 2)
++		dwc3_hs_hold(dwc, false);
++
+ 	dwc3_gadget_set_link_state(dwc, DWC3_LINK_STATE_RX_DET);
+ 
+ 	reg = dwc3_readl(dwc, DWC3_DCTL);
+@@ -4184,6 +4420,9 @@ static void dwc3_gadget_reset_interrupt(struct dwc3 *dwc)
+ 	if (dwc->err_state == DWC3_ERR_NONE)
+ 		dwc->err_recovery_count = 0;
+ 
++	if (dwc->hs_hold_mode == 1)
++		dwc3_hs_hold(dwc, false);
++
+ 	/*
+ 	 * Ideally, dwc3_reset_gadget() would trigger the function
+ 	 * drivers to stop any active transfers through ep disable.
+@@ -4271,6 +4510,21 @@ static void dwc3_gadget_conndone_interrupt(struct dwc3 *dwc)
+ 	speed = reg & DWC3_DSTS_CONNECTSPD;
+ 	dwc->speed = speed;
+ 
++	/*
++	 * Vendor: pull-up off again after Connect Done at HS or SS
++	 * (!(speed & 3)); SS only: after SuperSpeed(Plus).
++	 */
++	if (dwc->hs_hold_mode) {
++		dwc->hs_hold_armed = false;
++		dwc->hs_hold_ss = speed >= DWC3_DSTS_SUPERSPEED;
++		if (dwc->hs_hold_mode == 1 ? !(speed & 3) : dwc->hs_hold_ss)
++			dwc3_hs_hold(dwc, true);
++		/* mode 3: fall back to USB 2.0 if SS never gets enumerated */
++		if (dwc->hs_hold_mode == 3 && dwc->hs_hold_ss)
++			mod_delayed_work(system_wq, &dwc->hs_hold_timeout,
++					 msecs_to_jiffies(DWC3_SS_FIRST_ENUM_MS));
++	}
++
+ 	if (DWC3_IP_IS(DWC32))
+ 		lanes = DWC3_DSTS_CONNLANES(reg) + 1;
+ 
+@@ -4406,6 +4660,9 @@ static void dwc3_gadget_wakeup_interrupt(struct dwc3 *dwc, unsigned int evtinfo)
+ {
+ 	dwc->suspended = false;
+ 
++	if (dwc->hs_hold_mode == 1)
++		dwc3_hs_hold(dwc, true);
++
+ 	/*
+ 	 * TODO take core out of low power mode when that's
+ 	 * implemented.
+@@ -4428,6 +4685,31 @@ static void dwc3_gadget_linksts_change_interrupt(struct dwc3 *dwc,
+ 	int			ret;
+ 	int			intf_id;
+ 
++	switch (dwc->hs_hold_mode) {
++	case 1:		/* vendor: U0 (HS: ON), Rx.Detect (HS: early suspend), Resume */
++		if (next == DWC3_LINK_STATE_U0 ||
++		    next == DWC3_LINK_STATE_RX_DET ||
++		    next == DWC3_LINK_STATE_RESUME)
++			dwc3_hs_hold(dwc, false);
++		break;
++	case 2:		/* SS only: the SuperSpeed link went away */
++		if (dwc->speed >= DWC3_DSTS_SUPERSPEED &&
++		    (next == DWC3_LINK_STATE_SS_DIS ||
++		     next == DWC3_LINK_STATE_RX_DET ||
++		     next == DWC3_LINK_STATE_SS_INACT))
++			dwc3_hs_hold(dwc, false);
++		break;
++	case 3:		/* hold: SS link lost after Connect Done -> USB 2.0 */
++		if (dwc->hs_hold_ss &&
++		    (next == DWC3_LINK_STATE_SS_DIS ||
++		     next == DWC3_LINK_STATE_SS_INACT)) {
++			dwc->hs_hold_ss = false;
++			dwc3_hs_hold(dwc, false);
++			dwc3_hs_fallback(dwc, "SuperSpeed link lost");
++		}
++		break;
++	}
++
+ 	/*
+ 	 * WORKAROUND: DWC3 < 2.50a have an issue when configured without
+ 	 * Hibernation mode enabled which would show up when device detects
+@@ -4855,6 +5137,8 @@ int dwc3_gadget_init(struct dwc3 *dwc)
+ 
+ 	dwc->irq_gadget = irq;
+ 
++	dwc3_hs_hold_init(dwc);
++
+ 	dwc->ep0_trb = dma_alloc_coherent(dwc->sysdev,
+ 					  sizeof(*dwc->ep0_trb) * 2,
+ 					  &dwc->ep0_trb_addr, GFP_KERNEL);
+@@ -4976,6 +5260,7 @@ void dwc3_gadget_exit(struct dwc3 *dwc)
+ 	if (!dwc->gadget)
+ 		return;
+ 
++	dwc3_hs_hold_exit(dwc);
+ 	cancel_work_sync(&dwc->err_recovery_work);
+ 	mutex_destroy(&dwc->connect_mutex);
+ 	dwc3_enable_susphy(dwc, true);
+diff --git a/drivers/usb/dwc3/host.c b/drivers/usb/dwc3/host.c
+index c5674161b2..c272d33a6e 100644
+--- a/drivers/usb/dwc3/host.c
++++ b/drivers/usb/dwc3/host.c
+@@ -76,6 +76,9 @@ static void dwc3_xhci_plat_start(struct usb_hcd *hcd)
+ 	dwc = dev_get_drvdata(pdev->dev.parent);
+ 
+ 	dwc3_enable_susphy(dwc, true);
++
++	/* after the xHCI reset/start: Exynos9820 ref clock + USB2 PHY set */
++	dwc3_exynos9820_hostfix_apply(dwc);
+ }
+ 
+ static const struct xhci_plat_priv dwc3_xhci_plat_quirk = {

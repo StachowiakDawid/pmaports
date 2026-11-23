@@ -1,0 +1,115 @@
+From 8f19aac6f1505e589f1164e95105f9c18186ec0a Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] rtc: s3c: add Exynos9820 support
+
+The Exynos 9820 APM-domain RTC is register compatible with the S3C6410
+RTC, but it has no separate source clock and its APB clock must stay
+on: the APM firmware reads it as well, and the vendor driver never
+gates it. Add a compatible with needs_src_clk=false and a
+clk_always_on flag that keeps the bus clock enabled for the lifetime
+of the device. The binding entry is part of this commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ .../devicetree/bindings/rtc/s3c-rtc.yaml      |  3 +++
+ drivers/rtc/rtc-s3c.c                         | 25 +++++++++++++++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/rtc/s3c-rtc.yaml b/Documentation/devicetree/bindings/rtc/s3c-rtc.yaml
+index 338874e7ed..f962d3624f 100644
+--- a/Documentation/devicetree/bindings/rtc/s3c-rtc.yaml
++++ b/Documentation/devicetree/bindings/rtc/s3c-rtc.yaml
+@@ -13,6 +13,7 @@ properties:
+   compatible:
+     oneOf:
+       - enum:
++          - samsung,exynos9820-rtc
+           - samsung,s3c6410-rtc
+       - items:
+           - enum:
+@@ -26,9 +27,11 @@ properties:
+     maxItems: 1
+ 
+   clocks:
++    minItems: 1
+     maxItems: 2
+ 
+   clock-names:
++    minItems: 1
+     items:
+       - const: rtc
+       - const: rtc_src
+diff --git a/drivers/rtc/rtc-s3c.c b/drivers/rtc/rtc-s3c.c
+index 221a9461db..61e5499802 100644
+--- a/drivers/rtc/rtc-s3c.c
++++ b/drivers/rtc/rtc-s3c.c
+@@ -48,6 +48,13 @@ struct s3c_rtc {
+ 
+ struct s3c_rtc_data {
+ 	bool needs_src_clk;
++	/*
++	 * Keep the bus clock enabled for the lifetime of the device instead of
++	 * gating it between register accesses. On Exynos9820 the RTC lives in
++	 * the APM block and is also read by the APM firmware, so the AP must not
++	 * gate its APB clock.
++	 */
++	bool clk_always_on;
+ 
+ 	void (*irq_handler) (struct s3c_rtc *info, int mask);
+ 	void (*enable) (struct s3c_rtc *info);
+@@ -58,6 +65,9 @@ static int s3c_rtc_enable_clk(struct s3c_rtc *info)
+ {
+ 	int ret;
+ 
++	if (info->data->clk_always_on)
++		return 0;
++
+ 	ret = clk_enable(info->rtc_clk);
+ 	if (ret)
+ 		return ret;
+@@ -74,6 +84,9 @@ static int s3c_rtc_enable_clk(struct s3c_rtc *info)
+ 
+ static void s3c_rtc_disable_clk(struct s3c_rtc *info)
+ {
++	if (info->data->clk_always_on)
++		return;
++
+ 	if (info->data->needs_src_clk)
+ 		clk_disable(info->rtc_src_clk);
+ 	clk_disable(info->rtc_clk);
+@@ -377,6 +390,8 @@ static void s3c_rtc_remove(struct platform_device *pdev)
+ 
+ 	s3c_rtc_setaie(info->dev, 0);
+ 
++	if (info->data->clk_always_on)
++		clk_disable(info->rtc_clk);
+ 	if (info->data->needs_src_clk)
+ 		clk_unprepare(info->rtc_src_clk);
+ 	clk_unprepare(info->rtc_clk);
+@@ -538,6 +553,13 @@ static const struct s3c_rtc_data s3c6410_rtc_data = {
+ 	.disable		= s3c6410_rtc_disable,
+ };
+ 
++static const struct s3c_rtc_data exynos9820_rtc_data = {
++	.clk_always_on		= true,
++	.irq_handler		= s3c6410_rtc_irq,
++	.enable			= s3c6410_rtc_enable,
++	.disable		= s3c6410_rtc_disable,
++};
++
+ static const __maybe_unused struct of_device_id s3c_rtc_dt_match[] = {
+ 	{
+ 		.compatible = "samsung,s3c6410-rtc",
+@@ -545,6 +567,9 @@ static const __maybe_unused struct of_device_id s3c_rtc_dt_match[] = {
+ 	}, {
+ 		.compatible = "samsung,exynos3250-rtc",
+ 		.data = &s3c6410_rtc_data,
++	}, {
++		.compatible = "samsung,exynos9820-rtc",
++		.data = &exynos9820_rtc_data,
+ 	},
+ 	{ /* sentinel */ },
+ };

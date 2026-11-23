@@ -1,0 +1,993 @@
+From 1d562c4f30cdbb16bf3586d112f28d2b5a9878cf Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] leds, regulator: add Samsung S2MPB02 flash LED and S2MPB02/03
+ regulators
+
+Camera PMICs of the Galaxy S10 family:
+
+ - leds-s2mpb02: I2C driver for the flash LED channel of the S2MPB02.
+   The torch is the LED class brightness (N x 20 mA, up to
+   led-max-microamp), flash uses the LED flash class (N x 100 + 50 mA,
+   hardware-timed timeout). As in the vendor driver the current is
+   programmed over I2C and the TORCH/FLASH input pins switch the
+   output; without the GPIOs the FLED_CTRL1 enable/mode bits are used.
+ - s2mpb02-regulator: bucks, buck-boost and LDOs of the S2MPB02. The
+   I2C client stays with the flash LED driver; this platform driver
+   points at the chip with samsung,pmic and shares its regmap. Only
+   regulators described in the DT are registered. Buck "disable"
+   restores the reset value of the enable field, the state the
+   bootloader leaves.
+ - s2mpb03-regulator: I2C driver for the seven LDOs of the S2MPB03,
+   with input supplies for the low-voltage and analog LDOs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/leds/flash/Kconfig            |  13 +
+ drivers/leds/flash/Makefile           |   1 +
+ drivers/leds/flash/leds-s2mpb02.c     | 421 ++++++++++++++++++++++++++
+ drivers/regulator/Kconfig             |  17 ++
+ drivers/regulator/Makefile            |   2 +
+ drivers/regulator/s2mpb02-regulator.c | 221 ++++++++++++++
+ drivers/regulator/s2mpb03-regulator.c | 217 +++++++++++++
+ 7 files changed, 892 insertions(+)
+ create mode 100644 drivers/leds/flash/leds-s2mpb02.c
+ create mode 100644 drivers/regulator/s2mpb02-regulator.c
+ create mode 100644 drivers/regulator/s2mpb03-regulator.c
+
+diff --git a/drivers/leds/flash/Kconfig b/drivers/leds/flash/Kconfig
+index 9b6dd3f1ff..1b0bcfdecb 100644
+--- a/drivers/leds/flash/Kconfig
++++ b/drivers/leds/flash/Kconfig
+@@ -125,6 +125,19 @@ config LEDS_S2M_FLASH
+ 	  dedicated for every physical LED. The LEDs can be controlled in flash
+ 	  and torch modes.
+ 
++config LEDS_S2MPB02
++	tristate "Samsung S2MPB02 flash/torch LED support"
++	depends on I2C && OF
++	depends on GPIOLIB || COMPILE_TEST
++	select REGMAP_I2C
++	help
++	  This option enables support for the flash LED channel of the
++	  Samsung S2MPB02 camera PMIC, used for the rear flash/torch of the
++	  Galaxy S10 family (Exynos 9820). Torch brightness is the LED class
++	  brightness, flash is driven through the LED flash class.
++
++	  This driver can be built as a module, it will be called leds-s2mpb02.
++
+ config LEDS_SGM3140
+ 	tristate "LED support for the SGM3140"
+ 	depends on V4L2_FLASH_LED_CLASS || !V4L2_FLASH_LED_CLASS
+diff --git a/drivers/leds/flash/Makefile b/drivers/leds/flash/Makefile
+index 44e6c1b4be..196a4e4040 100644
+--- a/drivers/leds/flash/Makefile
++++ b/drivers/leds/flash/Makefile
+@@ -11,6 +11,7 @@ obj-$(CONFIG_LEDS_QCOM_FLASH)	+= leds-qcom-flash.o
+ obj-$(CONFIG_LEDS_RT4505)	+= leds-rt4505.o
+ obj-$(CONFIG_LEDS_RT8515)	+= leds-rt8515.o
+ obj-$(CONFIG_LEDS_S2M_FLASH)	+= leds-s2m-flash.o
++obj-$(CONFIG_LEDS_S2MPB02)	+= leds-s2mpb02.o
+ obj-$(CONFIG_LEDS_SGM3140)	+= leds-sgm3140.o
+ obj-$(CONFIG_LEDS_SY7802)	+= leds-sy7802.o
+ obj-$(CONFIG_LEDS_TPS6131X)	+= leds-tps6131x.o
+diff --git a/drivers/leds/flash/leds-s2mpb02.c b/drivers/leds/flash/leds-s2mpb02.c
+new file mode 100644
+index 0000000000..a229f61a37
+--- /dev/null
++++ b/drivers/leds/flash/leds-s2mpb02.c
+@@ -0,0 +1,421 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Flash/torch LED driver for the Samsung S2MPB02 camera PMIC.
++ *
++ * The S2MPB02 is a camera power IC (2 bucks, a buck-boost, 18 LDOs) with
++ * one flash LED channel. Only the flash LED block is handled here; the
++ * regulators are left in the state the bootloader programmed.
++ *
++ * The LED is controlled the way the vendor kernel does it: FLED_CTRL1 has
++ * the I2C enable bits cleared ("GPIO mode"), the current is programmed in
++ * FLED_CUR1, and the TORCH / FLASH input pins switch the output. When the
++ * GPIOs are not described the I2C enable/mode bits are used instead.
++ *
++ * Register layout from the Samsung SM-G975F kernel (drivers/leds/leds-s2mpb02.c):
++ *   FLED_CTRL1 0x12: [7] enable (I2C), [6] mode (0 flash, 1 torch), [3] LV_EN
++ *   FLED_CUR1  0x14: [7:4] flash current N*100+50 mA, [3:0] torch N*20 mA
++ *   FLED_TIME1 0x15: [7:4] flash timeout (N+1)*62.5 ms, [3:0] torch timeout
++ */
++
++#include <linux/bitfield.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/led-class-flash.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/property.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++#define S2MPB02_REG_ID			0x00
++#define S2MPB02_REG_INT1		0x01
++#define S2MPB02_REG_FLED_CTRL1		0x12
++#define S2MPB02_REG_FLED_CTRL2		0x13
++#define S2MPB02_REG_FLED_CUR1		0x14
++#define S2MPB02_REG_FLED_TIME1		0x15
++#define S2MPB02_REG_FLED_IRD2		0x1b
++#define S2MPB02_REG_BST_CTRL2		0x1d
++
++#define S2MPB02_FLED_CTRL1_EN		BIT(7)
++#define S2MPB02_FLED_CTRL1_TORCH	BIT(6)
++#define S2MPB02_FLED_CTRL1_LV_EN	BIT(3)
++#define S2MPB02_FLED_CTRL1_MODE_MASK	(S2MPB02_FLED_CTRL1_EN | S2MPB02_FLED_CTRL1_TORCH)
++#define S2MPB02_FLED_CTRL2_LOW_MASK	GENMASK(3, 0)
++#define S2MPB02_FLED_CTRL2_LOW_INIT	0x4	/* vendor init value */
++#define S2MPB02_FLED_FLASH_MASK		GENMASK(7, 4)
++#define S2MPB02_FLED_TORCH_MASK		GENMASK(3, 0)
++#define S2MPB02_FLED_IRD2_DISCHARGE	BIT(1)	/* active discharge, no faint glow */
++
++/* Torch: N * 20 mA, N = 1..15 */
++#define S2MPB02_TORCH_STEP_UA		20000
++#define S2MPB02_TORCH_MAX_LEVEL		15
++#define S2MPB02_TORCH_DEFAULT_UA	240000
++/* Flash: N * 100 mA + 50 mA, N = 1..15 */
++#define S2MPB02_FLASH_MIN_UA		150000
++#define S2MPB02_FLASH_STEP_UA		100000
++#define S2MPB02_FLASH_MAX_UA		1550000
++#define S2MPB02_FLASH_DEFAULT_UA	1250000
++/* Flash timeout: (N + 1) * 62.5 ms, N = 0..15 */
++#define S2MPB02_TIMEOUT_STEP_US		62500
++#define S2MPB02_TIMEOUT_MAX_US		1000000
++#define S2MPB02_TIMEOUT_DEFAULT_US	500000
++#define S2MPB02_TORCH_TIMEOUT_CODE	0xf	/* vendor value */
++
++enum s2mpb02_out { S2MPB02_OFF, S2MPB02_TORCH, S2MPB02_FLASH };
++
++struct s2mpb02_led {
++	struct led_classdev_flash fled;
++	struct device *dev;
++	struct regmap *regmap;
++	struct gpio_desc *torch_gpio;
++	struct gpio_desc *flash_gpio;
++	struct delayed_work flash_off_work;
++	struct mutex lock;		/* registers, GPIOs and the fields below */
++	bool i2c_mode;
++	bool strobing;
++	u8 torch_level;			/* 0 = off */
++	u8 flash_code;
++	u32 flash_timeout_us;
++};
++
++static struct s2mpb02_led *fled_to_s2mpb02(struct led_classdev_flash *fled)
++{
++	return container_of(fled, struct s2mpb02_led, fled);
++}
++
++static void s2mpb02_set_pins(struct s2mpb02_led *led, int torch, int flash)
++{
++	if (led->i2c_mode)
++		return;
++	gpiod_set_value_cansleep(led->torch_gpio, torch);
++	gpiod_set_value_cansleep(led->flash_gpio, flash);
++}
++
++/* Must be called with led->lock held. */
++static int s2mpb02_output(struct s2mpb02_led *led, enum s2mpb02_out out)
++{
++	unsigned int mode = 0;
++	int ret;
++
++	/* Always go through "off" so that both pins are never high. */
++	s2mpb02_set_pins(led, 0, 0);
++	ret = regmap_update_bits(led->regmap, S2MPB02_REG_FLED_CTRL1,
++				 S2MPB02_FLED_CTRL1_MODE_MASK, 0);
++	if (ret || out == S2MPB02_OFF)
++		return ret;
++
++	if (out == S2MPB02_TORCH) {
++		ret = regmap_update_bits(led->regmap, S2MPB02_REG_FLED_CUR1,
++					 S2MPB02_FLED_TORCH_MASK,
++					 FIELD_PREP(S2MPB02_FLED_TORCH_MASK, led->torch_level));
++		mode = S2MPB02_FLED_CTRL1_EN | S2MPB02_FLED_CTRL1_TORCH;
++	} else {
++		ret = regmap_update_bits(led->regmap, S2MPB02_REG_FLED_CUR1,
++					 S2MPB02_FLED_FLASH_MASK,
++					 FIELD_PREP(S2MPB02_FLED_FLASH_MASK, led->flash_code));
++		mode = S2MPB02_FLED_CTRL1_EN;
++	}
++	if (ret)
++		return ret;
++
++	if (led->i2c_mode)
++		return regmap_update_bits(led->regmap, S2MPB02_REG_FLED_CTRL1,
++					  S2MPB02_FLED_CTRL1_MODE_MASK, mode);
++
++	if (out == S2MPB02_TORCH)
++		s2mpb02_set_pins(led, 1, 0);
++	else
++		s2mpb02_set_pins(led, 0, 1);
++	return 0;
++}
++
++static int s2mpb02_torch_set(struct led_classdev *cdev,
++			     enum led_brightness brightness)
++{
++	struct s2mpb02_led *led = fled_to_s2mpb02(lcdev_to_flcdev(cdev));
++	int ret = 0;
++
++	mutex_lock(&led->lock);
++	led->torch_level = brightness;
++	/* While a flash strobe runs, the torch state is restored after it. */
++	if (!led->strobing)
++		ret = s2mpb02_output(led, brightness ? S2MPB02_TORCH : S2MPB02_OFF);
++	mutex_unlock(&led->lock);
++
++	return ret;
++}
++
++static void s2mpb02_flash_off_work(struct work_struct *work)
++{
++	struct s2mpb02_led *led = container_of(to_delayed_work(work),
++					       struct s2mpb02_led, flash_off_work);
++
++	mutex_lock(&led->lock);
++	if (led->strobing) {
++		led->strobing = false;
++		s2mpb02_output(led, led->torch_level ? S2MPB02_TORCH : S2MPB02_OFF);
++	}
++	mutex_unlock(&led->lock);
++}
++
++static int s2mpb02_flash_brightness_set(struct led_classdev_flash *fled,
++					u32 brightness)
++{
++	struct s2mpb02_led *led = fled_to_s2mpb02(fled);
++
++	mutex_lock(&led->lock);
++	led->flash_code = (brightness - 50000) / S2MPB02_FLASH_STEP_UA;
++	mutex_unlock(&led->lock);
++
++	return 0;
++}
++
++static int s2mpb02_timeout_set(struct led_classdev_flash *fled, u32 timeout)
++{
++	struct s2mpb02_led *led = fled_to_s2mpb02(fled);
++	int ret;
++
++	mutex_lock(&led->lock);
++	led->flash_timeout_us = timeout;
++	ret = regmap_update_bits(led->regmap, S2MPB02_REG_FLED_TIME1,
++				 S2MPB02_FLED_FLASH_MASK,
++				 FIELD_PREP(S2MPB02_FLED_FLASH_MASK,
++					    timeout / S2MPB02_TIMEOUT_STEP_US - 1));
++	mutex_unlock(&led->lock);
++
++	return ret;
++}
++
++static int s2mpb02_strobe_set(struct led_classdev_flash *fled, bool state)
++{
++	struct s2mpb02_led *led = fled_to_s2mpb02(fled);
++	int ret;
++
++	mutex_lock(&led->lock);
++	cancel_delayed_work(&led->flash_off_work);
++	if (state) {
++		ret = s2mpb02_output(led, S2MPB02_FLASH);
++		led->strobing = !ret;
++		/* The PMIC times out by itself; this only restores the torch. */
++		if (!ret)
++			schedule_delayed_work(&led->flash_off_work,
++					      usecs_to_jiffies(led->flash_timeout_us) + 1);
++	} else {
++		led->strobing = false;
++		ret = s2mpb02_output(led, led->torch_level ? S2MPB02_TORCH : S2MPB02_OFF);
++	}
++	mutex_unlock(&led->lock);
++
++	return ret;
++}
++
++static int s2mpb02_strobe_get(struct led_classdev_flash *fled, bool *state)
++{
++	struct s2mpb02_led *led = fled_to_s2mpb02(fled);
++
++	mutex_lock(&led->lock);
++	*state = led->strobing;
++	mutex_unlock(&led->lock);
++
++	return 0;
++}
++
++static const struct led_flash_ops s2mpb02_flash_ops = {
++	.flash_brightness_set	= s2mpb02_flash_brightness_set,
++	.strobe_set		= s2mpb02_strobe_set,
++	.strobe_get		= s2mpb02_strobe_get,
++	.timeout_set		= s2mpb02_timeout_set,
++};
++
++static void s2mpb02_led_off(void *data)
++{
++	struct s2mpb02_led *led = data;
++
++	cancel_delayed_work_sync(&led->flash_off_work);
++	mutex_lock(&led->lock);
++	led->strobing = false;
++	led->torch_level = 0;
++	s2mpb02_output(led, S2MPB02_OFF);
++	mutex_unlock(&led->lock);
++}
++
++static const struct regmap_config s2mpb02_regmap_config = {
++	.reg_bits	= 8,
++	.val_bits	= 8,
++	.max_register	= 0xff,
++};
++
++static int s2mpb02_hw_init(struct s2mpb02_led *led, u32 timeout_us)
++{
++	int ret;
++
++	/* Low-voltage mode off, I2C enable/mode bits off (pins control it). */
++	ret = regmap_update_bits(led->regmap, S2MPB02_REG_FLED_CTRL1,
++				 S2MPB02_FLED_CTRL1_MODE_MASK | S2MPB02_FLED_CTRL1_LV_EN, 0);
++	if (ret)
++		return ret;
++	ret = regmap_write(led->regmap, S2MPB02_REG_FLED_CUR1,
++			   FIELD_PREP(S2MPB02_FLED_FLASH_MASK, led->flash_code) |
++			   FIELD_PREP(S2MPB02_FLED_TORCH_MASK, 1));
++	if (ret)
++		return ret;
++	ret = regmap_write(led->regmap, S2MPB02_REG_FLED_TIME1,
++			   FIELD_PREP(S2MPB02_FLED_FLASH_MASK,
++				      timeout_us / S2MPB02_TIMEOUT_STEP_US - 1) |
++			   FIELD_PREP(S2MPB02_FLED_TORCH_MASK, S2MPB02_TORCH_TIMEOUT_CODE));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(led->regmap, S2MPB02_REG_FLED_CTRL2,
++				 S2MPB02_FLED_CTRL2_LOW_MASK, S2MPB02_FLED_CTRL2_LOW_INIT);
++	if (ret)
++		return ret;
++	return regmap_update_bits(led->regmap, S2MPB02_REG_FLED_IRD2,
++				  S2MPB02_FLED_IRD2_DISCHARGE,
++				  S2MPB02_FLED_IRD2_DISCHARGE);
++}
++
++static int s2mpb02_led_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct led_init_data init_data = {};
++	struct fwnode_handle *child;
++	struct led_classdev *cdev;
++	struct s2mpb02_led *led;
++	unsigned int id, bst, v[4];
++	u32 torch_ua = S2MPB02_TORCH_DEFAULT_UA;
++	u32 flash_ua = S2MPB02_FLASH_DEFAULT_UA;
++	u32 timeout_us = S2MPB02_TIMEOUT_DEFAULT_US;
++	int ret;
++
++	led = devm_kzalloc(dev, sizeof(*led), GFP_KERNEL);
++	if (!led)
++		return -ENOMEM;
++	led->dev = dev;
++
++	led->regmap = devm_regmap_init_i2c(client, &s2mpb02_regmap_config);
++	if (IS_ERR(led->regmap))
++		return dev_err_probe(dev, PTR_ERR(led->regmap), "regmap init failed\n");
++
++	ret = regmap_read(led->regmap, S2MPB02_REG_ID, &id);
++	if (!ret)
++		ret = regmap_read(led->regmap, S2MPB02_REG_BST_CTRL2, &bst);
++	if (ret)
++		return dev_err_probe(dev, ret, "no S2MPB02 at 0x%02x\n", client->addr);
++
++	regmap_read(led->regmap, S2MPB02_REG_FLED_CTRL1, &v[0]);
++	regmap_read(led->regmap, S2MPB02_REG_FLED_CTRL2, &v[1]);
++	regmap_read(led->regmap, S2MPB02_REG_FLED_CUR1, &v[2]);
++	regmap_read(led->regmap, S2MPB02_REG_FLED_TIME1, &v[3]);
++	dev_info(dev, "ID 0x%02x rev %d, FLED CTRL1 0x%02x CTRL2 0x%02x CUR1 0x%02x TIME1 0x%02x\n",
++		 id, bst == 0x90, v[0], v[1], v[2], v[3]);
++
++	child = device_get_next_child_node(dev, NULL);
++	if (!child)
++		return dev_err_probe(dev, -ENODEV, "no LED child node\n");
++
++	fwnode_property_read_u32(child, "led-max-microamp", &torch_ua);
++	fwnode_property_read_u32(child, "flash-max-microamp", &flash_ua);
++	fwnode_property_read_u32(child, "flash-max-timeout-us", &timeout_us);
++	torch_ua = clamp(torch_ua, S2MPB02_TORCH_STEP_UA,
++			 S2MPB02_TORCH_MAX_LEVEL * S2MPB02_TORCH_STEP_UA);
++	flash_ua = clamp(flash_ua, S2MPB02_FLASH_MIN_UA, S2MPB02_FLASH_MAX_UA);
++	timeout_us = clamp(timeout_us, S2MPB02_TIMEOUT_STEP_US, S2MPB02_TIMEOUT_MAX_US);
++
++	led->torch_gpio = devm_gpiod_get_optional(dev, "torch", GPIOD_OUT_LOW);
++	if (IS_ERR(led->torch_gpio)) {
++		ret = dev_err_probe(dev, PTR_ERR(led->torch_gpio), "torch GPIO\n");
++		goto err_put;
++	}
++	led->flash_gpio = devm_gpiod_get_optional(dev, "flash", GPIOD_OUT_LOW);
++	if (IS_ERR(led->flash_gpio)) {
++		ret = dev_err_probe(dev, PTR_ERR(led->flash_gpio), "flash GPIO\n");
++		goto err_put;
++	}
++	led->i2c_mode = !led->torch_gpio || !led->flash_gpio;
++
++	mutex_init(&led->lock);
++	INIT_DELAYED_WORK(&led->flash_off_work, s2mpb02_flash_off_work);
++	led->flash_code = (flash_ua - 50000) / S2MPB02_FLASH_STEP_UA;
++	led->flash_timeout_us = timeout_us -
++				timeout_us % S2MPB02_TIMEOUT_STEP_US;
++
++	ret = s2mpb02_hw_init(led, led->flash_timeout_us);
++	if (ret) {
++		dev_err_probe(dev, ret, "FLED init failed\n");
++		goto err_put;
++	}
++
++	/* Runs after the LED class device is gone (devm order). */
++	ret = devm_add_action_or_reset(dev, s2mpb02_led_off, led);
++	if (ret)
++		goto err_put;
++
++	led->fled.ops = &s2mpb02_flash_ops;
++	led->fled.brightness.min = S2MPB02_FLASH_MIN_UA;
++	led->fled.brightness.max = flash_ua - (flash_ua - S2MPB02_FLASH_MIN_UA) %
++				   S2MPB02_FLASH_STEP_UA;
++	led->fled.brightness.step = S2MPB02_FLASH_STEP_UA;
++	led->fled.brightness.val = led->fled.brightness.max;
++	led->fled.timeout.min = S2MPB02_TIMEOUT_STEP_US;
++	led->fled.timeout.max = led->flash_timeout_us;
++	led->fled.timeout.step = S2MPB02_TIMEOUT_STEP_US;
++	led->fled.timeout.val = led->flash_timeout_us;
++
++	cdev = &led->fled.led_cdev;
++	cdev->max_brightness = torch_ua / S2MPB02_TORCH_STEP_UA;
++	cdev->brightness_set_blocking = s2mpb02_torch_set;
++	cdev->flags |= LED_CORE_SUSPENDRESUME;
++
++	init_data.fwnode = child;
++	init_data.default_label = "white:flash";
++	ret = devm_led_classdev_flash_register_ext(dev, &led->fled, &init_data);
++	if (ret) {
++		dev_err_probe(dev, ret, "LED register failed\n");
++		goto err_put;
++	}
++
++	i2c_set_clientdata(client, led);
++	dev_info(dev, "%s: torch %u mA (%u levels), flash %u mA, %u ms, %s control\n",
++		 cdev->name, torch_ua / 1000, cdev->max_brightness,
++		 led->fled.brightness.max / 1000, led->flash_timeout_us / 1000,
++		 led->i2c_mode ? "I2C" : "GPIO");
++	ret = 0;
++err_put:
++	fwnode_handle_put(child);
++	return ret;
++}
++
++static void s2mpb02_led_shutdown(struct i2c_client *client)
++{
++	struct s2mpb02_led *led = i2c_get_clientdata(client);
++
++	if (led)
++		s2mpb02_led_off(led);
++}
++
++static const struct of_device_id s2mpb02_led_of_match[] = {
++	{ .compatible = "samsung,s2mpb02" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, s2mpb02_led_of_match);
++
++static const struct i2c_device_id s2mpb02_led_id[] = {
++	{ "s2mpb02" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, s2mpb02_led_id);
++
++static struct i2c_driver s2mpb02_led_driver = {
++	.driver = {
++		.name = "leds-s2mpb02",
++		.of_match_table = s2mpb02_led_of_match,
++	},
++	.probe = s2mpb02_led_probe,
++	.shutdown = s2mpb02_led_shutdown,
++	.id_table = s2mpb02_led_id,
++};
++module_i2c_driver(s2mpb02_led_driver);
++
++MODULE_DESCRIPTION("Samsung S2MPB02 flash/torch LED driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index 83a76b78e5..cba330088e 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -1480,6 +1480,23 @@ config REGULATOR_S2MPA01
+ 	 This driver controls Samsung S2MPA01 voltage output regulator
+ 	 via I2C bus. S2MPA01 has 10 Bucks and 26 LDO outputs.
+ 
++config REGULATOR_S2MPB02
++	tristate "Samsung S2MPB02 camera PMIC regulators"
++	depends on I2C && OF
++	select REGMAP_I2C
++	help
++	  Regulators (bucks, buck-boost and LDOs) of the Samsung S2MPB02
++	  camera power IC, e.g. on the Galaxy S10 family. The chip itself is
++	  bound by the flash LED driver (LEDS_S2MPB02), whose regmap is shared.
++
++config REGULATOR_S2MPB03
++	tristate "Samsung S2MPB03 camera PMIC regulators"
++	depends on I2C && OF
++	select REGMAP_I2C
++	help
++	  Seven LDOs of the Samsung S2MPB03 camera power IC, e.g. the rear
++	  wide camera supplies of the Galaxy S10 family.
++
+ config REGULATOR_S2MPS11
+ 	tristate "Samsung S2MPS11/13/14/15/S2MPU02/05 voltage regulator"
+ 	depends on MFD_SEC_CORE || COMPILE_TEST
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 6aabcc5438..1dd9a9fc7c 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -170,6 +170,8 @@ obj-$(CONFIG_REGULATOR_RTQ6752)	+= rtq6752-regulator.o
+ obj-$(CONFIG_REGULATOR_RTQ2208) += rtq2208-regulator.o
+ obj-$(CONFIG_REGULATOR_S2DOS05) += s2dos05-regulator.o
+ obj-$(CONFIG_REGULATOR_S2MPA01) += s2mpa01.o
++obj-$(CONFIG_REGULATOR_S2MPB02) += s2mpb02-regulator.o
++obj-$(CONFIG_REGULATOR_S2MPB03) += s2mpb03-regulator.o
+ obj-$(CONFIG_REGULATOR_S2MPS11) += s2mps11.o
+ obj-$(CONFIG_REGULATOR_S5M8767) += s5m8767.o
+ obj-$(CONFIG_REGULATOR_SC2730) += sc2730-regulator.o
+diff --git a/drivers/regulator/s2mpb02-regulator.c b/drivers/regulator/s2mpb02-regulator.c
+new file mode 100644
+index 0000000000..b6649fa7ff
+--- /dev/null
++++ b/drivers/regulator/s2mpb02-regulator.c
+@@ -0,0 +1,221 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Regulators of the Samsung S2MPB02 camera PMIC (2 bucks, 1 buck-boost,
++ * 18 LDOs).
++ *
++ * The I2C client of the chip is owned by the flash LED driver
++ * (leds-s2mpb02). This driver binds to a separate platform node that points
++ * at the chip with "samsung,pmic" and shares the regmap of the LED driver.
++ *
++ * Register layout from the Samsung SM-G975F kernel
++ * (drivers/regulator/s2mpb02-regulator.c, include/linux/mfd/samsung/
++ * s2mpb02-regulator.h):
++ *   BxCTRL1 [7:6] enable, BxCTRL2 [7:0] voltage
++ *   LxCTRL  [7] enable, [6:0] voltage
++ *
++ * The bucks come out of reset with the enable field at 01; the vendor
++ * kernel writes 11 to enable and 00 to disable. To stay as close as
++ * possible to the state the boot loader leaves (which the flash LED is
++ * known to work with), "disable" puts the reset value 01 back and only 11
++ * counts as enabled.
++ */
++
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++#include <linux/regulator/of_regulator.h>
++
++#define S2MPB02_REG_B1CTRL1	0x0b
++#define S2MPB02_REG_B1CTRL2	0x0c
++#define S2MPB02_REG_B2CTRL1	0x0d
++#define S2MPB02_REG_B2CTRL2	0x0e
++#define S2MPB02_REG_BB1CTRL1	0x0f
++#define S2MPB02_REG_BB1CTRL2	0x10
++#define S2MPB02_REG_L1CTRL	0x1e
++
++#define S2MPB02_BUCK_EN_MASK	GENMASK(7, 6)
++#define S2MPB02_BUCK_EN_ON	(3 << 6)
++#define S2MPB02_BUCK_EN_DEFAULT	(1 << 6)
++#define S2MPB02_LDO_EN		BIT(7)
++#define S2MPB02_LDO_VSEL_MASK	GENMASK(6, 0)
++
++static int s2mpb02_buck_enable(struct regulator_dev *rdev)
++{
++	return regmap_update_bits(rdev->regmap, rdev->desc->enable_reg,
++				  S2MPB02_BUCK_EN_MASK, S2MPB02_BUCK_EN_ON);
++}
++
++static int s2mpb02_buck_disable(struct regulator_dev *rdev)
++{
++	return regmap_update_bits(rdev->regmap, rdev->desc->enable_reg,
++				  S2MPB02_BUCK_EN_MASK,
++				  S2MPB02_BUCK_EN_DEFAULT);
++}
++
++static int s2mpb02_buck_is_enabled(struct regulator_dev *rdev)
++{
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(rdev->regmap, rdev->desc->enable_reg, &val);
++	if (ret)
++		return ret;
++
++	return (val & S2MPB02_BUCK_EN_MASK) == S2MPB02_BUCK_EN_ON;
++}
++
++static const struct regulator_ops s2mpb02_buck_ops = {
++	.list_voltage		= regulator_list_voltage_linear,
++	.map_voltage		= regulator_map_voltage_linear,
++	.is_enabled		= s2mpb02_buck_is_enabled,
++	.enable			= s2mpb02_buck_enable,
++	.disable		= s2mpb02_buck_disable,
++	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
++	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
++	.set_voltage_time_sel	= regulator_set_voltage_time_sel,
++};
++
++static const struct regulator_ops s2mpb02_ldo_ops = {
++	.list_voltage		= regulator_list_voltage_linear,
++	.map_voltage		= regulator_map_voltage_linear,
++	.is_enabled		= regulator_is_enabled_regmap,
++	.enable			= regulator_enable_regmap,
++	.disable		= regulator_disable_regmap,
++	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
++	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
++	.set_voltage_time_sel	= regulator_set_voltage_time_sel,
++};
++
++#define S2MPB02_BUCK(_name, _id, _ctrl1, _min, _step, _time) {		\
++	.name		= _name,					\
++	.of_match	= _name,					\
++	.regulators_node = "regulators",				\
++	.id		= _id,						\
++	.ops		= &s2mpb02_buck_ops,				\
++	.type		= REGULATOR_VOLTAGE,				\
++	.owner		= THIS_MODULE,					\
++	.min_uV		= _min,						\
++	.uV_step	= _step,					\
++	.n_voltages	= 256,						\
++	.ramp_delay	= 12000,					\
++	.vsel_reg	= (_ctrl1) + 1,					\
++	.vsel_mask	= 0xff,						\
++	.enable_reg	= _ctrl1,					\
++	.enable_time	= _time,					\
++}
++
++#define S2MPB02_LDO(_n, _step) {					\
++	.name		= "ldo" #_n,					\
++	.of_match	= "ldo" #_n,					\
++	.regulators_node = "regulators",				\
++	.id		= _n,						\
++	.ops		= &s2mpb02_ldo_ops,				\
++	.type		= REGULATOR_VOLTAGE,				\
++	.owner		= THIS_MODULE,					\
++	.min_uV		= 600000,					\
++	.uV_step	= _step,					\
++	.n_voltages	= 128,						\
++	.ramp_delay	= 12000,					\
++	.vsel_reg	= S2MPB02_REG_L1CTRL + (_n) - 1,		\
++	.vsel_mask	= S2MPB02_LDO_VSEL_MASK,			\
++	.enable_reg	= S2MPB02_REG_L1CTRL + (_n) - 1,		\
++	.enable_mask	= S2MPB02_LDO_EN,				\
++	.enable_time	= 180,						\
++}
++
++static const struct regulator_desc s2mpb02_regulators[] = {
++	S2MPB02_LDO(1, 12500), S2MPB02_LDO(2, 12500), S2MPB02_LDO(3, 12500),
++	S2MPB02_LDO(4, 12500), S2MPB02_LDO(5, 12500), S2MPB02_LDO(6, 25000),
++	S2MPB02_LDO(7, 25000), S2MPB02_LDO(8, 25000), S2MPB02_LDO(9, 25000),
++	S2MPB02_LDO(10, 25000), S2MPB02_LDO(11, 25000), S2MPB02_LDO(12, 25000),
++	S2MPB02_LDO(13, 25000), S2MPB02_LDO(14, 25000), S2MPB02_LDO(15, 25000),
++	S2MPB02_LDO(16, 25000), S2MPB02_LDO(17, 25000), S2MPB02_LDO(18, 25000),
++	S2MPB02_BUCK("buck1", 19, S2MPB02_REG_B1CTRL1, 400000, 6250, 100),
++	S2MPB02_BUCK("buck2", 20, S2MPB02_REG_B2CTRL1, 400000, 6250, 100),
++	S2MPB02_BUCK("bb", 21, S2MPB02_REG_BB1CTRL1, 2600000, 12500, 210),
++};
++
++static int s2mpb02_regulator_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct regulator_config config = { .dev = dev };
++	struct device_node *regs_np, *np, *pmic_np;
++	struct i2c_client *client;
++	struct regmap *regmap;
++	unsigned int i;
++
++	pmic_np = of_parse_phandle(dev->of_node, "samsung,pmic", 0);
++	if (!pmic_np)
++		return dev_err_probe(dev, -EINVAL, "no samsung,pmic\n");
++	client = of_find_i2c_device_by_node(pmic_np);
++	of_node_put(pmic_np);
++	if (!client)
++		return -EPROBE_DEFER;
++
++	/* The regmap exists once the LED driver has bound to the chip. */
++	regmap = dev_get_regmap(&client->dev, NULL);
++	if (!regmap) {
++		put_device(&client->dev);
++		return -EPROBE_DEFER;
++	}
++	/* Go away before the LED driver (and its regmap) does. */
++	if (!device_link_add(dev, &client->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
++		put_device(&client->dev);
++		return dev_err_probe(dev, -EINVAL, "no link to the PMIC\n");
++	}
++	put_device(&client->dev);
++	config.regmap = regmap;
++
++	regs_np = of_get_child_by_name(dev->of_node, "regulators");
++	if (!regs_np)
++		return dev_err_probe(dev, -EINVAL, "no regulators node\n");
++
++	/*
++	 * Only the regulators described in the DT are registered; everything
++	 * else (e.g. LDO17, the grip sensor supply) is not touched.
++	 */
++	for (i = 0; i < ARRAY_SIZE(s2mpb02_regulators); i++) {
++		const struct regulator_desc *desc = &s2mpb02_regulators[i];
++		struct regulator_dev *rdev;
++
++		np = of_get_child_by_name(regs_np, desc->of_match);
++		if (!np)
++			continue;
++		of_node_put(np);
++
++		rdev = devm_regulator_register(dev, desc, &config);
++		if (IS_ERR(rdev)) {
++			of_node_put(regs_np);
++			return dev_err_probe(dev, PTR_ERR(rdev),
++					     "failed to register %s\n",
++					     desc->name);
++		}
++	}
++	of_node_put(regs_np);
++
++	return 0;
++}
++
++static const struct of_device_id s2mpb02_regulator_of_match[] = {
++	{ .compatible = "samsung,s2mpb02-regulators" },
++	{ }
++};
++/*
++ * No MODULE_DEVICE_TABLE during bring-up: the module is loaded by hand, so
++ * that a boot never depends on it.
++ */
++
++static struct platform_driver s2mpb02_regulator_driver = {
++	.driver = {
++		.name = "s2mpb02-regulator",
++		.of_match_table = s2mpb02_regulator_of_match,
++	},
++	.probe = s2mpb02_regulator_probe,
++};
++module_platform_driver(s2mpb02_regulator_driver);
++
++MODULE_DESCRIPTION("Samsung S2MPB02 camera PMIC regulator driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/regulator/s2mpb03-regulator.c b/drivers/regulator/s2mpb03-regulator.c
+new file mode 100644
+index 0000000000..a95122eb28
+--- /dev/null
++++ b/drivers/regulator/s2mpb03-regulator.c
+@@ -0,0 +1,217 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Samsung S2MPB03 camera PMIC: seven LDOs behind I2C. On the Galaxy S10
++ * family it feeds the rear wide camera (S5K2L4), the camera I/O rail that
++ * the rear lens actuator bus hangs on, and the OIS motor driver.
++ *
++ * Register layout from the Samsung SM-G975F kernel
++ * (drivers/regulator/s2mpb03.c, include/linux/regulator/s2mpb03.h):
++ *   0x00 ID, 0x01 status, 0x02 control,
++ *   0x03 + n: LDO(n + 1) control, [7] enable, [5:0] voltage
++ *
++ * Only the LDOs described in the DT are registered; nothing is written at
++ * probe time.
++ *
++ * Inputs: LDOs 1, 2 and 4 (1.0 V core, 1.1 V DRAM I/O and 1.025 V retention
++ * rails of the rear wide sensor) are fed by the 1.3 V buck 1 of the S2MPB02
++ * camera PMIC, which the vendor kernel keeps always on. With that buck off
++ * they report enabled but deliver nothing: the sensor stays silent on I2C
++ * while its EEPROM and lens actuator answer. The analog LDOs 5 and 6 are
++ * given the S2MPB02 buck-boost (also always on downstream; not proven to be
++ * their input). LDO 3 (camera I/O) works with both off and has no input.
++ * The DT can name the inputs on the PMIC node ("vinl-supply", "vinh-supply");
++ * a DT without them gets the S2MPB02 regulators by their names.
++ */
++
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include <linux/regulator/driver.h>
++#include <linux/regulator/of_regulator.h>
++
++#define S2MPB03_REG_ID		0x00
++#define S2MPB03_REG_LDO1_CTRL	0x03
++#define S2MPB03_REG_MAX		0x0b
++
++#define S2MPB03_LDO_EN		BIT(7)
++#define S2MPB03_LDO_VSEL_MASK	GENMASK(5, 0)
++
++static const struct regulator_ops s2mpb03_ldo_ops = {
++	.list_voltage		= regulator_list_voltage_linear,
++	.map_voltage		= regulator_map_voltage_linear,
++	.is_enabled		= regulator_is_enabled_regmap,
++	.enable			= regulator_enable_regmap,
++	.disable		= regulator_disable_regmap,
++	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
++	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
++	.set_voltage_time_sel	= regulator_set_voltage_time_sel,
++};
++
++#define S2MPB03_LDO(_n, _min, _step, _vin) {				\
++	.name		= "ldo" #_n,					\
++	.supply_name	= _vin,						\
++	.of_match	= "ldo" #_n,					\
++	.regulators_node = "regulators",				\
++	.id		= _n,						\
++	.ops		= &s2mpb03_ldo_ops,				\
++	.type		= REGULATOR_VOLTAGE,				\
++	.owner		= THIS_MODULE,					\
++	.min_uV		= _min,						\
++	.uV_step	= _step,					\
++	.n_voltages	= 64,						\
++	.ramp_delay	= 12000,					\
++	.vsel_reg	= S2MPB03_REG_LDO1_CTRL + (_n) - 1,		\
++	.vsel_mask	= S2MPB03_LDO_VSEL_MASK,			\
++	.enable_reg	= S2MPB03_REG_LDO1_CTRL + (_n) - 1,		\
++	.enable_mask	= S2MPB03_LDO_EN,				\
++	.enable_time	= 150,						\
++}
++
++static const struct regulator_desc s2mpb03_regulators[] = {
++	S2MPB03_LDO(1, 700000, 12500, "vinl"),
++	S2MPB03_LDO(2, 700000, 12500, "vinl"),
++	S2MPB03_LDO(3, 700000, 25000, NULL),
++	S2MPB03_LDO(4, 700000, 12500, "vinl"),
++	S2MPB03_LDO(5, 1800000, 25000, "vinh"),
++	S2MPB03_LDO(6, 1800000, 25000, "vinh"),
++	S2MPB03_LDO(7, 1800000, 25000, NULL),
++};
++
++/* fallback for a DT that does not name the inputs */
++static const struct {
++	const char *supply;
++	const char *regulator;
++} s2mpb03_inputs[] = {
++	{ "vinl", "S2MPB02_BUCK1" },
++	{ "vinh", "S2MPB02_BB" },
++};
++
++/*
++ * The supply name of an LDO: the DT one if the PMIC node has the property,
++ * else the regulator name of the S2MPB02 output (the regulator core finds a
++ * supply by regulator name when the DT has none). That regulator must exist
++ * before the LDO is registered, or the core settles for a dummy supply.
++ */
++static int s2mpb03_supply_name(struct device *dev, const char *vin,
++			       const char **name)
++{
++	struct regulator *reg;
++	char prop[16];
++	unsigned int i;
++
++	*name = vin;
++	if (!vin)
++		return 0;
++	snprintf(prop, sizeof(prop), "%s-supply", vin);
++	if (of_property_present(dev->of_node, prop))
++		return 0;
++
++	for (i = 0; i < ARRAY_SIZE(s2mpb03_inputs); i++)
++		if (!strcmp(vin, s2mpb03_inputs[i].supply))
++			break;
++	if (i == ARRAY_SIZE(s2mpb03_inputs))
++		return 0;
++
++	reg = regulator_get_optional(dev, s2mpb03_inputs[i].regulator);
++	if (IS_ERR(reg))
++		return dev_err_probe(dev, -EPROBE_DEFER,
++				     "input %s (%s) not registered yet\n", vin,
++				     s2mpb03_inputs[i].regulator);
++	regulator_put(reg);
++	*name = s2mpb03_inputs[i].regulator;
++
++	return 0;
++}
++
++static const struct regmap_config s2mpb03_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = S2MPB03_REG_MAX,
++};
++
++static int s2mpb03_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct regulator_config config = { .dev = dev };
++	struct device_node *regs_np, *np;
++	unsigned int i, id = 0, ctrl[7] = { 0 };
++	struct regmap *regmap;
++	int ret;
++
++	regmap = devm_regmap_init_i2c(client, &s2mpb03_regmap_config);
++	if (IS_ERR(regmap))
++		return dev_err_probe(dev, PTR_ERR(regmap), "no regmap\n");
++	config.regmap = regmap;
++
++	/* The chip is always powered: read-only presence check and state */
++	ret = regmap_read(regmap, S2MPB03_REG_ID, &id);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot read the ID register\n");
++	for (i = 0; i < ARRAY_SIZE(ctrl); i++)
++		regmap_read(regmap, S2MPB03_REG_LDO1_CTRL + i, &ctrl[i]);
++	dev_info(dev, "S2MPB03 id 0x%02x, LDO1-7 control %02x %02x %02x %02x %02x %02x %02x\n",
++		 id, ctrl[0], ctrl[1], ctrl[2], ctrl[3], ctrl[4], ctrl[5],
++		 ctrl[6]);
++
++	regs_np = of_get_child_by_name(dev->of_node, "regulators");
++	if (!regs_np)
++		return dev_err_probe(dev, -EINVAL, "no regulators node\n");
++
++	for (i = 0; i < ARRAY_SIZE(s2mpb03_regulators); i++) {
++		const struct regulator_desc *tmpl = &s2mpb03_regulators[i];
++		struct regulator_desc *desc;
++		struct regulator_dev *rdev;
++
++		np = of_get_child_by_name(regs_np, tmpl->of_match);
++		if (!np)
++			continue;
++		of_node_put(np);
++
++		desc = devm_kmemdup(dev, tmpl, sizeof(*tmpl), GFP_KERNEL);
++		if (!desc) {
++			of_node_put(regs_np);
++			return -ENOMEM;
++		}
++		ret = s2mpb03_supply_name(dev, tmpl->supply_name,
++					  &desc->supply_name);
++		if (ret) {
++			of_node_put(regs_np);
++			return ret;
++		}
++
++		rdev = devm_regulator_register(dev, desc, &config);
++		if (IS_ERR(rdev)) {
++			of_node_put(regs_np);
++			return dev_err_probe(dev, PTR_ERR(rdev),
++					     "failed to register %s\n",
++					     desc->name);
++		}
++	}
++	of_node_put(regs_np);
++
++	return 0;
++}
++
++static const struct of_device_id s2mpb03_of_match[] = {
++	{ .compatible = "samsung,s2mpb03" },
++	{ }
++};
++/*
++ * No MODULE_DEVICE_TABLE during bring-up: the module is loaded by hand, so
++ * that a boot never depends on it.
++ */
++
++static struct i2c_driver s2mpb03_driver = {
++	.driver = {
++		.name = "s2mpb03-regulator",
++		.of_match_table = s2mpb03_of_match,
++	},
++	.probe = s2mpb03_probe,
++};
++module_i2c_driver(s2mpb03_driver);
++
++MODULE_SOFTDEP("pre: s2mpb02-regulator");
++MODULE_DESCRIPTION("Samsung S2MPB03 camera PMIC regulator driver");
++MODULE_LICENSE("GPL");

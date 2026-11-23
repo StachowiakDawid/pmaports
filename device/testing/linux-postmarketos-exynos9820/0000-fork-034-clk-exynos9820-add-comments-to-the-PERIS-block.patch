@@ -1,0 +1,30 @@
+From 6093fa714b9fadee70d9f04856f7b96bb8f0e258 Mon Sep 17 00:00:00 2001
+From: chiffathefox <chiffathefoxx@gmail.com>
+Date: Thu, 23 Jul 2026 19:00:34 +0300
+Subject: [PATCH 34/46] clk: exynos9820: add comments to the PERIS block
+
+(cherry picked from commit 1c351049b2d7124e417188fc484cadb4cf7ae918)
+---
+ drivers/clk/samsung/clk-exynos9820.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/clk/samsung/clk-exynos9820.c b/drivers/clk/samsung/clk-exynos9820.c
+index 58a22089a6..cb0561453a 100644
+--- a/drivers/clk/samsung/clk-exynos9820.c
++++ b/drivers/clk/samsung/clk-exynos9820.c
+@@ -107,6 +107,7 @@ static const struct samsung_gate_clock peris_gate_clks[] __initconst = {
+ 	     "gout_peris_otp_con_bisr_i_oscclk", "oscclk",
+ 	     CLK_CON_GAT_CLK_BLK_PERIS_UID_OTP_CON_BISR_IPCLKPORT_I_OSCCLK, 21,
+ 	     0, 0),
++	/* EL3 firmware requires access to this register */
+ 	GATE(CLK_GOUT_PERIS_OTP_CON_TOP_I_OSCCLK,
+ 	     "gout_peris_otp_con_top_i_oscclk", "oscclk",
+ 	     CLK_CON_GAT_CLK_BLK_PERIS_UID_OTP_CON_TOP_IPCLKPORT_I_OSCCLK, 21,
+@@ -153,6 +154,7 @@ static const struct samsung_gate_clock peris_gate_clks[] __initconst = {
+ 	     "mout_peris_bus_user",
+ 	     CLK_CON_GAT_GOUT_BLK_PERIS_UID_OTP_CON_BISR_IPCLKPORT_PCLK, 21,
+ 	     0, 0),
++	/* EL3 firmware rqeuires access to this register */
+ 	GATE(CLK_GOUT_PERIS_OTP_CON_TOP_PCLK, "gout_peris_otp_con_top_pclk",
+ 	     "mout_peris_bus_user",
+ 	     CLK_CON_GAT_GOUT_BLK_PERIS_UID_OTP_CON_TOP_IPCLKPORT_PCLK, 21,

@@ -1,0 +1,1516 @@
+From 3ad5a23b829efd86870855afdd240180979e1145 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] phy: exynos5-usbdrd: add Exynos9820 host mode, USB3 and
+ DisplayPort combo PHY
+
+Exynos 9820 support for the USB DRD PHY, with its binding:
+
+ - USB 2.0 host mode (software controlled VBUS valid, over-current
+   from the unused SET_OCD bits).
+ - The USB3 half of the USBDP combo PHY, enabled with exynos9820_ss=1
+   (default off: USB 2.0 only): PMA init in the vendor EVT1 sequence
+   with the PCS PLL enable forced (the LC PLL does not start
+   otherwise), the vendor SuperSpeed tune set applied before the PLL
+   starts and again on the running PMA, and a reported RX CDR lock
+   wait. A lock failure falls back to USB 2.0 instead of failing
+   phy_init().
+ - The SuperSpeed lanes follow the Type-C orientation switch when a
+   cable is attached, else the port select GPIO; they are re-targeted
+   on phy_set_mode() when the orientation changed.
+ - An HS pull-up hold (PHY_MODE_USB_DEVICE_SS/_HS) for
+   SuperSpeed-first connects.
+ - DisplayPort mode of the combo PHY as a third PHY, with the EVT1
+   default table; powering DP on stops USB3.
+ - The probe is deferred until the port select GPIO is available.
+ - The host column of the SuperSpeed tune uses RX EQ 0xc / DFE tap 0
+   like the other Exynos 9820 boards; with the Galaxy S10+ vendor
+   values the link behind a USB3 hub on lanes 0/1 dropped under
+   traffic.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ .../bindings/phy/samsung,usb3-drd-phy.yaml    |   81 +-
+ drivers/phy/samsung/phy-exynos5-usbdrd.c      | 1250 ++++++++++++++++-
+ 2 files changed, 1309 insertions(+), 22 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/phy/samsung,usb3-drd-phy.yaml b/Documentation/devicetree/bindings/phy/samsung,usb3-drd-phy.yaml
+index a1b3d9e6a0..cc562c79e4 100644
+--- a/Documentation/devicetree/bindings/phy/samsung,usb3-drd-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/samsung,usb3-drd-phy.yaml
+@@ -24,19 +24,23 @@ description: |
+ 
+ properties:
+   compatible:
+-    enum:
+-      - google,gs101-usb31drd-phy
+-      - samsung,exynos2200-usb32drd-phy
+-      - samsung,exynos5250-usbdrd-phy
+-      - samsung,exynos5420-usbdrd-phy
+-      - samsung,exynos5433-usbdrd-phy
+-      - samsung,exynos7-usbdrd-phy
+-      - samsung,exynos7870-usbdrd-phy
+-      - samsung,exynos850-usbdrd-phy
+-      - samsung,exynos990-usbdrd-phy
+-      - samsung,exynosautov920-usb31drd-combo-ssphy
+-      - samsung,exynosautov920-usbdrd-combo-hsphy
+-      - samsung,exynosautov920-usbdrd-phy
++    oneOf:
++      - items:
++          - const: samsung,exynos9820-usbdrd-phy
++          - const: samsung,exynos990-usbdrd-phy
++      - enum:
++          - google,gs101-usb31drd-phy
++          - samsung,exynos2200-usb32drd-phy
++          - samsung,exynos5250-usbdrd-phy
++          - samsung,exynos5420-usbdrd-phy
++          - samsung,exynos5433-usbdrd-phy
++          - samsung,exynos7-usbdrd-phy
++          - samsung,exynos7870-usbdrd-phy
++          - samsung,exynos850-usbdrd-phy
++          - samsung,exynos990-usbdrd-phy
++          - samsung,exynosautov920-usb31drd-combo-ssphy
++          - samsung,exynosautov920-usbdrd-combo-hsphy
++          - samsung,exynosautov920-usbdrd-phy
+ 
+   clocks:
+     minItems: 1
+@@ -85,6 +89,12 @@ properties:
+       - const: pcs
+       - const: pma
+ 
++  samsung,usbdp-port-gpios:
++    maxItems: 1
++    description:
++      Exynos9820 only. Input telling which lane pair of the USB/DP combo PHY
++      carries USB 3 (low = lanes 0/1, high = lanes 2/3), as wired by the board.
++
+   samsung,pmu-syscon:
+     $ref: /schemas/types.yaml#/definitions/phandle
+     description:
+@@ -134,6 +144,18 @@ required:
+   - samsung,pmu-syscon
+ 
+ allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: samsung,exynos9820-usbdrd-phy
++    then:
++      $ref: /schemas/usb/usb-switch.yaml#
++      description:
++        On Exynos9820 the third PHY (phandle argument 2) is the DisplayPort
++        mode of the USB/DP combo PHY; with mode-switch the PHY follows the
++        DP alt mode lane assignment of the USB-C connector.
++
+   - if:
+       properties:
+         compatible:
+@@ -226,6 +248,34 @@ allOf:
+         reg-names:
+           maxItems: 1
+ 
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: samsung,exynos9820-usbdrd-phy
++    then:
++      allOf:
++        - $ref: /schemas/usb/usb-switch.yaml#
++        - $ref: /schemas/usb/usb-switch-ports.yaml#
++
++      properties:
++        clocks:
++          minItems: 2
++          maxItems: 2
++
++        clock-names:
++          items:
++            - const: phy
++            - const: ref
++
++        reg:
++          minItems: 1
++          maxItems: 3
++
++    else:
++      properties:
++        samsung,usbdp-port-gpios: false
++
+   - if:
+       properties:
+         compatible:
+@@ -239,6 +289,11 @@ allOf:
+               - samsung,exynosautov920-usb31drd-combo-ssphy
+               - samsung,exynosautov920-usbdrd-combo-hsphy
+               - samsung,exynosautov920-usbdrd-phy
++      not:
++        properties:
++          compatible:
++            contains:
++              const: samsung,exynos9820-usbdrd-phy
+     then:
+       properties:
+         clocks:
+diff --git a/drivers/phy/samsung/phy-exynos5-usbdrd.c b/drivers/phy/samsung/phy-exynos5-usbdrd.c
+index 5c218c0189..907edba08d 100644
+--- a/drivers/phy/samsung/phy-exynos5-usbdrd.c
++++ b/drivers/phy/samsung/phy-exynos5-usbdrd.c
+@@ -11,11 +11,13 @@
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/io.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/iopoll.h>
++#include <linux/ktime.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
+ #include <linux/mutex.h>
+@@ -23,7 +25,9 @@
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/soc/samsung/exynos-regs-pmu.h>
++#include <linux/phy/phy-dp.h>
+ #include <linux/usb/typec.h>
++#include <linux/usb/typec_dp.h>
+ #include <linux/usb/typec_mux.h>
+ 
+ /* Exynos USB PHY registers */
+@@ -488,6 +492,8 @@ struct exynos5_usbdrd_phy_drvdata {
+ 	u32 pmu_offset_usbdrd0_phy;
+ 	u32 pmu_offset_usbdrd0_phy_ss;
+ 	u32 pmu_offset_usbdrd1_phy;
++	/* TypeC orientation switch only selects SS lanes, never gates VBUSVALID */
++	bool orien_sw_ss_only;
+ };
+ 
+ /**
+@@ -508,6 +514,21 @@ struct exynos5_usbdrd_phy_drvdata {
+  * @regulators: regulators for phy
+  * @sw: TypeC orientation switch handle
+  * @orientation: TypeC connector orientation - normal or flipped
++ * @port_gpio: (Exynos9820) input telling which PMA lanes carry USB3
++ * @ss_port: (Exynos9820) lane set the SS PHY was brought up for, -1 if off
++ * @ss_inited: (Exynos9820) pipe3 phy_init() was called (until phy_exit())
++ * @ss_pmu_on: (Exynos9820) the USBDP PMU isolation was released by us
++ * @dp_phy: (Exynos9820) DisplayPort mode of the combo PHY (phandle arg 2)
++ * @mux: (Exynos9820) TypeC mode switch for the DP alt mode lane split
++ * @dp_max_lanes: (Exynos9820) lanes DP may use (pin assignment), 0 = no DP
++ * @dp_lanes: (Exynos9820) lanes DP is configured for
++ * @dp_rate: (Exynos9820) DP link rate in Mb/s
++ * @dp_flip: (Exynos9820) DP on the CC2 lane set (downstream dp_sw_sel)
++ * @dp_on: (Exynos9820) DP PHY powered on
++ * @dp_pmu_on: (Exynos9820) the USBDP PMU isolation is held for DP
++ * @ss_host: (Exynos9820) UTMI in host mode: use the host SS tune column
++ * @ss_hs_hold: (Exynos9820) HS pull-up (HSP VBUSVLDEXT) held off for SS
++ * @ss_src: (Exynos9820) where the last SS lane choice came from
+  */
+ struct exynos5_usbdrd_phy {
+ 	struct device *dev;
+@@ -531,6 +552,26 @@ struct exynos5_usbdrd_phy {
+ 
+ 	struct typec_switch_dev *sw;
+ 	enum typec_orientation orientation;
++
++	struct gpio_desc *port_gpio;
++	int ss_port;
++	bool ss_inited;
++	bool ss_pmu_on;
++
++	/* Exynos9820 DisplayPort mode of the combo PHY (third PHY, index 2) */
++	struct phy *dp_phy;
++	struct typec_mux_dev *mux;
++	unsigned int dp_max_lanes;	/* from the alt mode pin assignment */
++	unsigned int dp_lanes;
++	unsigned int dp_rate;		/* Mb/s */
++	bool dp_flip;
++	bool dp_on;
++	bool dp_pmu_on;
++
++	/* Exynos9820 SS tune column (UTMI role) and HS pull-up hold */
++	bool ss_host;
++	bool ss_hs_hold;
++	const char *ss_src;
+ };
+ 
+ static inline
+@@ -670,15 +711,9 @@ exynos5_usbdrd_utmi_set_refclk(struct phy_usb_instance *inst)
+ }
+ 
+ static void
+-exynos5_usbdrd_apply_phy_tunes(struct exynos5_usbdrd_phy *phy_drd,
+-			       enum exynos5_usbdrd_phy_tuning_state state)
++exynos5_usbdrd_apply_tune_table(struct exynos5_usbdrd_phy *phy_drd,
++				const struct exynos5_usbdrd_phy_tuning *tune)
+ {
+-	const struct exynos5_usbdrd_phy_tuning *tune;
+-
+-	tune = phy_drd->drv_data->phy_tunes[state];
+-	if (!tune)
+-		return;
+-
+ 	for_each_phy_tune(tune) {
+ 		void __iomem *reg_base;
+ 		u32 reg = 0;
+@@ -708,6 +743,19 @@ exynos5_usbdrd_apply_phy_tunes(struct exynos5_usbdrd_phy *phy_drd,
+ 	}
+ }
+ 
++static void
++exynos5_usbdrd_apply_phy_tunes(struct exynos5_usbdrd_phy *phy_drd,
++			       enum exynos5_usbdrd_phy_tuning_state state)
++{
++	const struct exynos5_usbdrd_phy_tuning *tune;
++
++	tune = phy_drd->drv_data->phy_tunes[state];
++	if (!tune)
++		return;
++
++	exynos5_usbdrd_apply_tune_table(phy_drd, tune);
++}
++
+ static int exynos5_usbdrd_pipe3_init(struct exynos5_usbdrd_phy *phy_drd)
+ {
+ 	u32 reg;
+@@ -1173,6 +1221,9 @@ static struct phy *exynos5_usbdrd_phy_xlate(struct device *dev,
+ {
+ 	struct exynos5_usbdrd_phy *phy_drd = dev_get_drvdata(dev);
+ 
++	if (args->args[0] == EXYNOS5_DRDPHYS_NUM && phy_drd->dp_phy)
++		return phy_drd->dp_phy;
++
+ 	if (WARN_ON(args->args[0] >= EXYNOS5_DRDPHYS_NUM))
+ 		return ERR_PTR(-ENODEV);
+ 
+@@ -1573,7 +1624,7 @@ static int exynos850_usbdrd_utmi_init(struct exynos5_usbdrd_phy *phy_drd)
+ 	reg |= FIELD_PREP(LINKCTRL_BUS_FILTER_BYPASS, 0xf);
+ 	writel(reg, regs_base + EXYNOS850_DRD_LINKCTRL);
+ 
+-	if (!phy_drd->sw) {
++	if (!phy_drd->sw || phy_drd->drv_data->orien_sw_ss_only) {
+ 		reg = readl(regs_base + EXYNOS850_DRD_UTMI);
+ 		reg |= UTMI_FORCE_BVALID | UTMI_FORCE_VBUSVALID;
+ 		writel(reg, regs_base + EXYNOS850_DRD_UTMI);
+@@ -1799,6 +1850,1143 @@ static const struct phy_ops gs101_usbdrd_phy_ops = {
+ 	.owner		= THIS_MODULE,
+ };
+ 
++/*
++ * Exynos9820 (USB 3.1 DRD link + "USBDP gen2" USB/DisplayPort combo PHY).
++ *
++ * The UTMI (HS) part is the Exynos990 one. Two additions:
++ *
++ * - host mode: there is no VBUS pad, so the D+/D- 15k pull-downs and the
++ *   VBUSVALID/BVALID overrides are software controlled (downstream
++ *   phy_exynos_usb_v3p1_config_host_mode(), "is_not_vbus_pad"). Done from
++ *   phy_set_mode(), device mode restores exactly what utmi_init set up.
++ *
++ * - SuperSpeed: the combo PHY (PMA at reg "pma", PCS at reg "pcs", PMU
++ *   isolation at 0x704) is brought up like the downstream
++ *   exynos_usbdrd_pipe3_init() / phy_exynos_usbdp_g2_enable(). This is OFF
++ *   unless the exynos9820_ss module parameter is set, so the USB 2.0 link
++ *   (forced pipe3 signals, PMA in low power, as set by utmi_init) is not
++ *   touched by default. Any lock failure falls back to that USB 2.0-only
++ *   state instead of failing phy_init().
++ *
++ * Which PMA lanes carry USB3 follows the "samsung,usbdp-port-gpios" input
++ * (downstream "phy,gpio_phy_port", 0 = lanes 0/1, 1 = lanes 2/3) and, without
++ * it, the TypeC orientation (reverse = port 1).
++ */
++static bool exynos9820_ss;
++module_param(exynos9820_ss, bool, 0644);
++MODULE_PARM_DESC(exynos9820_ss,
++		 "Exynos9820: bring up the USB3 SuperSpeed combo PHY (default off: USB 2.0 only; takes effect at the next phy_init)");
++
++/*
++ * The LC PLL bring-up follows the downstream EVT1 sequence, except that the
++ * PCS PLL enable is forced (CMN 0x310): on the device the LC PLL only locks
++ * with it (A0350 = 0xee); without it it never starts (0x38).
++ */
++
++/* SECPMACTL bits 16 (REF_SOC_PLL_SSC) and 13:8 (RO/LC PLL ref, ref freq) */
++#define EXYNOS9820_SECPMACTL_REF_MASK	(BIT(16) | GENMASK(13, 8))
++/* REF_FREQ_SEL 1, LC/RO PLL ref 0 */
++#define EXYNOS9820_SECPMACTL_REF	0x100
++
++#define EXYNOS9820_PHY_CTRL_USBDP		0x704
++
++#define EXYNOS9820_DRD_LINKPORT			0x08
++#define LINKPORT_HUB_PORT_SEL_OCD_U3		BIT(3)
++#define LINKPORT_HUB_PORT_SEL_OCD_U2		BIT(2)
++
++#define EXYNOS9820_PMA_CMN_A0308		0x0308
++#define EXYNOS9820_PMA_CMN_A030C		0x030c
++#define A030C_OVRD_PCS_CMN_RSTN			BIT(3)
++#define A030C_PCS_CMN_RSTN			BIT(2)
++#define EXYNOS9820_PMA_CMN_A0310		0x0310
++#define A0310_OVRD_PCS_PLL_EN			BIT(1)
++#define A0310_PCS_PLL_EN			BIT(0)
++#define EXYNOS9820_PMA_CMN_A0314		0x0314
++#define EXYNOS9820_PMA_CMN_A0350		0x0350
++#define A0350_ANA_LCPLL_LOCK_DONE		BIT(7)
++#define EXYNOS9820_PMA_CMN_A0354		0x0354
++#define EXYNOS9820_PMA_CMN_A031C		0x031c
++#define EXYNOS9820_PMA_CMN_A0328		0x0328
++#define EXYNOS9820_PMA_CMN_A032C		0x032c
++#define EXYNOS9820_PMA_TRSV_A0B84		0x0b84	/* lane 0 */
++#define EXYNOS9820_PMA_TRSV_A1B84		0x1b84	/* lane 2 */
++#define TRSV_B84_MON_RX_CDR_LOCK_DONE		BIT(0)
++
++/*
++ * phy_exynos_usbdp_g2_enable() (EVT1, !CONFIG_SOC_EXYNOS9820_EVT0) and
++ * phy_exynos_usbdp_g2_set_pcs(), as executed: generated by running the
++ * downstream function against a register shadow and keeping, for every
++ * write, the bits it sets/clears (mask ~0 = plain write).
++ */
++static const struct exynos5_usbdrd_phy_tuning exynos9820_tunes_pipe3_init[] = {
++	PHY_TUNING_ENTRY_PMA(0x0830, ~0, 0x00000007),
++	PHY_TUNING_ENTRY_PMA(0x1830, ~0, 0x00000007),
++	PHY_TUNING_ENTRY_PMA(0x085c, ~0, 0x00000080),
++	PHY_TUNING_ENTRY_PMA(0x185c, ~0, 0x00000080),
++	PHY_TUNING_ENTRY_PMA(0x1030, ~0, 0x00000007),
++	PHY_TUNING_ENTRY_PMA(0x2030, ~0, 0x00000007),
++	PHY_TUNING_ENTRY_PMA(0x105c, ~0, 0x00000080),
++	PHY_TUNING_ENTRY_PMA(0x205c, ~0, 0x00000080),
++	PHY_TUNING_ENTRY_PMA(0x0228, ~0, 0x00000038),
++	PHY_TUNING_ENTRY_PMA(0x0104, ~0, 0x00000044),
++	PHY_TUNING_ENTRY_PMA(0x0248, ~0, 0x00000044),
++	PHY_TUNING_ENTRY_PMA(0x038c, 0x0000000e, 0x00000002),
++	PHY_TUNING_ENTRY_PMA(0x0878, ~0, 0x00000004),
++	PHY_TUNING_ENTRY_PMA(0x1878, ~0, 0x00000004),
++	PHY_TUNING_ENTRY_PMA(0x09a4, ~0, 0x00000007),
++	PHY_TUNING_ENTRY_PMA(0x19a4, ~0, 0x00000007),
++	PHY_TUNING_ENTRY_PMA(0x09a8, ~0, 0x00000022),
++	PHY_TUNING_ENTRY_PMA(0x19a8, ~0, 0x00000022),
++	PHY_TUNING_ENTRY_PMA(0x0994, ~0, 0x00000012),
++	PHY_TUNING_ENTRY_PMA(0x1994, ~0, 0x00000012),
++	PHY_TUNING_ENTRY_PMA(0x0998, ~0, 0x00000012),
++	PHY_TUNING_ENTRY_PMA(0x1998, ~0, 0x00000012),
++	PHY_TUNING_ENTRY_PMA(0x099c, ~0, 0x00000048),
++	PHY_TUNING_ENTRY_PMA(0x199c, ~0, 0x00000048),
++	PHY_TUNING_ENTRY_PMA(0x0898, ~0, 0x00000077),
++	PHY_TUNING_ENTRY_PMA(0x1898, ~0, 0x00000077),
++	PHY_TUNING_ENTRY_PMA(0x0054, ~0, 0x00000001),
++	PHY_TUNING_ENTRY_PMA(0x00e0, ~0, 0x00000038),
++	PHY_TUNING_ENTRY_PMA(0x0060, ~0, 0x00000024),
++	PHY_TUNING_ENTRY_PMA(0x0064, ~0, 0x00000077),
++	PHY_TUNING_ENTRY_PMA(0x0070, ~0, 0x00000076),
++	PHY_TUNING_ENTRY_PMA(0x0310, ~0, 0x00000000),
++	PHY_TUNING_ENTRY_PMA(0x0308, ~0, 0x00000000),
++	PHY_TUNING_ENTRY_PCS(0x0304, 0x003f003f, 0x00000001),
++	PHY_TUNING_ENTRY_PCS(0x0318, 0x00020000, 0x00020000),
++	PHY_TUNING_ENTRY_PCS(0x030c, 0x00000001, 0x00000000),
++	PHY_TUNING_ENTRY_PCS(0x014c, 0x00000300, 0x00000100),
++	PHY_TUNING_ENTRY_PCS(0x0150, 0x0000c000, 0x00004000),
++	PHY_TUNING_ENTRY_PMA(0x0a98, 0x000000f0, 0x00000020),
++	PHY_TUNING_ENTRY_PMA(0x1a98, 0x000000f0, 0x00000020),
++	PHY_TUNING_ENTRY_PMA(0x0258, ~0, 0x00000000),
++	PHY_TUNING_ENTRY_LAST
++};
++
++/* lanes for used_phy_port 0 (USB on lanes 0/1) */
++static const struct exynos5_usbdrd_phy_tuning exynos9820_tunes_pipe3_port0[] = {
++	PHY_TUNING_ENTRY_PMA(0x0288, ~0, 0x000000c0),
++	PHY_TUNING_ENTRY_PMA(0x028c, ~0, 0x00000018),
++	PHY_TUNING_ENTRY_PMA(0x1000, ~0, 0x00000008),
++	PHY_TUNING_ENTRY_PMA(0x2000, ~0, 0x00000028),
++	PHY_TUNING_ENTRY_PMA(0x0af0, 0x0000001c, 0x00000000),
++	PHY_TUNING_ENTRY_LAST
++};
++
++static const struct exynos5_usbdrd_phy_tuning exynos9820_tunes_pipe3_port1[] = {
++	PHY_TUNING_ENTRY_PMA(0x0288, ~0, 0x00000030),
++	PHY_TUNING_ENTRY_PMA(0x028c, ~0, 0x00000018),
++	PHY_TUNING_ENTRY_PMA(0x1000, ~0, 0x00000028),
++	PHY_TUNING_ENTRY_PMA(0x2000, ~0, 0x00000008),
++	PHY_TUNING_ENTRY_PMA(0x1af0, 0x0000001c, 0x00000000),
++	PHY_TUNING_ENTRY_LAST
++};
++
++/*
++ * The downstream SuperSpeed tune set. The beyond2lte DT has
++ * "ss_tune_param = <&usb_ss_tune>" on the PHY node; the usb_ss_tune node is
++ * status = "disabled", but exynos_usbdrd_get_sub_phyinfo() parses it through
++ * of_parse_phandle() without an availability check, so the vendor kernel
++ * applies all 20 entries: in phy_exynos_usbdp_g2_enable() (via
++ * phy_exynos_g2_usbdp_tune()) and again from phy_tune() right after
++ * dwc3_phy_setup() at every DWC3 core init, i.e. on the running PMA. Values
++ * are <device host>. phy_exynos_usbdp_g2_tune_each() writes the RX entries to
++ * lane 0 and lane 2, the TX entries to lane 1 and lane 3, and after each
++ * MF/HF EQ and DFE1 entry restarts the RX adaptation (TRSV 0x0a34/0x1a34 =
++ * 0x08, 0x18, 0x1e). Groups:
++ *   1 RX squelch/LFPS detect thresholds (tunes 1-2)
++ *   2 RX EQ: CTLE MF enable, SSLMS MF/HF init rates, DFE taps 1-5, plus the
++ *     adaptation restart (tunes 3-12)
++ *   4 RX termination calibration (tune 13)
++ *   8 TX driver: amplitude, de-emphasis, pre-shoot, IDRV up/down, Rcal up/dn
++ *     (tunes 14-20)
++ * All groups are applied in the enable() position (before the PLL starts)
++ * and again after the lanes run (the phy_tune() position); a
++ * role change (phy_set_mode) re-applies the matching column if SS is up.
++ */
++#define EXYNOS9820_SST_RX_SQ		BIT(0)
++#define EXYNOS9820_SST_RX_EQ		BIT(1)
++#define EXYNOS9820_SST_RX_TERM		BIT(2)
++#define EXYNOS9820_SST_TX		BIT(3)
++
++/*
++ * RX CDR lock wait after run_lane. Downstream polls TRSV 0xb84/0x1b84 for up
++ * to 100 x 1000 x 1 us and tears the PHY down on timeout; here it is only
++ * reported.
++ */
++#define EXYNOS9820_SS_CDR_MS		100
++
++struct exynos9820_ss_tune_ent {
++	u16 off[2];		/* lane 0/2 (RX) or lane 1/3 (TX) */
++	u8 mask;		/* all bits the entry touches */
++	u8 set;			/* bits always set (override enables etc.) */
++	u8 field;		/* value field */
++	u8 shift;
++	u8 val[2];		/* <device host> from the DT */
++	u8 group;
++	bool restart;		/* RX adaptation restart afterwards */
++};
++
++#define SST(o0, o1, m, st, f, sh, vd, vh, g, r) \
++	{ .off = { o0, o1 }, .mask = m, .set = st, .field = f, .shift = sh, \
++	  .val = { vd, vh }, .group = g, .restart = r }
++
++static const struct exynos9820_ss_tune_ent exynos9820_ss_tunes[] = {
++	/* ss_tune1  ssrx_sqhs_th <4 4>: TRSV 26E RX_SQHS_TH[7:4] */
++	SST(0x09b8, 0x19b8, 0xf0, 0x00, 0xf0, 4, 0x4, 0x4, EXYNOS9820_SST_RX_SQ, false),
++	/* ss_tune2  ssrx_lfps_th <2 2>: TRSV 0270 RX_LFPS_TH_CTRL[3:1] */
++	SST(0x09c0, 0x19c0, 0x0e, 0x00, 0x0e, 1, 0x2, 0x2, EXYNOS9820_SST_RX_SQ, false),
++	/* ss_tune3  ssrx_mf_eq_en: TRSV 0241 |= RL_HF_HBR3(3) | MF_BWD_EN, &= ~OC_DAC_PU */
++	SST(0x0904, 0x1904, 0x78, 0x70, 0x00, 0, 0x0, 0x0, EXYNOS9820_SST_RX_EQ, false),
++	/* ss_tune4  ssrx_mf_eq_ctrl_ss <6 6>: TRSV 0311 SSLMS_MF_INIT_RATE_SP[4:0] */
++	SST(0x0c44, 0x1c44, 0x1f, 0x00, 0x1f, 0, 0x6, 0x6, EXYNOS9820_SST_RX_EQ, true),
++	/*
++	 * ss_tune5  ssrx_hf_eq_ctrl_ss <0xc 0xe>: TRSV 030B SSLMS_HF_INIT_RATE_SP.
++	 * Host 0xc instead of the beyond2lte DT's 0xe (the other 9820 boards'
++	 * value, and our device column): with 0xe the link behind a Nintendo
++	 * Switch dock on lanes 0/1 dropped to SS.Inactive every few seconds
++	 * under traffic (16-30 drops / 120 s); with 0xc + dfe1 0: none in 5 min
++	 * at 10 MS/s. Directly attached devices work with both.
++	 */
++	SST(0x0c2c, 0x1c2c, 0x1f, 0x00, 0x1f, 0, 0xc, 0xc, EXYNOS9820_SST_RX_EQ, true),
++	/* ss_tune6  ssrx_mf_eq_ctrl_ssp <6 6>: TRSV 0312 */
++	SST(0x0c48, 0x1c48, 0x1f, 0x00, 0x1f, 0, 0x6, 0x6, EXYNOS9820_SST_RX_EQ, true),
++	/* ss_tune7  ssrx_hf_eq_ctrl_ssp <0xe 0xe>: TRSV 030C */
++	SST(0x0c30, 0x1c30, 0x1f, 0x00, 0x1f, 0, 0xe, 0xe, EXYNOS9820_SST_RX_EQ, true),
++	/* ss_tune8  ssrx_dfe1_tap_ctrl <0 2>: TRSV 0279 SSLMS_C1_INIT[7:0]; host 0 (see ss_tune5) */
++	SST(0x09e4, 0x19e4, 0xff, 0x00, 0xff, 0, 0x0, 0x0, EXYNOS9820_SST_RX_EQ, true),
++	/* ss_tune9..12 ssrx_dfe2..5_tap_ctrl <0 0>: TRSV 027A..027D */
++	SST(0x09e8, 0x19e8, 0xff, 0x00, 0xff, 0, 0x0, 0x0, EXYNOS9820_SST_RX_EQ, false),
++	SST(0x09ec, 0x19ec, 0xff, 0x00, 0xff, 0, 0x0, 0x0, EXYNOS9820_SST_RX_EQ, false),
++	SST(0x09f0, 0x19f0, 0xff, 0x00, 0xff, 0, 0x0, 0x0, EXYNOS9820_SST_RX_EQ, false),
++	SST(0x09f4, 0x19f4, 0xff, 0x00, 0xff, 0, 0x0, 0x0, EXYNOS9820_SST_RX_EQ, false),
++	/* ss_tune13 ssrx_term_cal <0xb 0xb>: TRSV 02BD RX_RTERM_CTRL[3:0], |= RCAL_OPT_CODE(1) */
++	SST(0x0af4, 0x1af4, 0x1f, 0x10, 0x0f, 0, 0xb, 0xb, EXYNOS9820_SST_RX_TERM, false),
++	/* ss_tune14 sstx_amp <0xb 0xb>: TRSV 0404 OVRD_TX_DRV_LVL_CTRL | LVL_CTRL[4:0] */
++	SST(0x1010, 0x2010, 0x3f, 0x20, 0x1f, 0, 0xb, 0xb, EXYNOS9820_SST_TX, false),
++	/* ss_tune15 sstx_deemp <5 5>: TRSV 0405 OVRD_POST_LVL | POST_LVL_CTRL[3:0] */
++	SST(0x1014, 0x2014, 0x1f, 0x10, 0x0f, 0, 0x5, 0x5, EXYNOS9820_SST_TX, false),
++	/* ss_tune16 sstx_pre_shoot <3 3>: TRSV 0406 OVRD_PRE_LVL | PRE_LVL_CTRL[5:2] */
++	SST(0x1018, 0x2018, 0x7c, 0x40, 0x3c, 2, 0x3, 0x3, EXYNOS9820_SST_TX, false),
++	/* ss_tune17 sstx_idrv_up <7 7>: TRSV 0407 IDRV_IUP_CTRL[7:5] (EVT1) */
++	SST(0x101c, 0x201c, 0xe0, 0x00, 0xe0, 5, 0x7, 0x7, EXYNOS9820_SST_TX, false),
++	/* ss_tune18 sstx_idrv_dn <0 0>: CMN 041C/0420 LN1/LN3 IDRV_IDN_CTRL[2:0] (EVT1) */
++	SST(0x041c, 0x0420, 0x07, 0x00, 0x07, 0, 0x0, 0x0, EXYNOS9820_SST_TX, false),
++	/* ss_tune19 sstx_up_term <3 3>: TRSV 0420 TX_RCAL_UP_CODE[7:4] */
++	SST(0x1080, 0x2080, 0xf0, 0x00, 0xf0, 4, 0x3, 0x3, EXYNOS9820_SST_TX, false),
++	/* ss_tune20 sstx_dn_term <3 3>: TRSV 0420 TX_RCAL_DN_CODE[3:0] */
++	SST(0x1080, 0x2080, 0x0f, 0x00, 0x0f, 0, 0x3, 0x3, EXYNOS9820_SST_TX, false),
++};
++
++#define EXYNOS9820_PMA_TRSV_A0A34		0x0a34
++#define EXYNOS9820_PMA_TRSV_A1A34		0x1a34
++
++/* phy_exynos_g2_usbdp_tune() with the <device host> column of the DT */
++static void exynos9820_usbdrd_ss_tune(struct exynos5_usbdrd_phy *phy_drd,
++				      const char *when)
++{
++	void __iomem *pma = phy_drd->reg_pma;
++	int col = phy_drd->ss_host ? 1 : 0;
++	static const u8 restart[] = { 0x08, 0x18, 0x1e };
++	int i, j, k;
++
++	for (i = 0; i < ARRAY_SIZE(exynos9820_ss_tunes); i++) {
++		const struct exynos9820_ss_tune_ent *t = &exynos9820_ss_tunes[i];
++
++		for (j = 0; j < 2; j++) {
++			u32 reg = readl(pma + t->off[j]);
++
++			reg &= ~(u32)t->mask;
++			reg |= t->set;
++			reg |= ((u32)t->val[col] << t->shift) & t->field;
++			writel(reg, pma + t->off[j]);
++		}
++
++		if (!t->restart)
++			continue;
++
++		for (k = 0; k < ARRAY_SIZE(restart); k++) {
++			writel(restart[k], pma + EXYNOS9820_PMA_TRSV_A0A34);
++			writel(restart[k], pma + EXYNOS9820_PMA_TRSV_A1A34);
++		}
++	}
++
++	dev_info(phy_drd->dev,
++		 "USB3 SS tune (%s column) %s: RX0 sq/lfps %#x/%#x eq %#x/%#x term %#x, TX1 amp/de/pre %#x/%#x/%#x, TX3 amp %#x\n",
++		 col ? "host" : "device", when,
++		 readl(pma + 0x09b8), readl(pma + 0x09c0),
++		 readl(pma + 0x0c2c), readl(pma + 0x0a34),
++		 readl(pma + 0x0af4), readl(pma + 0x1010),
++		 readl(pma + 0x1014), readl(pma + 0x1018),
++		 readl(pma + 0x2010));
++}
++
++static void exynos9820_usbdrd_utmi_init(struct exynos5_usbdrd_phy *phy_drd)
++{
++	u32 reg;
++
++	exynos850_usbdrd_utmi_init(phy_drd);
++
++	/*
++	 * Host port over-current from the (never set) SET_OCD bits instead
++	 * of a pad, like downstream with use_io_for_ovc = 0. Only the xHCI
++	 * root hub looks at this.
++	 */
++	reg = readl(phy_drd->reg_phy + EXYNOS9820_DRD_LINKPORT);
++	reg |= LINKPORT_HUB_PORT_SEL_OCD_U3 | LINKPORT_HUB_PORT_SEL_OCD_U2;
++	writel(reg, phy_drd->reg_phy + EXYNOS9820_DRD_LINKPORT);
++}
++
++/* PMU USBDP isolation is handled by pipe3 init/exit themselves */
++static void exynos9820_usbdrd_pipe3_isol(struct phy_usb_instance *inst,
++					 bool isolate)
++{
++}
++
++/*
++ * Which input picks the SS lane pair: the TypeC
++ * orientation (from the connector's orientation switch, i.e. max77705-usbc
++ * through the typec class, DT "orientation-switch") when one is registered
++ * and the cable is attached, else the port gpio (gpg0-4, set by the CC
++ * hardware), else the last orientation. Read at every combo PHY (re-)init
++ * and lane re-target.
++ */
++static int exynos9820_usbdrd_ss_port(struct exynos5_usbdrd_phy *phy_drd)
++{
++	if (phy_drd->sw && phy_drd->orientation != TYPEC_ORIENTATION_NONE) {
++		phy_drd->ss_src = "typec orientation";
++		return phy_drd->orientation == TYPEC_ORIENTATION_REVERSE;
++	}
++
++	if (phy_drd->port_gpio) {
++		int val = gpiod_get_value_cansleep(phy_drd->port_gpio);
++
++		if (val >= 0) {
++			phy_drd->ss_src = "port gpio";
++			return !!val;
++		}
++	}
++
++	phy_drd->ss_src = "typec orientation";
++	return phy_drd->orientation == TYPEC_ORIENTATION_REVERSE;
++}
++
++/* state of the PCS -> PMA controls and the LC PLL monitors, for bring-up */
++static void exynos9820_usbdrd_ss_dump(struct exynos5_usbdrd_phy *phy_drd,
++				      struct regmap *pmu, const char *what)
++{
++	void __iomem *pma = phy_drd->reg_pma;
++	unsigned int iso = 0;
++
++	regmap_read(pmu, EXYNOS9820_PHY_CTRL_USBDP, &iso);
++	dev_info(phy_drd->dev,
++		 "USB3 %s: PMU704=%#x CLKRST=%#x LINKCTRL=%#x SECPMACTL=%#x A0308=%#x A030C=%#x A0310=%#x A0314=%#x A0350=%#x A0354=%#x\n",
++		 what, iso, readl(phy_drd->reg_phy + EXYNOS850_DRD_CLKRST),
++		 readl(phy_drd->reg_phy + EXYNOS850_DRD_LINKCTRL),
++		 readl(phy_drd->reg_phy + EXYNOS850_DRD_SECPMACTL),
++		 readl(pma + EXYNOS9820_PMA_CMN_A0308),
++		 readl(pma + EXYNOS9820_PMA_CMN_A030C),
++		 readl(pma + EXYNOS9820_PMA_CMN_A0310),
++		 readl(pma + EXYNOS9820_PMA_CMN_A0314),
++		 readl(pma + EXYNOS9820_PMA_CMN_A0350),
++		 readl(pma + EXYNOS9820_PMA_CMN_A0354));
++}
++
++static void exynos9820_usbdrd_hs_hold_write(struct exynos5_usbdrd_phy *phy_drd,
++					    bool hold);
++
++/* back to the USB 2.0-only state left by utmi_init */
++static void exynos9820_usbdrd_pipe3_off(struct exynos5_usbdrd_phy *phy_drd)
++{
++	u32 reg;
++
++	if (phy_drd->ss_hs_hold)
++		exynos9820_usbdrd_hs_hold_write(phy_drd, false);
++
++	exynos5_usbdrd_usb_v3p1_pipe_override(phy_drd);
++
++	reg = readl(phy_drd->reg_phy + EXYNOS850_DRD_CLKRST);
++	reg &= ~CLKRST_LINK_PCLK_SEL;
++	writel(reg, phy_drd->reg_phy + EXYNOS850_DRD_CLKRST);
++
++	phy_drd->ss_port = -1;
++}
++
++static void exynos9820_usbdrd_pipe3_init(struct exynos5_usbdrd_phy *phy_drd)
++{
++	struct phy_usb_instance *inst = &phy_drd->phys[EXYNOS5_DRDPHY_PIPE3];
++	void __iomem *regs_phy = phy_drd->reg_phy;
++	void __iomem *regs_pma = phy_drd->reg_pma;
++	unsigned int pmu = 0;
++	ktime_t t0;
++	s64 cdr_us;
++	u32 reg;
++	int port, err;
++
++	phy_drd->ss_port = -1;
++	if (!exynos9820_ss || !phy_drd->reg_pma || !phy_drd->reg_pcs) {
++		dev_dbg(phy_drd->dev, "USB3 combo PHY not enabled, USB 2.0 only\n");
++		return;
++	}
++
++	if (phy_drd->dp_on) {
++		/* TODO: USB3 next to 2-lane DP (pin D) needs a shared PMA init */
++		dev_info(phy_drd->dev, "combo PHY in DP mode, USB 2.0 only\n");
++		return;
++	}
++
++	port = exynos9820_usbdrd_ss_port(phy_drd);
++
++	/* ungate the USBDP PHY in the PMU, PMA accesses fault without it */
++	regmap_update_bits(inst->reg_pmu, EXYNOS9820_PHY_CTRL_USBDP,
++			   EXYNOS4_PHY_ENABLE, EXYNOS4_PHY_ENABLE);
++	phy_drd->ss_pmu_on = true;
++	if (!regmap_read(inst->reg_pmu, EXYNOS9820_PHY_CTRL_USBDP, &pmu) &&
++	    !(pmu & EXYNOS4_PHY_ENABLE))
++		dev_warn(phy_drd->dev, "USB3: PMU USBDP enable did not stick (%#x)\n",
++			 pmu);
++
++	/* phy_exynos_usb_v3p1_g2_pma_ready() */
++	udelay(100);
++	reg = readl(regs_phy + EXYNOS850_DRD_SECPMACTL);
++	reg &= ~EXYNOS9820_SECPMACTL_REF_MASK;
++	reg |= EXYNOS9820_SECPMACTL_REF & EXYNOS9820_SECPMACTL_REF_MASK;
++	reg |= SECPMACTL_PMA_LOW_PWR | SECPMACTL_PMA_TRSV_SW_RST |
++	       SECPMACTL_PMA_CMN_SW_RST | SECPMACTL_PMA_INIT_SW_RST |
++	       SECPMACTL_PMA_APB_SW_RST;
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++	udelay(1);
++	reg &= ~SECPMACTL_PMA_LOW_PWR;
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++	udelay(1);
++
++	reg = readl(regs_phy + EXYNOS850_DRD_LINKCTRL);
++	reg &= ~LINKCTRL_FORCE_PIPE_EN;
++	writel(reg, regs_phy + EXYNOS850_DRD_LINKCTRL);
++	udelay(1);
++
++	reg = readl(regs_phy + EXYNOS850_DRD_SECPMACTL);
++	reg &= ~SECPMACTL_PMA_APB_SW_RST;
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++
++	/* phy_exynos_usbdp_g2_enable() */
++	exynos5_usbdrd_apply_tune_table(phy_drd, exynos9820_tunes_pipe3_init);
++	exynos5_usbdrd_apply_tune_table(phy_drd, port ?
++					exynos9820_tunes_pipe3_port1 :
++					exynos9820_tunes_pipe3_port0);
++	/* phy_exynos_g2_usbdp_tune(): disjoint from the table registers */
++	exynos9820_usbdrd_ss_tune(phy_drd, "at init");
++	writel(A0310_OVRD_PCS_PLL_EN | A0310_PCS_PLL_EN,
++	       regs_pma + EXYNOS9820_PMA_CMN_A0310);
++
++	/* phy_exynos_usb_v3p1_g2_pma_sw_rst_release() */
++	reg = readl(regs_phy + EXYNOS850_DRD_SECPMACTL);
++	reg &= ~SECPMACTL_PMA_INIT_SW_RST;
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++	udelay(1);
++	reg &= ~(SECPMACTL_PMA_TRSV_SW_RST | SECPMACTL_PMA_CMN_SW_RST);
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++	fsleep(1000);
++
++	err = readl_poll_timeout(regs_pma + EXYNOS9820_PMA_CMN_A0350, reg,
++				 reg & A0350_ANA_LCPLL_LOCK_DONE, 10, 100000);
++	if (err) {
++		dev_err(phy_drd->dev,
++			"USB3 combo PHY: LC PLL not locked (%#x), staying at USB 2.0\n",
++			reg);
++		exynos9820_usbdrd_ss_dump(phy_drd, inst->reg_pmu, "PLL fail");
++		exynos9820_usbdrd_pipe3_off(phy_drd);
++		return;
++	}
++	exynos9820_usbdrd_ss_dump(phy_drd, inst->reg_pmu, "PLL locked");
++
++	/* phy_exynos_usbdp_g2_run_lane() */
++	writel(0, regs_pma + EXYNOS9820_PMA_CMN_A031C);
++	writel(0, regs_pma + EXYNOS9820_PMA_CMN_A0328);
++	writel(0, regs_pma + EXYNOS9820_PMA_CMN_A032C);
++
++	/*
++	 * RX CDR lock: downstream waits up to ~100 ms and treats a timeout
++	 * as fatal; here it is only reported.
++	 */
++	t0 = ktime_get();
++	reg = readl(regs_pma + (port ? EXYNOS9820_PMA_TRSV_A1B84 :
++				EXYNOS9820_PMA_TRSV_A0B84));
++	err = (reg & TRSV_B84_MON_RX_CDR_LOCK_DONE) ? 0 : -ETIMEDOUT;
++	if (err)
++		err = readl_poll_timeout(regs_pma +
++					 (port ? EXYNOS9820_PMA_TRSV_A1B84 :
++					  EXYNOS9820_PMA_TRSV_A0B84),
++					 reg, reg & TRSV_B84_MON_RX_CDR_LOCK_DONE,
++					 10, EXYNOS9820_SS_CDR_MS *
++					 USEC_PER_MSEC);
++	cdr_us = ktime_us_delta(ktime_get(), t0);
++
++	/* phy_exynos_usb_v3p1_g2_link_pclk_sel(): link pipe clock from PMA */
++	reg = readl(regs_phy + EXYNOS850_DRD_CLKRST);
++	reg |= CLKRST_LINK_PCLK_SEL;
++	writel(reg, regs_phy + EXYNOS850_DRD_CLKRST);
++	mdelay(3);
++
++	/* downstream phy_tune() after dwc3_phy_setup(): on the running PMA */
++	exynos9820_usbdrd_ss_tune(phy_drd, "after lane run");
++
++	phy_drd->ss_port = port;
++	dev_info(phy_drd->dev, "USB3 combo PHY up on lanes %s (%s), RX CDR %s after %lld us (B84 %#x)\n",
++		 port ? "2/3" : "0/1",
++		 phy_drd->ss_src ?: "?",
++		 err ? "not locked" : "locked", cdr_us,
++		 readl(regs_pma + (port ? EXYNOS9820_PMA_TRSV_A1B84 :
++				   EXYNOS9820_PMA_TRSV_A0B84)));
++}
++
++/* orientation changed while the SS PHY is in use: move it to the other lanes */
++static void exynos9820_usbdrd_ss_retarget(struct exynos5_usbdrd_phy *phy_drd)
++{
++	int port;
++
++	if (!phy_drd->ss_inited || !exynos9820_ss)
++		return;
++
++	port = exynos9820_usbdrd_ss_port(phy_drd);
++	if (port == phy_drd->ss_port) {
++		dev_dbg(phy_drd->dev, "USB3 lanes stay on port %d (%s)\n", port,
++			phy_drd->ss_src);
++		return;
++	}
++
++	dev_info(phy_drd->dev, "USB3 lanes: port %d -> %d (%s), re-initialising combo PHY\n",
++		 phy_drd->ss_port, port, phy_drd->ss_src);
++	if (phy_drd->ss_port >= 0)
++		exynos9820_usbdrd_pipe3_off(phy_drd);
++	exynos9820_usbdrd_pipe3_init(phy_drd);
++}
++
++static int exynos9820_usbdrd_phy_init(struct phy *phy)
++{
++	struct phy_usb_instance *inst = phy_get_drvdata(phy);
++	struct exynos5_usbdrd_phy *phy_drd = to_usbdrd_phy(inst);
++
++	if (inst->phy_cfg->id == EXYNOS5_DRDPHY_PIPE3)
++		phy_drd->ss_inited = true;
++
++	return exynos850_usbdrd_phy_init(phy);
++}
++
++static int exynos9820_usbdrd_phy_exit(struct phy *phy)
++{
++	struct phy_usb_instance *inst = phy_get_drvdata(phy);
++	struct exynos5_usbdrd_phy *phy_drd = to_usbdrd_phy(inst);
++	int ret;
++
++	if (inst->phy_cfg->id == EXYNOS5_DRDPHY_UTMI)
++		return exynos850_usbdrd_phy_exit(phy);
++
++	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
++	if (ret)
++		return ret;
++
++	scoped_guard(mutex, &phy_drd->phy_mutex) {
++		if (phy_drd->ss_port >= 0)
++			exynos9820_usbdrd_pipe3_off(phy_drd);
++		if (phy_drd->ss_pmu_on) {
++			if (!phy_drd->dp_pmu_on)
++				regmap_update_bits(inst->reg_pmu,
++						   EXYNOS9820_PHY_CTRL_USBDP,
++						   EXYNOS4_PHY_ENABLE, 0);
++			phy_drd->ss_pmu_on = false;
++		}
++		phy_drd->ss_inited = false;
++	}
++
++	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
++
++	return 0;
++}
++
++/*
++ * HS pull-up hold for SuperSpeed-first connects. The 9820 has no
++ * VBUS pad, so the HS PHY's VBUS valid (HSP VBUSVLDEXT, which gates the D+
++ * pull-up) is software controlled. Downstream (dwc3 gadget, is_not_vbus_pad)
++ * clears it at pullup(on), on Connect Done at HS/SS and on wakeup, and sets
++ * it again at USB reset and on the U0 / Rx.Detect / Resume link states
++ * (phy_set(SET_DPPULLUP_DISABLE/ENABLE) -> phy_exynos_usb_v3p1_*_dp_pullup()).
++ * Without that the host sees the device on USB 2.0 while the SuperSpeed link
++ * is coming up, resets the USB 2.0 port, and the link drops SS (LTSSM history
++ * Polling -> U0 -> Recovery -> U0 -> SS.Disabled). DWC3 requests it here with
++ * phy_set_mode_ext(usb2 phy, PHY_MODE_USB_DEVICE_SS = hold, _HS = release).
++ * A hold is ignored while the SS PHY is not up (exynos9820_ss=0, PLL fail),
++ * so USB 2.0-only operation never changes. PHY_MODE_USB_DEVICE/HOST and the
++ * SS PHY going down release it.
++ */
++static void exynos9820_usbdrd_hs_hold_write(struct exynos5_usbdrd_phy *phy_drd,
++					    bool hold)
++{
++	void __iomem *regs_base = phy_drd->reg_phy;
++	u32 hsp;
++
++	hsp = readl(regs_base + EXYNOS850_DRD_HSP);
++	if (hold)
++		hsp = (hsp | HSP_VBUSVLDEXTSEL) & ~HSP_VBUSVLDEXT;
++	else
++		hsp |= HSP_VBUSVLDEXTSEL | HSP_VBUSVLDEXT;
++	writel(hsp, regs_base + EXYNOS850_DRD_HSP);
++	phy_drd->ss_hs_hold = hold;
++}
++
++static int exynos9820_usbdrd_hs_hold(struct exynos5_usbdrd_phy *phy_drd,
++				     bool hold)
++{
++	int ret;
++
++	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
++	if (ret)
++		return ret;
++
++	scoped_guard(mutex, &phy_drd->phy_mutex) {
++		if (hold && phy_drd->ss_port < 0)
++			hold = false;
++		if (hold != phy_drd->ss_hs_hold)
++			exynos9820_usbdrd_hs_hold_write(phy_drd, hold);
++	}
++
++	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
++
++	dev_dbg(phy_drd->dev, "HS pull-up %s\n", hold ? "held" : "released");
++
++	return 0;
++}
++
++/*
++ * No VBUS pad: in host mode the D+/D- pull-downs and the VBUSVALID/BVALID
++ * overrides must be set by software (downstream SET_DPDM_PULLDOWN ->
++ * phy_exynos_usb_v3p1_config_host_mode()). Device mode puts back what
++ * exynos850_usbdrd_utmi_init() programmed.
++ */
++static int exynos9820_usbdrd_phy_set_mode(struct phy *phy, enum phy_mode mode,
++					  int submode)
++{
++	struct phy_usb_instance *inst = phy_get_drvdata(phy);
++	struct exynos5_usbdrd_phy *phy_drd = to_usbdrd_phy(inst);
++	void __iomem *regs_base = phy_drd->reg_phy;
++	u32 utmi, hsp;
++	int ret;
++
++	/*
++	 * DWC3 sets the PIPE3 PHY's mode when a role starts (and
++	 * on a TypeC re-attach in device mode): re-target the SS lanes to the
++	 * cable orientation now, the port gpio / orientation are only read at
++	 * a combo PHY init otherwise.
++	 */
++	if (inst->phy_cfg->id == EXYNOS5_DRDPHY_PIPE3) {
++		if (mode != PHY_MODE_USB_HOST && mode != PHY_MODE_USB_DEVICE)
++			return 0;
++		ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks,
++					      phy_drd->clks);
++		if (ret)
++			return ret;
++		scoped_guard(mutex, &phy_drd->phy_mutex)
++			exynos9820_usbdrd_ss_retarget(phy_drd);
++		clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks,
++					   phy_drd->clks);
++		return 0;
++	}
++
++	if (inst->phy_cfg->id != EXYNOS5_DRDPHY_UTMI)
++		return 0;
++
++	if (mode == PHY_MODE_USB_DEVICE_SS || mode == PHY_MODE_USB_DEVICE_HS)
++		return exynos9820_usbdrd_hs_hold(phy_drd,
++						 mode == PHY_MODE_USB_DEVICE_SS);
++
++	if (mode != PHY_MODE_USB_HOST && mode != PHY_MODE_USB_DEVICE)
++		return 0;
++
++	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
++	if (ret)
++		return ret;
++
++	scoped_guard(mutex, &phy_drd->phy_mutex) {
++		phy_drd->ss_hs_hold = false;
++		utmi = readl(regs_base + EXYNOS850_DRD_UTMI);
++		hsp = readl(regs_base + EXYNOS850_DRD_HSP);
++		if (mode == PHY_MODE_USB_HOST) {
++			utmi |= UTMI_DP_PULLDOWN | UTMI_DM_PULLDOWN;
++			utmi &= ~(UTMI_FORCE_BVALID | UTMI_FORCE_VBUSVALID);
++			hsp &= ~(HSP_VBUSVLDEXTSEL | HSP_VBUSVLDEXT);
++		} else {
++			utmi &= ~(UTMI_DP_PULLDOWN | UTMI_DM_PULLDOWN);
++			utmi |= UTMI_FORCE_BVALID | UTMI_FORCE_VBUSVALID;
++			hsp |= HSP_VBUSVLDEXTSEL | HSP_VBUSVLDEXT;
++		}
++		writel(utmi, regs_base + EXYNOS850_DRD_UTMI);
++		writel(hsp, regs_base + EXYNOS850_DRD_HSP);
++
++		/* downstream phy_tune(usb3, otg state) at the role's core init */
++		phy_drd->ss_host = mode == PHY_MODE_USB_HOST;
++		if (phy_drd->ss_port >= 0)
++			exynos9820_usbdrd_ss_tune(phy_drd, "on role change");
++	}
++
++	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
++
++	dev_dbg(phy_drd->dev, "UTMI %s mode\n",
++		mode == PHY_MODE_USB_HOST ? "host" : "device");
++
++	return 0;
++}
++
++static const struct phy_ops exynos9820_usbdrd_phy_ops = {
++	.init		= exynos9820_usbdrd_phy_init,
++	.exit		= exynos9820_usbdrd_phy_exit,
++	.power_on	= exynos5_usbdrd_phy_power_on,
++	.power_off	= exynos5_usbdrd_phy_power_off,
++	.set_mode	= exynos9820_usbdrd_phy_set_mode,
++	.owner		= THIS_MODULE,
++};
++
++
++/*
++ * Exynos9820 DisplayPort over the USBDP combo PHY (third PHY, phandle arg 2).
++ *
++ * Downstream the DP link driver programs the combo PHY's DP registers
++ * itself (dpu20/cal_9820/displayport_reg.c, "phy_regs" = the PMA region at
++ * 0x10ae0000) after asking the USB driver to power the PHY
++ * (dwc3_exynos_phy_enable) and to give DP 4 or 2 lanes
++ * (exynos_usbdrd_inform_dp_use). Here that lives in the PHY driver:
++ *
++ *  - typec_mux (DT "mode-switch"): the DP alt mode pin assignment decides
++ *    how many lanes DP may use (C/E: 4, USB3 must be off; D: 2, USB3 keeps
++ *    the other pair). The limit is published as the DP PHY's bus width.
++ *  - phy_configure(opts.dp): set_rate/set_lanes re-run the downstream PHY
++ *    sequence (reset, default table, link BW, lane mux + TX clock
++ *    inversion, SSC off, reset release); set_voltages writes the per lane
++ *    amplitude/emphasis table. The PLL lock is polled by the DP controller
++ *    (SYSTEM_PLL_LOCK_CONTROL is a link register).
++ *
++ * Lane mapping (displayport_reg_set_phy_voltage_and_pre_emphasis /
++ * _set_lane_map_config, pin C/D/E): DP lane i is on physical lane
++ * map[flip][i]; "flip" is downstream dp_sw_sel (CC2 / TypeC reverse), the
++ * complement of the USB3 port select.
++ *
++ * UNTESTED on hardware.
++ */
++#define EXYNOS9820_DP_CMN_REG0009		0x0024
++#define DP_CMN_ANA_AUX_TX_LVL_CTRL		GENMASK(6, 3)
++#define EXYNOS9820_DP_CMN_REG00A2		0x0288
++#define DP_CMN_LANE_MUX_SEL_DP(ln)		BIT(4 + (ln))
++#define DP_CMN_LANE_EN(ln)			BIT(ln)
++#define EXYNOS9820_DP_CMN_REG00A3		0x028c
++#define DP_CMN_TX_LINK_BW			GENMASK(6, 5)
++#define EXYNOS9820_DP_CMN_REG00B4		0x02d0
++#define DP_CMN_ROPLL_SSC_EN			BIT(1)
++#define EXYNOS9820_DP_CMN_REG00E3		0x038c
++#define DP_CMN_DP_INIT_RSTN			BIT(3)
++#define DP_CMN_DP_CMN_RSTN			BIT(2)
++#define DP_CMN_CDR_WATCHDOG_EN			BIT(1)
++/* per physical lane: TRSV_REG0204/0404/0604/0804 (+4*n), TRSV_REGx215 */
++#define EXYNOS9820_DP_TRSV_TUNE(ln)		(0x0810 + 0x800 * (ln))
++#define EXYNOS9820_DP_TRSV_TXCLK(ln)		(0x0854 + 0x800 * (ln))
++#define DP_TRSV_ANA_TX_SER_TXCLK_INV		BIT(1)
++
++/*
++ * EVT1 phy_default_value[] (displayport_reg.c). DEFAULT_SFR_CNT is 32 for EVT1
++ * (regs-displayport.h), so the table has exactly these 32 entries; the
++ * {0, 0} entry of the first implementation (a write of 0 to CMN_REG0000)
++ * came from misreading the EVT0 count and is gone.
++ */
++static const u16 exynos9820_dp_phy_defaults[][2] = {
++	{ 0x0830, 0x07 }, { 0x085c, 0x80 }, { 0x1030, 0x07 }, { 0x105c, 0x80 },
++	{ 0x1830, 0x07 }, { 0x185c, 0x80 }, { 0x2030, 0x07 }, { 0x205c, 0x80 },
++	{ 0x0228, 0x38 }, { 0x0104, 0x44 }, { 0x0248, 0x44 }, { 0x038c, 0x02 },
++	{ 0x0878, 0x04 }, { 0x1878, 0x04 }, { 0x09a4, 0x07 }, { 0x09a8, 0x22 },
++	{ 0x19a4, 0x07 }, { 0x19a8, 0x22 }, { 0x0994, 0x12 }, { 0x1994, 0x12 },
++	{ 0x0998, 0x12 }, { 0x1998, 0x12 }, { 0x099c, 0x48 }, { 0x199c, 0x48 },
++	{ 0x0898, 0x77 }, { 0x1898, 0x77 }, { 0x0054, 0x01 }, { 0x00e0, 0x38 },
++	{ 0x0060, 0x24 }, { 0x0064, 0x77 }, { 0x0070, 0x76 }, { 0x0234, 0xe8 },
++};
++static_assert(ARRAY_SIZE(exynos9820_dp_phy_defaults) == 32);
++
++/* EVT1 phy_tune_param_default[swing][pre-emphasis] = {amp, post, pre, idrv, accdrv} */
++static const u8 exynos9820_dp_tune[4][4][5] = {
++	{
++		{ 0x21, 0x10, 0x42, 0xe5, 0x60 }, { 0x25, 0x14, 0x42, 0xe5, 0x60 },
++		{ 0x26, 0x17, 0x43, 0xe5, 0x60 }, { 0x2b, 0x1c, 0x43, 0xe7, 0x60 },
++	}, {
++		{ 0x26, 0x10, 0x42, 0xe7, 0x60 }, { 0x2b, 0x15, 0x42, 0xe7, 0x60 },
++		{ 0x2b, 0x18, 0x43, 0xe7, 0x60 }, { 0x2b, 0x18, 0x43, 0xe7, 0x60 },
++	}, {
++		{ 0x2a, 0x10, 0x42, 0xe7, 0x60 }, { 0x2b, 0x15, 0x43, 0xe7, 0x60 },
++		{ 0x2b, 0x15, 0x43, 0xe7, 0x60 }, { 0x2b, 0x15, 0x43, 0xe7, 0x60 },
++	}, {
++		{ 0x2b, 0x10, 0x43, 0xe7, 0x60 }, { 0x2b, 0x10, 0x43, 0xe7, 0x60 },
++		{ 0x2b, 0x10, 0x43, 0xe7, 0x60 }, { 0x2b, 0x10, 0x43, 0xe7, 0x60 },
++	},
++};
++
++static const u8 exynos9820_dp_lane_map[2][4] = {
++	{ 0, 1, 3, 2 },		/* CC1 */
++	{ 3, 2, 0, 1 },		/* CC2 (dp_sw_sel) */
++};
++
++static void exynos9820_dp_write_mask(struct exynos5_usbdrd_phy *phy_drd,
++				     u32 off, u32 mask, u32 val)
++{
++	u32 reg = readl(phy_drd->reg_pma + off);
++
++	writel((reg & ~mask) | (val & mask), phy_drd->reg_pma + off);
++}
++
++static bool exynos9820_dp_flip(struct exynos5_usbdrd_phy *phy_drd)
++{
++	/* DP takes the lane pair USB3 does not use */
++	return !exynos9820_usbdrd_ss_port(phy_drd);
++}
++
++/* PMU isolation off + PMA out of reset, without touching the USB link side */
++static void exynos9820_dp_pma_on(struct exynos5_usbdrd_phy *phy_drd)
++{
++	struct phy_usb_instance *inst = &phy_drd->phys[EXYNOS5_DRDPHY_PIPE3];
++	void __iomem *regs_phy = phy_drd->reg_phy;
++	u32 reg;
++
++	if (!phy_drd->ss_pmu_on && !phy_drd->dp_pmu_on)
++		regmap_update_bits(inst->reg_pmu, EXYNOS9820_PHY_CTRL_USBDP,
++				   EXYNOS4_PHY_ENABLE, EXYNOS4_PHY_ENABLE);
++	phy_drd->dp_pmu_on = true;
++
++	if (phy_drd->ss_port >= 0)
++		return;		/* the USB3 bring-up already released the PMA */
++
++	/* phy_exynos_usb_v3p1_g2_pma_ready() + _pma_sw_rst_release() */
++	udelay(100);
++	reg = readl(regs_phy + EXYNOS850_DRD_SECPMACTL);
++	reg &= ~(SECPMACTL_PMA_ROPLL_REF_CLK_SEL |
++		 SECPMACTL_PMA_LCPLL_REF_CLK_SEL | SECPMACTL_PMA_REF_FREQ_SEL);
++	reg |= FIELD_PREP(SECPMACTL_PMA_REF_FREQ_SEL, 1);
++	reg |= SECPMACTL_PMA_LOW_PWR | SECPMACTL_PMA_TRSV_SW_RST |
++	       SECPMACTL_PMA_CMN_SW_RST | SECPMACTL_PMA_INIT_SW_RST |
++	       SECPMACTL_PMA_APB_SW_RST;
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++	udelay(1);
++	reg &= ~SECPMACTL_PMA_LOW_PWR;
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++	udelay(1);
++	reg &= ~SECPMACTL_PMA_APB_SW_RST;
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++	reg &= ~SECPMACTL_PMA_INIT_SW_RST;
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++	udelay(1);
++	reg &= ~(SECPMACTL_PMA_TRSV_SW_RST | SECPMACTL_PMA_CMN_SW_RST);
++	writel(reg, regs_phy + EXYNOS850_DRD_SECPMACTL);
++	udelay(10);
++}
++
++static void exynos9820_dp_pma_off(struct exynos5_usbdrd_phy *phy_drd)
++{
++	struct phy_usb_instance *inst = &phy_drd->phys[EXYNOS5_DRDPHY_PIPE3];
++	u32 reg;
++
++	if (!phy_drd->dp_pmu_on)
++		return;
++	phy_drd->dp_pmu_on = false;
++	if (phy_drd->ss_port >= 0 || phy_drd->ss_pmu_on)
++		return;		/* USB3 still uses it */
++
++	/* back to the low power state utmi_init leaves the PMA in */
++	reg = readl(phy_drd->reg_phy + EXYNOS850_DRD_SECPMACTL);
++	reg |= SECPMACTL_PMA_LOW_PWR;
++	writel(reg, phy_drd->reg_phy + EXYNOS850_DRD_SECPMACTL);
++	regmap_update_bits(inst->reg_pmu, EXYNOS9820_PHY_CTRL_USBDP,
++			   EXYNOS4_PHY_ENABLE, 0);
++}
++
++/* displayport_reg_phy_reset(1) ... phy_reset(0) of the link training */
++static void exynos9820_dp_phy_setup(struct exynos5_usbdrd_phy *phy_drd)
++{
++	unsigned int i, ln, n = phy_drd->dp_lanes;
++	bool flip = phy_drd->dp_flip;
++	u32 mux = 0, bw;
++
++	exynos9820_dp_write_mask(phy_drd, EXYNOS9820_DP_CMN_REG00E3,
++				 DP_CMN_DP_CMN_RSTN, 0);
++
++	for (i = 0; i < ARRAY_SIZE(exynos9820_dp_phy_defaults); i++)
++		writel(exynos9820_dp_phy_defaults[i][1],
++		       phy_drd->reg_pma + exynos9820_dp_phy_defaults[i][0]);
++	exynos9820_dp_write_mask(phy_drd, EXYNOS9820_DP_CMN_REG0009,
++				 DP_CMN_ANA_AUX_TX_LVL_CTRL,
++				 FIELD_PREP(DP_CMN_ANA_AUX_TX_LVL_CTRL, 0xd));
++
++	switch (phy_drd->dp_rate) {
++	case 1620:
++		bw = 0;
++		break;
++	case 2700:
++		bw = 1;
++		break;
++	default:
++		bw = 2;
++		break;
++	}
++	exynos9820_dp_write_mask(phy_drd, EXYNOS9820_DP_CMN_REG00A3,
++				 DP_CMN_TX_LINK_BW,
++				 FIELD_PREP(DP_CMN_TX_LINK_BW, bw));
++
++	/* lane mux: all 4 lanes, or the pair USB3 does not use */
++	for (ln = 0; ln < 4; ln++) {
++		bool dp = n > 2 || (flip ? ln >= 2 : ln < 2);
++
++		if (dp)
++			mux |= DP_CMN_LANE_MUX_SEL_DP(ln) | DP_CMN_LANE_EN(ln);
++		exynos9820_dp_write_mask(phy_drd, EXYNOS9820_DP_TRSV_TXCLK(ln),
++					 DP_TRSV_ANA_TX_SER_TXCLK_INV,
++					 dp && phy_drd->dp_rate < 5400 ?
++					 DP_TRSV_ANA_TX_SER_TXCLK_INV : 0);
++	}
++	writel(mux, phy_drd->reg_pma + EXYNOS9820_DP_CMN_REG00A2);
++
++	exynos9820_dp_write_mask(phy_drd, EXYNOS9820_DP_CMN_REG00B4,
++				 DP_CMN_ROPLL_SSC_EN, 0);
++
++	udelay(60);
++	writel(DP_CMN_DP_INIT_RSTN | DP_CMN_CDR_WATCHDOG_EN,
++	       phy_drd->reg_pma + EXYNOS9820_DP_CMN_REG00E3);
++	udelay(1);
++	writel(DP_CMN_DP_INIT_RSTN | DP_CMN_DP_CMN_RSTN | DP_CMN_CDR_WATCHDOG_EN,
++	       phy_drd->reg_pma + EXYNOS9820_DP_CMN_REG00E3);
++}
++
++static void exynos9820_dp_set_tune(struct exynos5_usbdrd_phy *phy_drd,
++				   const struct phy_configure_opts_dp *dp)
++{
++	const u8 *map = exynos9820_dp_lane_map[phy_drd->dp_flip];
++	unsigned int i, j;
++
++	for (i = 0; i < phy_drd->dp_lanes; i++) {
++		unsigned int v = min(dp->voltage[i], 3u);
++		unsigned int pre = min(dp->pre[i], 3u);
++
++		for (j = 0; j < 5; j++)
++			writel(exynos9820_dp_tune[v][pre][j], phy_drd->reg_pma +
++			       EXYNOS9820_DP_TRSV_TUNE(map[i]) + 4 * j);
++	}
++}
++
++static int exynos9820_dp_phy_power_on(struct phy *phy)
++{
++	struct exynos5_usbdrd_phy *phy_drd = phy_get_drvdata(phy);
++	int ret;
++
++	if (!phy_drd->reg_pma)
++		return -ENODEV;
++
++	ret = clk_bulk_prepare_enable(phy_drd->drv_data->n_clks, phy_drd->clks);
++	if (ret)
++		return ret;
++
++	guard(mutex)(&phy_drd->phy_mutex);
++	/*
++	 * The DP sequence resets the PMA common block and rewrites its default
++	 * table, which a running USB3 pipe does not survive; USB3 next to a
++	 * 2-lane DP link (pin D) would need a shared PMA init (TODO). So DP
++	 * always takes the PHY from USB3, also for 2 lanes; USB 2.0 (UTMI)
++	 * is not touched. pipe3 init refuses while dp_on.
++	 */
++	if (phy_drd->ss_port >= 0) {
++		dev_warn(phy_drd->dev, "DP (%u lanes): stopping the USB3 pipe, USB 2.0 stays\n",
++			 phy_drd->dp_max_lanes ?: 4);
++		exynos9820_usbdrd_pipe3_off(phy_drd);
++	}
++	exynos9820_dp_pma_on(phy_drd);
++	phy_drd->dp_flip = exynos9820_dp_flip(phy_drd);
++	phy_drd->dp_lanes = phy_drd->dp_max_lanes ?: 4;
++	phy_drd->dp_rate = 1620;
++	exynos9820_dp_phy_setup(phy_drd);
++	phy_drd->dp_on = true;
++	dev_info(phy_drd->dev, "DP PHY on (max %u lanes, %s)\n",
++		 phy_drd->dp_max_lanes, phy_drd->dp_flip ? "CC2" : "CC1");
++
++	return 0;
++}
++
++static int exynos9820_dp_phy_power_off(struct phy *phy)
++{
++	struct exynos5_usbdrd_phy *phy_drd = phy_get_drvdata(phy);
++
++	scoped_guard(mutex, &phy_drd->phy_mutex) {
++		exynos9820_dp_write_mask(phy_drd, EXYNOS9820_DP_CMN_REG00E3,
++					 DP_CMN_DP_CMN_RSTN, 0);
++		writel(0, phy_drd->reg_pma + EXYNOS9820_DP_CMN_REG00A2);
++		exynos9820_dp_pma_off(phy_drd);
++		phy_drd->dp_on = false;
++	}
++
++	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
++	return 0;
++}
++
++static int exynos9820_dp_phy_validate(struct phy *phy, enum phy_mode mode,
++				      int submode, union phy_configure_opts *opts)
++{
++	struct exynos5_usbdrd_phy *phy_drd = phy_get_drvdata(phy);
++	struct phy_configure_opts_dp *dp = &opts->dp;
++
++	if (mode != PHY_MODE_DP)
++		return -EINVAL;
++	if (dp->set_lanes && (dp->lanes == 3 || dp->lanes > 4 ||
++			      (phy_drd->dp_max_lanes &&
++			       dp->lanes > phy_drd->dp_max_lanes)))
++		return -EINVAL;
++	if (dp->set_rate && dp->link_rate != 1620 && dp->link_rate != 2700 &&
++	    dp->link_rate != 5400)
++		return -EINVAL;
++	return 0;
++}
++
++static int exynos9820_dp_phy_configure(struct phy *phy,
++				       union phy_configure_opts *opts)
++{
++	struct exynos5_usbdrd_phy *phy_drd = phy_get_drvdata(phy);
++	struct phy_configure_opts_dp *dp = &opts->dp;
++	int ret;
++
++	ret = exynos9820_dp_phy_validate(phy, PHY_MODE_DP, 0, opts);
++	if (ret)
++		return ret;
++
++	guard(mutex)(&phy_drd->phy_mutex);
++	if (!phy_drd->dp_on)
++		return -EIO;
++
++	if (dp->set_lanes)
++		phy_drd->dp_lanes = dp->lanes;
++	if (dp->set_rate)
++		phy_drd->dp_rate = dp->link_rate;
++	if (dp->set_lanes || dp->set_rate) {
++		phy_drd->dp_flip = exynos9820_dp_flip(phy_drd);
++		exynos9820_dp_phy_setup(phy_drd);
++	}
++	if (dp->set_voltages)
++		exynos9820_dp_set_tune(phy_drd, dp);
++
++	return 0;
++}
++
++static int exynos9820_dp_phy_set_mode(struct phy *phy, enum phy_mode mode,
++				      int submode)
++{
++	return mode == PHY_MODE_DP ? 0 : -EINVAL;
++}
++
++static const struct phy_ops exynos9820_dp_phy_ops = {
++	.power_on	= exynos9820_dp_phy_power_on,
++	.power_off	= exynos9820_dp_phy_power_off,
++	.set_mode	= exynos9820_dp_phy_set_mode,
++	.validate	= exynos9820_dp_phy_validate,
++	.configure	= exynos9820_dp_phy_configure,
++	.owner		= THIS_MODULE,
++};
++
++static int exynos9820_dp_mux_set(struct typec_mux_dev *mux,
++				 struct typec_mux_state *state)
++{
++	struct exynos5_usbdrd_phy *phy_drd = typec_mux_get_drvdata(mux);
++	unsigned int lanes = 0;
++
++	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
++		switch (state->mode) {
++		case TYPEC_DP_STATE_C:
++		case TYPEC_DP_STATE_E:
++			lanes = 4;
++			break;
++		case TYPEC_DP_STATE_D:
++			lanes = 2;
++			break;
++		default:
++			break;
++		}
++	}
++
++	guard(mutex)(&phy_drd->phy_mutex);
++	if (lanes != phy_drd->dp_max_lanes)
++		dev_info(phy_drd->dev, "DP alt mode: %u lanes\n", lanes);
++	phy_drd->dp_max_lanes = lanes;
++	phy_set_bus_width(phy_drd->dp_phy, lanes);
++	/*
++	 * A running USB3 pipe is stopped by the DP PHY power on, not here:
++	 * the mux is also set for USB/safe states without DP. The DWC3 speed
++	 * drop of downstream exynos_usbdrd_inform_dp_use() is not done (the SS
++	 * port just loses its link).
++	 */
++	return 0;
++}
++
++static void exynos9820_dp_mux_unregister(void *data)
++{
++	typec_mux_unregister(data);
++}
++
++static int exynos9820_dp_setup(struct exynos5_usbdrd_phy *phy_drd)
++{
++	struct device *dev = phy_drd->dev;
++	struct typec_mux_desc mux_desc = { };
++	int ret;
++
++	if (!phy_drd->reg_pma)
++		return 0;	/* DT without the combo PHY registers */
++
++	phy_drd->dp_phy = devm_phy_create(dev, NULL, &exynos9820_dp_phy_ops);
++	if (IS_ERR(phy_drd->dp_phy))
++		return dev_err_probe(dev, PTR_ERR(phy_drd->dp_phy),
++				     "failed to create DP phy\n");
++	phy_set_drvdata(phy_drd->dp_phy, phy_drd);
++
++	if (!IS_ENABLED(CONFIG_TYPEC) ||
++	    !device_property_present(dev, "mode-switch"))
++		return 0;
++
++	mux_desc.drvdata = phy_drd;
++	mux_desc.fwnode = dev_fwnode(dev);
++	mux_desc.set = exynos9820_dp_mux_set;
++	phy_drd->mux = typec_mux_register(dev, &mux_desc);
++	if (IS_ERR(phy_drd->mux))
++		return dev_err_probe(dev, PTR_ERR(phy_drd->mux),
++				     "failed to register TypeC mux\n");
++
++	ret = devm_add_action_or_reset(dev, exynos9820_dp_mux_unregister,
++				       phy_drd->mux);
++	return ret;
++}
++
++/*
++ * phy_config::phy_init returns int since 7.4; the Exynos9820 init steps
++ * report their own failures (and fall back to USB 2.0) instead.
++ */
++static int exynos9820_usbdrd_utmi_init_cfg(struct exynos5_usbdrd_phy *phy_drd)
++{
++	exynos9820_usbdrd_utmi_init(phy_drd);
++	return 0;
++}
++
++static int exynos9820_usbdrd_pipe3_init_cfg(struct exynos5_usbdrd_phy *phy_drd)
++{
++	exynos9820_usbdrd_pipe3_init(phy_drd);
++	return 0;
++}
++
++static const struct exynos5_usbdrd_phy_config phy_cfg_exynos9820[] = {
++	{
++		.id		= EXYNOS5_DRDPHY_UTMI,
++		.phy_isol	= exynos5_usbdrd_phy_isol,
++		.phy_init	= exynos9820_usbdrd_utmi_init_cfg,
++	}, {
++		.id		= EXYNOS5_DRDPHY_PIPE3,
++		.phy_isol	= exynos9820_usbdrd_pipe3_isol,
++		.phy_init	= exynos9820_usbdrd_pipe3_init_cfg,
++	},
++};
++
+ static int exynos5_usbdrd_phy_clk_handle(struct exynos5_usbdrd_phy *phy_drd)
+ {
+ 	int ret;
+@@ -1881,6 +3069,14 @@ static int exynos5_usbdrd_orien_sw_set(struct typec_switch_dev *sw,
+ 		void __iomem * const regs_base = phy_drd->reg_phy;
+ 		unsigned int reg;
+ 
++		if (phy_drd->drv_data->orien_sw_ss_only) {
++			/* SS lane selection only, VBUSVALID stays forced */
++			phy_drd->orientation = orientation;
++			if (orientation != TYPEC_ORIENTATION_NONE)
++				exynos9820_usbdrd_ss_retarget(phy_drd);
++			break;
++		}
++
+ 		if (orientation == TYPEC_ORIENTATION_NONE) {
+ 			reg = readl(regs_base + EXYNOS850_DRD_UTMI);
+ 			reg &= ~(UTMI_FORCE_VBUSVALID | UTMI_FORCE_BVALID);
+@@ -2135,6 +3331,20 @@ static const struct exynos5_usbdrd_phy_drvdata exynos990_usbdrd_phy = {
+ 	.n_regulators		= ARRAY_SIZE(exynos5_regulator_names),
+ };
+ 
++static const struct exynos5_usbdrd_phy_drvdata exynos9820_usbdrd_phy = {
++	.phy_cfg		= phy_cfg_exynos9820,
++	.phy_ops		= &exynos9820_usbdrd_phy_ops,
++	.phy_tunes		= exynos990_tunes,
++	.pmu_offset_usbdrd0_phy	= EXYNOS990_PHY_CTRL_USB20,
++	.clk_names		= exynos5_clk_names,
++	.n_clks			= ARRAY_SIZE(exynos5_clk_names),
++	.core_clk_names		= exynos5_core_clk_names,
++	.n_core_clks		= ARRAY_SIZE(exynos5_core_clk_names),
++	.regulator_names	= exynos5_regulator_names,
++	.n_regulators		= ARRAY_SIZE(exynos5_regulator_names),
++	.orien_sw_ss_only	= true,
++};
++
+ static void
+ exynosautov920_usb31drd_cr_clk(struct exynos5_usbdrd_phy *phy_drd, bool high)
+ {
+@@ -2934,6 +4144,9 @@ static const struct of_device_id exynos5_usbdrd_phy_of_match[] = {
+ 	}, {
+ 		.compatible = "samsung,exynos990-usbdrd-phy",
+ 		.data = &exynos990_usbdrd_phy
++	}, {
++		.compatible = "samsung,exynos9820-usbdrd-phy",
++		.data = &exynos9820_usbdrd_phy
+ 	}, {
+ 		.compatible = "samsung,exynosautov920-usb31drd-combo-ssphy",
+ 		.data = &exynosautov920_usb31drd_combo_ssphy
+@@ -3047,6 +4260,25 @@ static int exynos5_usbdrd_phy_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	phy_drd->ss_port = -1;
++	if (drv_data->orien_sw_ss_only) {
++		/* optional, never fail the (USB 2.0) PHY because of it */
++		phy_drd->port_gpio = devm_gpiod_get_optional(dev, "samsung,usbdp-port",
++							     GPIOD_IN);
++		if (PTR_ERR_OR_ZERO(phy_drd->port_gpio) == -EPROBE_DEFER)
++			/* shared GPIO (also used by DP): wait for its proxy */
++			return -EPROBE_DEFER;
++		if (IS_ERR(phy_drd->port_gpio)) {
++			dev_warn(dev, "no USB3 port select gpio (%ld), using TypeC orientation\n",
++				 PTR_ERR(phy_drd->port_gpio));
++			phy_drd->port_gpio = NULL;
++		}
++
++		ret = exynos9820_dp_setup(phy_drd);
++		if (ret)
++			return ret;
++	}
++
+ 	dev_vdbg(dev, "Creating usbdrd_phy phy\n");
+ 
+ 	for (i = 0; i < EXYNOS5_DRDPHYS_NUM; i++) {

@@ -1,0 +1,586 @@
+From 32608d5af2ba6e3f75383abae96fbf2705165ba4 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] Input: s6sy761 - robust boot handshake, panel follower,
+ background resume
+
+Touch controller of the Galaxy S10 family:
+
+ - Boot handshake: the supplies are regulator-boot-on, so at probe the
+   controller has been running for seconds and the boot-complete event
+   may be gone. Poll the event stack for up to 1 s, then try a
+   software reset and finally a power cycle, and report a failure with
+   dev_err_probe(). The supplies are enabled before the power-off
+   action is registered.
+ - The size warning checks the multitouch axes that are actually set
+   up.
+ - Panel follower: sensing depends on the panel (the DDIC drives the
+   sync input). With a "panel" property the driver registers as a
+   drm_panel_follower: sense off before the panel is disabled, sense
+   on after it has been enabled. The follower is registered from a
+   delayed work that retries, because the panel driver usually probes
+   later.
+ - System resume: the interrupt stays masked until the controller is
+   up (the threaded handler otherwise consumed the boot-complete
+   event), and the power-up runs from a work item instead of the
+   resume callback. Contacts are released on suspend, the supply
+   enable and the interrupt mask are tracked, and the sense commands
+   are skipped while the controller is off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/input/touchscreen/Kconfig   |   1 +
+ drivers/input/touchscreen/s6sy761.c | 390 +++++++++++++++++++++++++---
+ 2 files changed, 348 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index 9b9ae8ac3f..9452e0bd82 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -530,6 +530,7 @@ config TOUCHSCREEN_IPROC
+ config TOUCHSCREEN_S6SY761
+ 	tristate "Samsung S6SY761 Touchscreen driver"
+ 	depends on I2C
++	depends on DRM || !DRM
+ 	help
+ 	  Say Y if you have the Samsung S6SY761 driver
+ 
+diff --git a/drivers/input/touchscreen/s6sy761.c b/drivers/input/touchscreen/s6sy761.c
+index 4390af73a4..3af1110346 100644
+--- a/drivers/input/touchscreen/s6sy761.c
++++ b/drivers/input/touchscreen/s6sy761.c
+@@ -15,10 +15,14 @@
+ #include <linux/module.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/workqueue.h>
++
++#include <drm/drm_panel.h>
+ 
+ /* commands */
+ #define S6SY761_SENSE_ON		0x10
+ #define S6SY761_SENSE_OFF		0x11
++#define S6SY761_SW_RESET		0x12
+ #define S6SY761_TOUCH_FUNCTION		0x30 /* R/W for get/set */
+ #define S6SY761_FIRMWARE_INTEGRITY	0x21
+ #define S6SY761_PANEL_INFO		0x23
+@@ -97,6 +101,13 @@
+ #define S6SY761_TS_STATUS_SIZE		5
+ #define S6SY761_MAX_FINGERS		10
+ 
++/* power-up timing, see s6sy761_start() */
++#define S6SY761_POWER_ON_DELAY_MS	140
++#define S6SY761_RESET_DELAY_MS		300
++#define S6SY761_POWER_OFF_DELAY_MS	50
++#define S6SY761_BOOT_POLL_MS		20
++#define S6SY761_BOOT_TIMEOUT_MS		1000
++
+ #define S6SY761_DEV_NAME	"s6sy761"
+ 
+ enum s6sy761_regulators {
+@@ -114,8 +125,37 @@ struct s6sy761_data {
+ 
+ 	u16 devid;
+ 	u8 tx_channel;
++
++	/* optional: follow the display panel given by the "panel" property */
++	struct drm_panel_follower follower;
++	struct delayed_work follow_work;
++	unsigned int follow_tries;
++	bool following;
++
++	/*
++	 * System sleep state, protected by input->mutex: the supplies are off
++	 * while suspended; panel_on mirrors the followed panel's enable state;
++	 * need_init means the controller did not come back after a resume and
++	 * is brought up again from reinit_work. powered tracks our enable of
++	 * the supplies and irq_masked our disable_irq(), so that a failed
++	 * attempt is not followed by an unbalanced disable.
++	 */
++	struct work_struct reinit_work;
++	bool powered;
++	bool irq_masked;
++	bool suspended;
++	bool panel_on;
++	bool need_init;
+ };
+ 
++/*
++ * On panels whose DDIC drives the touch controller's sync input (Galaxy S10
++ * family: S6E3HA9 "TSP HSYNC"), sensing stops while the panel is off and the
++ * controller may need a reset once the panel is powered again. With a
++ * "panel" phandle in DT the driver follows that panel: sense off before the
++ * panel is disabled, sense on after it is enabled.
++ */
++
+ /*
+  * We can't simply use i2c_smbus_read_i2c_block_data because we
+  * need to read more than 255 bytes
+@@ -290,6 +330,12 @@ static int s6sy761_input_open(struct input_dev *dev)
+ {
+ 	struct s6sy761_data *sdata = input_get_drvdata(dev);
+ 
++	/* the sense state is set once the controller is back */
++	if (sdata->need_init && !sdata->suspended)
++		schedule_work(&sdata->reinit_work);
++	if (sdata->suspended || sdata->need_init)
++		return 0;
++
+ 	return i2c_smbus_write_byte(sdata->client, S6SY761_SENSE_ON);
+ }
+ 
+@@ -298,11 +344,88 @@ static void s6sy761_input_close(struct input_dev *dev)
+ 	struct s6sy761_data *sdata = input_get_drvdata(dev);
+ 	int ret;
+ 
++	if (sdata->suspended || sdata->need_init)
++		return;
++
+ 	ret = i2c_smbus_write_byte(sdata->client, S6SY761_SENSE_OFF);
+ 	if (ret)
+ 		dev_err(&sdata->client->dev, "failed to turn off sensing\n");
+ }
+ 
++static int s6sy761_panel_enabled(struct drm_panel_follower *follower)
++{
++	struct s6sy761_data *sdata =
++		container_of(follower, struct s6sy761_data, follower);
++	struct input_dev *input = sdata->input;
++	int ret = 0;
++
++	mutex_lock(&input->mutex);
++	sdata->panel_on = true;
++	if (sdata->need_init)
++		schedule_work(&sdata->reinit_work);
++	else if (!sdata->suspended && input_device_enabled(input))
++		ret = i2c_smbus_write_byte(sdata->client, S6SY761_SENSE_ON);
++	mutex_unlock(&input->mutex);
++
++	return ret;
++}
++
++static int s6sy761_panel_disabling(struct drm_panel_follower *follower)
++{
++	struct s6sy761_data *sdata =
++		container_of(follower, struct s6sy761_data, follower);
++	struct input_dev *input = sdata->input;
++	int ret = 0;
++
++	mutex_lock(&input->mutex);
++	sdata->panel_on = false;
++	if (!sdata->suspended && !sdata->need_init &&
++	    input_device_enabled(input))
++		ret = i2c_smbus_write_byte(sdata->client, S6SY761_SENSE_OFF);
++	mutex_unlock(&input->mutex);
++
++	return ret;
++}
++
++static const struct drm_panel_follower_funcs s6sy761_follower_funcs = {
++	.panel_enabled = s6sy761_panel_enabled,
++	.panel_disabling = s6sy761_panel_disabling,
++};
++
++/*
++ * The panel driver is a module and may come much later (or never); touch
++ * works without it, so look for the panel in the background instead of
++ * deferring the probe.
++ */
++static void s6sy761_follow_work(struct work_struct *work)
++{
++	struct s6sy761_data *sdata =
++		container_of(work, struct s6sy761_data, follow_work.work);
++	struct device *dev = &sdata->client->dev;
++	int ret;
++
++	sdata->follower.funcs = &s6sy761_follower_funcs;
++	ret = drm_panel_add_follower(dev, &sdata->follower);
++	if (!ret) {
++		sdata->following = true;
++		dev_info(dev, "following the display panel\n");
++	} else if (ret == -EPROBE_DEFER && ++sdata->follow_tries < 300) {
++		schedule_delayed_work(&sdata->follow_work, HZ);
++	} else {
++		dev_info(dev, "not following a panel: %d\n", ret);
++	}
++}
++
++static void s6sy761_unfollow(void *data)
++{
++	struct s6sy761_data *sdata = data;
++
++	cancel_delayed_work_sync(&sdata->follow_work);
++	if (sdata->following)
++		drm_panel_remove_follower(&sdata->follower);
++	sdata->following = false;
++}
++
+ static ssize_t s6sy761_sysfs_devid(struct device *dev,
+ 				struct device_attribute *attr, char *buf)
+ {
+@@ -319,33 +442,82 @@ static struct attribute *s6sy761_sysfs_attrs[] = {
+ };
+ ATTRIBUTE_GROUPS(s6sy761_sysfs);
+ 
+-static int s6sy761_power_on(struct s6sy761_data *sdata)
++/*
++ * Poll the event stack until the controller reports that its firmware has
++ * booted. Other pending events are consumed. I2C errors are expected while
++ * the controller is still coming out of reset and are retried.
++ */
++static int s6sy761_wait_boot_complete(struct s6sy761_data *sdata)
+ {
++	unsigned long timeout = jiffies +
++				msecs_to_jiffies(S6SY761_BOOT_TIMEOUT_MS);
+ 	u8 buffer[S6SY761_EVENT_SIZE];
+ 	u8 event;
+ 	int ret;
+ 
+-	ret = regulator_bulk_enable(ARRAY_SIZE(sdata->regulators),
+-				    sdata->regulators);
+-	if (ret)
+-		return ret;
++	do {
++		ret = i2c_smbus_read_i2c_block_data(sdata->client,
++						    S6SY761_READ_ONE_EVENT,
++						    S6SY761_EVENT_SIZE,
++						    buffer);
++		if (ret == S6SY761_EVENT_SIZE) {
++			event = (buffer[0] >> 2) & 0xf;
++			if ((event == S6SY761_EVENT_INFO ||
++			     event == S6SY761_EVENT_VENDOR_INFO) &&
++			    buffer[1] == S6SY761_INFO_BOOT_COMPLETE)
++				return 0;
++			ret = -ENODEV;
++		} else if (ret >= 0) {
++			ret = -EIO;
++		}
+ 
+-	msleep(140);
++		msleep(S6SY761_BOOT_POLL_MS);
++	} while (time_before(jiffies, timeout));
+ 
+-	/* double check whether the touch is functional */
+-	ret = i2c_smbus_read_i2c_block_data(sdata->client,
+-					    S6SY761_READ_ONE_EVENT,
+-					    S6SY761_EVENT_SIZE,
+-					    buffer);
+-	if (ret < 0)
+-		return ret;
++	return ret;
++}
+ 
+-	event = (buffer[0] >> 2) & 0xf;
++/*
++ * Bring the (already powered) controller into application mode.
++ *
++ * The supplies are often left enabled by the bootloader ("regulator-boot-on"),
++ * in which case the controller booted long before the kernel and its
++ * boot-complete event may be gone. Fall back to a software reset and then to
++ * a full power cycle instead of failing the probe; a probe failing with
++ * -ENODEV/-ENXIO is silently dropped by the driver core and never retried.
++ */
++static int s6sy761_start(struct s6sy761_data *sdata)
++{
++	struct device *dev = &sdata->client->dev;
++	int ret;
+ 
+-	if ((event != S6SY761_EVENT_INFO &&
+-	     event != S6SY761_EVENT_VENDOR_INFO) ||
+-	    buffer[1] != S6SY761_INFO_BOOT_COMPLETE) {
+-		return -ENODEV;
++	ret = s6sy761_wait_boot_complete(sdata);
++	if (ret) {
++		dev_info(dev, "no boot-complete event (%d), resetting\n", ret);
++		ret = i2c_smbus_write_byte(sdata->client, S6SY761_SW_RESET);
++		if (!ret) {
++			msleep(S6SY761_RESET_DELAY_MS);
++			ret = s6sy761_wait_boot_complete(sdata);
++		}
++	}
++
++	if (ret) {
++		dev_info(dev, "reset failed (%d), power cycling\n", ret);
++		regulator_bulk_disable(ARRAY_SIZE(sdata->regulators),
++				       sdata->regulators);
++		sdata->powered = false;
++		msleep(S6SY761_POWER_OFF_DELAY_MS);
++		ret = regulator_bulk_enable(ARRAY_SIZE(sdata->regulators),
++					    sdata->regulators);
++		if (ret)
++			return ret;
++		sdata->powered = true;
++
++		msleep(S6SY761_POWER_ON_DELAY_MS);
++		ret = s6sy761_wait_boot_complete(sdata);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "controller did not boot\n");
+ 	}
+ 
+ 	ret = i2c_smbus_read_byte_data(sdata->client, S6SY761_BOOT_STATUS);
+@@ -354,16 +526,28 @@ static int s6sy761_power_on(struct s6sy761_data *sdata)
+ 
+ 	/* for some reasons the device might be stuck in the bootloader */
+ 	if (ret != S6SY761_BS_APPLICATION)
+-		return -ENODEV;
++		return dev_err_probe(dev, -ENODEV,
++				     "stuck in boot loader (status %#x)\n", ret);
+ 
+ 	/* enable touch functionality */
+-	ret = i2c_smbus_write_word_data(sdata->client,
+-					S6SY761_TOUCH_FUNCTION,
+-					S6SY761_MASK_TOUCH);
++	return i2c_smbus_write_word_data(sdata->client,
++					 S6SY761_TOUCH_FUNCTION,
++					 S6SY761_MASK_TOUCH);
++}
++
++static int s6sy761_power_on(struct s6sy761_data *sdata)
++{
++	int ret;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(sdata->regulators),
++				    sdata->regulators);
+ 	if (ret)
+ 		return ret;
++	sdata->powered = true;
+ 
+-	return 0;
++	msleep(S6SY761_POWER_ON_DELAY_MS);
++
++	return s6sy761_start(sdata);
+ }
+ 
+ static int s6sy761_hw_init(struct s6sy761_data *sdata,
+@@ -372,7 +556,7 @@ static int s6sy761_hw_init(struct s6sy761_data *sdata,
+ 	u8 buffer[S6SY761_PANEL_ID_SIZE]; /* larger read size */
+ 	int ret;
+ 
+-	ret = s6sy761_power_on(sdata);
++	ret = s6sy761_start(sdata);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -403,7 +587,8 @@ static int s6sy761_hw_init(struct s6sy761_data *sdata,
+ 	if (ret < 0)
+ 		return ret;
+ 	else if (ret != S6SY761_FW_OK)
+-		return -ENODEV;
++		return dev_err_probe(&sdata->client->dev, -ENODEV,
++				     "bad firmware integrity %#x\n", ret);
+ 
+ 	return 0;
+ }
+@@ -412,9 +597,96 @@ static void s6sy761_power_off(void *data)
+ {
+ 	struct s6sy761_data *sdata = data;
+ 
+-	disable_irq(sdata->client->irq);
+-	regulator_bulk_disable(ARRAY_SIZE(sdata->regulators),
+-						sdata->regulators);
++	if (!sdata->irq_masked)
++		disable_irq(sdata->client->irq);
++	sdata->irq_masked = true;
++	if (sdata->powered)
++		regulator_bulk_disable(ARRAY_SIZE(sdata->regulators),
++				       sdata->regulators);
++	sdata->powered = false;
++}
++
++/* Lift all contacts: a finger on the glass across a power cycle is lost. */
++static void s6sy761_release_contacts(struct s6sy761_data *sdata)
++{
++	struct input_dev *input = sdata->input;
++	int i;
++
++	for (i = 0; i < input->mt->num_slots; i++) {
++		input_mt_slot(input, i);
++		input_mt_report_slot_inactive(input);
++	}
++	input_sync(input);
++}
++
++/*
++ * Restore the sense state after a power-up: on only for an open input
++ * device and, when following the panel, only while the panel is enabled
++ * (as the follower callbacks do at runtime). Called with input->mutex held.
++ */
++static int s6sy761_restore_sense(struct s6sy761_data *sdata)
++{
++	bool on = input_device_enabled(sdata->input) &&
++		  (!sdata->following || sdata->panel_on);
++
++	return i2c_smbus_write_byte(sdata->client,
++				    on ? S6SY761_SENSE_ON : S6SY761_SENSE_OFF);
++}
++
++/*
++ * Bring the controller back after a system resume, or after a failed
++ * attempt. Runs from a work item so the system resume does not wait for the
++ * 140 ms power-up delay and the boot handshake (or seconds of retries).
++ *
++ * The handshake runs with the interrupt masked: the threaded IRQ handler
++ * reads the same event stack, and with the interrupt enabled it consumed
++ * the boot-complete event (raised as soon as the firmware is up) before the
++ * 20 ms polling in s6sy761_wait_boot_complete() saw it. The handshake then
++ * timed out, the software reset and the power cycle failed the same way,
++ * and while the supplies were cut the IRQ fired on the low INT line ("tx
++ * timeout"), for 3.7 s of every resume and an -ENODEV from it.
++ *
++ * On failure the interrupt stays masked and the next panel enable or input
++ * open tries again.
++ */
++static void s6sy761_reinit_work(struct work_struct *work)
++{
++	struct s6sy761_data *sdata =
++		container_of(work, struct s6sy761_data, reinit_work);
++	struct device *dev = &sdata->client->dev;
++	int ret;
++
++	guard(mutex)(&sdata->input->mutex);
++
++	if (sdata->suspended || !sdata->need_init)
++		return;
++
++	if (!sdata->irq_masked) {
++		disable_irq(sdata->client->irq);
++		sdata->irq_masked = true;
++	}
++
++	/* with the supplies on, s6sy761_start() resets / power cycles itself */
++	ret = sdata->powered ? s6sy761_start(sdata) : s6sy761_power_on(sdata);
++	if (!ret)
++		ret = s6sy761_restore_sense(sdata);
++	if (ret) {
++		dev_warn(dev, "controller not up (%d), retrying on the next panel enable\n",
++			 ret);
++		return;
++	}
++
++	sdata->need_init = false;
++	sdata->irq_masked = false;
++	enable_irq(sdata->client->irq);
++	dev_dbg(dev, "controller up after resume\n");
++}
++
++static void s6sy761_cancel_reinit(void *data)
++{
++	struct s6sy761_data *sdata = data;
++
++	cancel_work_sync(&sdata->reinit_work);
+ }
+ 
+ static int s6sy761_probe(struct i2c_client *client)
+@@ -443,13 +715,26 @@ static int s6sy761_probe(struct i2c_client *client)
+ 	if (err)
+ 		return err;
+ 
++	err = regulator_bulk_enable(ARRAY_SIZE(sdata->regulators),
++				    sdata->regulators);
++	if (err)
++		return dev_err_probe(&client->dev, err,
++				     "failed to enable supplies\n");
++	sdata->powered = true;
++
+ 	err = devm_add_action_or_reset(&client->dev, s6sy761_power_off, sdata);
+ 	if (err)
+ 		return err;
+ 
++	msleep(S6SY761_POWER_ON_DELAY_MS);
++
+ 	err = s6sy761_hw_init(sdata, &max_x, &max_y);
+ 	if (err)
+-		return err;
++		return dev_err_probe(&client->dev, err,
++				     "failed to initialize controller\n");
++
++	dev_dbg(&client->dev, "devid %#x, %ux%u, %u tx channels\n",
++		sdata->devid, max_x, max_y, sdata->tx_channel);
+ 
+ 	sdata->input = devm_input_allocate_device(&client->dev);
+ 	if (!sdata->input)
+@@ -468,8 +753,8 @@ static int s6sy761_probe(struct i2c_client *client)
+ 
+ 	touchscreen_parse_properties(sdata->input, true, &sdata->prop);
+ 
+-	if (!input_abs_get_max(sdata->input, ABS_X) ||
+-	    !input_abs_get_max(sdata->input, ABS_Y)) {
++	if (!input_abs_get_max(sdata->input, ABS_MT_POSITION_X) ||
++	    !input_abs_get_max(sdata->input, ABS_MT_POSITION_Y)) {
+ 		dev_warn(&client->dev, "the axis have not been set\n");
+ 	}
+ 
+@@ -491,8 +776,23 @@ static int s6sy761_probe(struct i2c_client *client)
+ 	if (err)
+ 		return err;
+ 
++	INIT_WORK(&sdata->reinit_work, s6sy761_reinit_work);
++	err = devm_add_action_or_reset(&client->dev, s6sy761_cancel_reinit,
++				       sdata);
++	if (err)
++		return err;
++
+ 	pm_runtime_enable(&client->dev);
+ 
++	if (drm_is_panel_follower(&client->dev)) {
++		INIT_DELAYED_WORK(&sdata->follow_work, s6sy761_follow_work);
++		err = devm_add_action_or_reset(&client->dev, s6sy761_unfollow,
++					       sdata);
++		if (err)
++			return err;
++		schedule_delayed_work(&sdata->follow_work, 0);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -521,30 +821,34 @@ static int s6sy761_suspend(struct device *dev)
+ {
+ 	struct s6sy761_data *sdata = dev_get_drvdata(dev);
+ 
++	cancel_work_sync(&sdata->reinit_work);
++
++	guard(mutex)(&sdata->input->mutex);
++
++	/* masks the IRQ and cuts the supplies */
+ 	s6sy761_power_off(sdata);
++	sdata->suspended = true;
++	s6sy761_release_contacts(sdata);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * The supplies and the IRQ stay off here; reinit_work powers the controller
++ * up in the background. Resume never fails: an error here would only be
++ * logged by the PM core.
++ */
+ static int s6sy761_resume(struct device *dev)
+ {
+ 	struct s6sy761_data *sdata = dev_get_drvdata(dev);
+-	int err;
+-
+-	err = s6sy761_power_on(sdata);
+-	if (err)
+-		return err;
+-
+-	enable_irq(sdata->client->irq);
+ 
+ 	guard(mutex)(&sdata->input->mutex);
+ 
+-	if (!input_device_enabled(sdata->input))
+-		return 0;
+-
+-	err = i2c_smbus_write_byte(sdata->client, S6SY761_SENSE_ON);
++	sdata->suspended = false;
++	sdata->need_init = true;
++	schedule_work(&sdata->reinit_work);
+ 
+-	return err;
++	return 0;
+ }
+ 
+ static const struct dev_pm_ops s6sy761_pm_ops = {

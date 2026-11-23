@@ -1,0 +1,3388 @@
+From 59ab5b1dd0187bb56ae42a5cbb567a90ee51814a Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] misc: add a Samsung S5000AP (Exynos 9820 CP) modem driver
+
+Driver for the Shannon 5000AP cellular processor integrated in the
+Exynos 9820: CP power and boot control for the
+userspace loader (allow_boot; debugfs ctl, cpmem and link_up), the
+shared memory link (legacy and SBD rings) with the link bring-up after
+the CP's INIT_START/PHONE_START, and the interfaces on top of it:
+
+ - character devices for the IPC/RFS channels with multi-frame
+   messages,
+ - rmnet packet data with zero-copy downlink buffers,
+ - a WWAN device with an MBIM control port and an AT port bridged to
+   userspace, and a second link for the IMS PDN,
+ - CP restart without an AP reboot,
+ - the CP's MIF/INT DVFS requests are served as floors,
+ - system sleep: the CP mailbox interrupt wakes the system; pda_active
+   tells the CP that the AP is idle, call_active refuses system sleep
+   during a call, and with dark_wake=1 a wake that only brought signal
+   reports goes back to sleep at once.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/misc/Kconfig        |   19 +
+ drivers/misc/Makefile       |    1 +
+ drivers/misc/s5000ap-boot.c | 3309 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 3329 insertions(+)
+ create mode 100644 drivers/misc/s5000ap-boot.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 8241fa450d..e91ae8be27 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -440,6 +440,25 @@ config MISC_RTSX
+ 	tristate
+ 	default MISC_RTSX_PCI || MISC_RTSX_USB
+ 
++config S5000AP_BOOT
++	tristate "Samsung S5000AP (Exynos 9820 CP) boot and IPC link driver"
++	depends on ARCH_EXYNOS && OF && DEBUG_FS && HAVE_ARM_SMCCC
++	depends on WWAN
++	select MFD_SYSCON
++	help
++	  Loader and shared memory link for the Shannon 5000 cellular
++	  processor integrated in the Exynos 9820. It places the signed CP
++	  image in the shared DRAM, asks the secure monitor to verify and
++	  start it and logs what the CP reports through the AP/CP mailbox.
++	  Once the CP is up, the SBD shared-memory link is set up and the
++	  IPC channels are exposed as /dev/umts_ipc0, /dev/umts_ipc1 and
++	  /dev/umts_rfs0 for a user space RIL and RFS server. Packet data
++	  goes through an rmnet and a WWAN network device, with MBIM and AT
++	  control ports for user space.
++
++	  The module is never loaded automatically and does nothing until
++	  told to through debugfs. If unsure, say N.
++
+ config OPEN_DICE
+ 	tristate "Open Profile for DICE driver"
+ 	depends on OF_RESERVED_MEM
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 49c1ba093e..ec5ec5a870 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -53,6 +53,7 @@ obj-y				+= cardreader/
+ obj-$(CONFIG_PVPANIC)   	+= pvpanic/
+ obj-$(CONFIG_UACCE)		+= uacce/
+ obj-$(CONFIG_XILINX_SDFEC)	+= xilinx_sdfec.o
++obj-$(CONFIG_S5000AP_BOOT)	+= s5000ap-boot.o
+ obj-$(CONFIG_NTSYNC)		+= ntsync.o
+ obj-$(CONFIG_HI6421V600_IRQ)	+= hi6421v600-irq.o
+ obj-$(CONFIG_OPEN_DICE)		+= open-dice.o
+diff --git a/drivers/misc/s5000ap-boot.c b/drivers/misc/s5000ap-boot.c
+new file mode 100644
+index 0000000000..2a72051218
+--- /dev/null
++++ b/drivers/misc/s5000ap-boot.c
+@@ -0,0 +1,3309 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Samsung S5000AP (Shannon 5000, the CP integrated in Exynos 9820) boot and
++ * shared memory link driver.
++ *
++ * A step-by-step port of the downstream boot path (drivers/misc/modem_v1
++ * modem_ctrl_s5000ap.c + link_device_shmem.c, drivers/misc/mcu_ipc,
++ * cal-if/pmucal_cp.c).  It loads the signed CP image into the shared DRAM,
++ * asks EL3 to verify and start it, and reports what the CP says through the
++ * AP<->CP mailbox.  The link layer on top of it is described below and at
++ * the code that implements it.
++ *
++ * Nothing touches the hardware at probe time.  Every step is requested by
++ * hand through debugfs (<debugfs>/s5000ap/ctl) and steps that write need
++ * the module parameter allow_boot=1.  The module has no device alias on
++ * purpose, so it is never loaded automatically.
++ *
++ * Step order, as cbd drives the downstream driver: mbox, secure 2 0 0
++ * (powers the CP, re-init), load through cpmem, secure 0 <boot> <main>,
++ * on, boot_on, dl_start, udl ..., off.
++ *
++ * Link bring-up after the CP's INIT_START (downstream cmd_init_start_handler()
++ * and cmd_phone_start_handler()): pktproc, sbd_init, pif_done, then after
++ * PHONE_START link_reset, init_end.  sbd and sbd_rx look at the rings.  The
++ * module answers INIT_START and PHONE_START itself.
++ *
++ * Once INIT_END is sent the link is up and the IPC channels are exposed as
++ * character devices named as downstream does (umts_ipc0, umts_ipc1,
++ * umts_rfs0, umts_loopback): one read returns one IPC frame without the SIPC5
++ * link header, one write sends one.  User space (RFS server, RIL) decides
++ * what is said; the module only moves frames.  The diagnostic, AT router and
++ * CSD channels get no device.
++ */
++
++#include <linux/arm-smccc.h>
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/gfp.h>
++#include <linux/gpio/consumer.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/if_arp.h>
++#include <linux/iopoll.h>
++#include <linux/miscdevice.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/pm_wakeup.h>
++#include <linux/poll.h>
++#include <linux/regmap.h>
++#include <linux/sizes.h>
++#include <linux/soc/samsung/exynos9820-dark-wake.h>
++#include <linux/skbuff.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/unaligned.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++#include <linux/wwan.h>
++
++/* Mailbox (downstream regs-mcu_ipc.h) */
++#define MBOX_MCUCTLR		0x00
++#define MBOX_INTCR0		0x0c
++#define MBOX_INTMR0		0x10
++#define MBOX_INTSR0		0x14
++#define MBOX_INTGR1		0x1c
++#define MBOX_INTCR1		0x20
++#define MBOX_ISSR(n)		(0x80 + 4 * (n))
++#define MBOX_NUM_ISSR		64
++
++/* Shared registers and interrupts (modem-s5000ap-sipc-pdata.dtsi) */
++#define MBX_AP2CP_MSG		0
++#define MBX_CP2AP_MSG		1
++#define MBX_AP2CP_STATUS	2
++#define MBX_CP2AP_STATUS	3
++#define INT_AP2CP_WAKEUP	1
++#define INT_AP2CP_ACTIVE	3	/* downstream mif,int_ap2cp_active */
++
++#define AP_STATUS_AP_STATUS	GENMASK(4, 1)
++#define AP_STATUS_PDA_ACTIVE	BIT(5)
++#define AP_STATUS_SYS_REV	GENMASK(13, 6)
++#define AP_STATUS_DS_DET	GENMASK(15, 14)
++#define AP_STATUS_DEVICE_TYPE	GENMASK(22, 18)
++#define CP_STATUS_CP_STATUS	GENMASK(4, 1)
++#define CP_STATUS_LTE_ACTIVE	BIT(5)
++
++#define MASK_INT_VALID		0x0080
++#define MASK_CMD_VALID		0x0040
++#define MASK_CMD_FIELD		0x003f
++
++/* PMU (cal-if/exynos9820/pmucal_cp_exynos9820.h) */
++#define PMU_CP_CONFIGURATION	0x3000
++#define PMU_CP_STATUS		0x3004
++#define PMU_CP_OUT		0x3020
++#define PMU_CP_IN		0x3024
++#define PMU_WAIT_US		2000
++
++/* Secure monitor calls (modem_v1.h, pmucal_cp.h) */
++#define SMC_CP			0x82000700
++#define SMC_CP_READ_CTRL	3
++#define SMC_CP_WRITE_CTRL	4
++#define SMC_CP_CHECK_CONTINUE	8
++#define SMC_CP_CTRL_S		0
++#define SMC_SSS_CLK		0x82001011
++#define CP_NOT_WORKING		11
++#define CP_CHECK_SIGN_NOT_FINISH 0x100
++#define CP_CHECK_MAX_TRY	0x1000
++
++/* Legacy 4 MiB map at the start of the IPC region (link_device_memory.h) */
++#define SHM_MAGIC		0x00
++#define SHM_ACCESS		0x04
++#define SHM_FMT_RX_HEAD		0x10
++#define SHM_FMT_RX_TAIL		0x14
++#define SHM_RAW_TX_HEAD		0x18
++#define SHM_RAW_TX_TAIL		0x1c
++#define SHM_RAW_RX_HEAD		0x20
++#define SHM_RAW_RX_TAIL		0x24
++#define SHM_FMT_RX_BUFF		0x2000
++#define SHM_FMT_RX_SIZE		4096
++#define SHM_BOOTLOG		0xc00
++#define SHM_BOOTLOG_MAX		0x1fb
++#define SHM_UDL_WAIT_MS		30000
++#define SHM_RAW_TX_BUFF		0x3000
++#define SHM_RAW_TX_SIZE		2084864
++#define SHM_RAW_RX_BUFF		0x200000
++#define SHM_RAW_RX_SIZE		2097152
++#define MEM_BOOT_MAGIC		0x424f4f54
++
++#define MEM_IPC_MAGIC		0xaa
++#define SHM_CLK_TABLE		0x28
++
++#define CMD_INIT_END		0x02
++#define CMD_PIF_INIT_DONE	0x0d
++#define MASK_SEND_DATA		0x0001
++
++/* Shared buffer descriptor layout (downstream include/sbd.h) */
++#define SBD_DESC_OFF		0x800
++#define SBD_BUFF_OFF		0x10000
++#define SBD_MAX_CH		32
++#define SBD_RBD_SIZE		20
++#define SBD_GDESC_SIZE		\
++	(12 + SBD_MAX_CH * 16 + SBD_MAX_CH * 2 * SBD_RBD_SIZE)
++#define SBD_VERSION		1
++#define SBD_UL			0
++#define SBD_DL			1
++
++/* pktproc global descriptor at the start of modem_spare (link_rx_pktproc.h) */
++#define PKTPROC_CP_BASE		0x50000000
++#define PKTPROC_DESC_OFF	0x00000100
++#define PKTPROC_DATA_OFF	0x00100000
++#define PKTPROC_NUM_DESC	8192
++#define PKTPROC_DESC_SIZE	24	/* data_addr @0, length @0x10, channel @0x12 */
++#define PKTPROC_DATA_SIZE	SZ_16M
++#define CP_VIEW_BASE		0x40000000	/* CP view of the start of its memory */
++#define ZMB_OFF			0x01100000	/* zero-copy pool in modem_spare */
++#define ZMB_SIZE		0x00500000
++#define ZMB_CELL		2048		/* MIF_BUFF_DEFAULT_CELL_SIZE */
++#define ZMB_HEADROOM		64		/* NET_HEADROOM: data starts here */
++#define PKTPROC_MAP_SIZE	(ZMB_OFF + ZMB_SIZE)
++#define PKTPROC_MAX_PKT		2048
++#define SBD_PDP_HI		8	/* sbd_chans[] index: raw-IP QoS ring */
++#define SBD_PDP			9	/* sbd_chans[] index: multipdp, PS uplink */
++#define SIPC_CH_RMNET0		10
++#define SIPC_CH_RMNET1		11	/* stock rmnet1 = cid 2, the IMS PDN */
++
++#define SIPC5_START		0xf8
++#define SIPC5_PADDING		0x04
++#define SIPC_CH_BOOT		215
++
++static bool allow_boot;
++module_param(allow_boot, bool, 0400);
++MODULE_PARM_DESC(allow_boot, "Allow the steps that write to the CP (default off)");
++
++/* Keep the system awake this long after a CP interrupt (ms) */
++#define S5000AP_WAKE_MS		1000
++/* Dual SIM detect value and display type for the CP (downstream defaults) */
++#define S5000AP_DS_DET		0
++#define S5000AP_DEVICE_TYPE	1
++/* Bytes of each received frame to log: link + IPC header only */
++#define S5000AP_DUMP_LEN	12
++
++/*
++ * Dark wake: after a SLEEP that the CP mailbox
++ * alone ended, sleep again at once (exynos9820-suspend ->suspend_again)
++ * when the CP sent nothing but signal reports (DISP ICON_INFO/RSSI_INFO
++ * NOTIs). They stay queued on umts_ipc0 for the daemon, an older report of
++ * the same kind is replaced by the newer one. Anything else, a CP wake
++ * lock, packet data or a command ends the loop and the system resumes.
++ */
++static bool dark_wake;
++module_param(dark_wake, bool, 0644);
++MODULE_PARM_DESC(dark_wake, "Sleep again after a CP wake that only brought signal reports (default N)");
++
++/* Resume fully after this many dark wakes in a row (about 1 h) */
++#define S5000AP_DARK_MAX	360
++/* Wait this long for more CP frames before a dark wake decides (ms) */
++#define S5000AP_DARK_SETTLE_MS	10
++
++#define CHAN_RXQ_MAX		512
++#define SIPC5_HDR_MF_LEN	5	/* config, channel, u16 length, control */
++#define SIPC5_MF_MORE		0x80	/* control: more pieces follow */
++#define SIPC5_MF_ID		0x7f
++#define CHAN_MSG_MAX		SZ_1M
++#define CHAN_TX_TIMEOUT_MS	2000	/* wait for the CP to drain a full ring */
++#define SIPC5_HDR_LEN		4
++#define SIPC5_HDR_EXT_LEN	6
++#define SIPC5_EXT_FIELD		0x02
++#define SIPC5_MULTI_FRAME	0x03
++
++/*
++ * The link channels in the order downstream init_ctrl_tables() builds them
++ * from modem-s5000ap-sipc-pdata.dtsi: every SIPC5 IPC channel that is not a
++ * PS channel, then the two MULTI_RAW devices as QoS channels 10 and 11.
++ */
++struct sbd_chan {
++	const char *name;
++	u8 ch;
++	u16 len[2];	/* UL, DL ring length */
++	u16 size[2];	/* UL, DL buffer size */
++};
++
++static const struct sbd_chan sbd_chans[] = {
++	{ "cass",     35, {  16,   16 }, { 2048, 2048 } },
++	{ "ipc0",    235, {  16,   32 }, { 4096, 4096 } },
++	{ "ipc1",    236, {  16,   32 }, { 4096, 4096 } },
++	{ "rfs0",    245, {  16,  512 }, { 2048, 2048 } },
++	{ "csd",       1, {  32,   64 }, { 2048, 2048 } },
++	{ "router",   25, {  16,   16 }, { 2048, 2048 } },
++	{ "dm0",      28, {  16,  128 }, { 2048, 2048 } },
++	{ "loopback", 244, { 16,   32 }, { 2048, 2048 } },
++	{ "pdp_hi",   10, { 256,  256 }, { 2048, 2048 } },
++	{ "pdp",      11, { 512, 1024 }, { 2048,    8 } },
++};
++
++#define SBD_NCH		ARRAY_SIZE(sbd_chans)
++
++/* Channels that get a character device, as downstream names them. */
++static const struct {
++	const char *name;
++	int idx;		/* into sbd_chans */
++} chan_devs[] = {
++	{ "umts_ipc0", 1 },
++	{ "umts_ipc1", 2 },
++	{ "umts_rfs0", 3 },
++	{ "umts_loopback", 7 },
++};
++
++#define NCHDEV		ARRAY_SIZE(chan_devs)
++
++struct s5000ap;
++
++struct s5000ap_chan {
++	struct s5000ap *s;
++	struct miscdevice misc;
++	int idx;
++	struct sk_buff_head rxq;
++	wait_queue_head_t wq;
++	atomic_t users;
++	struct sk_buff *part;	/* frame spanning several buffers */
++	u32 part_left;
++	bool part_mf;
++	u8 part_ctrl;
++	struct sk_buff_head mfq;	/* pieces of a multi-frame message */
++	u32 mf_len;
++	u8 mf_id;
++	struct mutex tx_mutex;	/* one message at a time per channel */
++	u8 tx_id;		/* multi-frame id of the last UL message */
++	u32 drops;
++};
++
++struct s5000ap {
++	struct device *dev;
++	struct mutex lock;		/* one step at a time */
++	struct dentry *dbg;
++	struct regmap *pmu;
++	struct clk *pclk;
++	struct gpio_descs *rev_gpios;
++	void __iomem *mbox;
++	void __iomem *cfg;
++	void *mem;
++	phys_addr_t mem_phys;
++	size_t mem_size;
++	u32 ipc_off;
++	u32 ipc_size;
++	int irq;
++	bool mbox_up;
++	bool cp_on;
++	bool reinit;
++	bool secured;			/* EL3 holds the CP image area */
++	bool ran_once;			/* a CP was started since the AP booted */
++	bool sbd_ready;
++	bool link_reset;
++	u32 sbd_rbps;
++	u32 sbd_buff[SBD_NCH][2];
++	u32 sbd_sizev[SBD_NCH][2];
++	atomic_t irqs;
++	atomic_t data_irqs;
++
++	/* link layer */
++	bool link_up;			/* INIT_END sent: rings carry IPC */
++	spinlock_t tx_lock;		/* UL rings + AP -> CP message box */
++	struct work_struct rx_work;
++	struct work_struct link_work;
++	unsigned long link_events;	/* BIT(cmd) from the CP */
++	struct s5000ap_chan *chans[SBD_NCH];
++	struct s5000ap_chan chdev[NCHDEV];
++	u32 rx_frames, tx_frames, rx_dropped, tx_full;
++	u32 cp_mif_req, cp_int_req;	/* CP DVFS floors in kHz, 0 = none */
++	u32 pda_low;			/* ISSR2 bits pda_active cleared, 0 = high */
++	bool call_busy;			/* call_active: refuse system sleep */
++
++	/* dark wake: counters since the last snapshot (s5000ap_dw_snap()) */
++	struct exynos9820_dark_wake dw;
++	bool dw_armed;			/* system suspend in progress, dark_wake on */
++	bool cp_wakelock;		/* CP2AP status bit 6, last seen */
++	u32 dw_benign;			/* signal reports queued (rx_work) */
++	atomic_t dw_other;		/* anything else (irq, rx_work) */
++	u32 dw_irq_bits;		/* mailbox bits seen since the snapshot */
++	u32 dw_snap_benign, dw_snap_other, dw_snap_frames, dw_snap_pkts;
++	u32 dw_loops;			/* dark wakes in this suspend */
++	bool tx_gate;			/* INIT_END sent, CP not heard from yet */
++	bool cp_spoke;			/* a data interrupt came after INIT_END */
++	unsigned long tx_gate_until;
++	unsigned int init_end_resends;
++	struct work_struct dvfs_work;
++
++	/* packet data: rmnet0, UL on the multipdp ring, DL from pktproc */
++	struct net_device *ndev;
++	struct net_device *ndev_ims;	/* WWAN link 1 = SIPC ch 11 (IMS PDN) */
++	void *pkt;			/* modem_spare, WC: gdesc, descriptors, data */
++	struct delayed_work tx_wake;
++	u32 pkt_rx, pkt_bad, pkt_other_ch;
++	u16 zc_pre;			/* zero-copy DL: next slot to consume */
++	u32 zc_rx, zc_bad;
++
++	/* WWAN: MBIM control port bridged to userspace */
++	struct wwan_port *mbim_port;
++	struct miscdevice mbim_misc;
++	struct sk_buff_head mbim_q;	/* host -> function messages */
++	wait_queue_head_t mbim_wq;
++	bool mbim_bridge_open;
++	bool mbim_host_open;
++
++	/* WWAN AT port (voice for ModemManager), bridged like MBIM */
++	struct wwan_port *at_port;
++	struct miscdevice at_misc;
++	struct sk_buff_head at_q;
++	wait_queue_head_t at_wq;
++	bool at_bridge_open;
++};
++
++static void s5000ap_zc_init(struct s5000ap *s);
++static bool s5000ap_dark_again(void *data);
++
++static u32 mbox_rd(struct s5000ap *s, u32 reg)
++{
++	return readl(s->mbox + reg);
++}
++
++static void mbox_wr(struct s5000ap *s, u32 val, u32 reg)
++{
++	writel(val, s->mbox + reg);
++}
++
++static const char *cmd_name(u16 cmd)
++{
++	static const char * const names[] = {
++		[0x1] = "INIT_START", [0x2] = "INIT_END", [0x3] = "REQ_ACTIVE",
++		[0x4] = "RES_ACTIVE", [0x5] = "REQ_TIME_SYNC", [0x7] = "CRASH_RESET",
++		[0x8] = "PHONE_START", [0x9] = "CRASH_EXIT", [0xa] = "CP_DEEP_SLEEP",
++		[0xb] = "NV_REBUILDING", [0xc] = "EMER_DOWN",
++		[0xe] = "SILENT_NV_REBUILD", [0xf] = "NORMAL_POWER_OFF",
++	};
++
++	if (cmd < ARRAY_SIZE(names) && names[cmd])
++		return names[cmd];
++	return "?";
++}
++
++/*
++ * The CP raises its interrupts in the upper half of interrupt group 0.  They
++ * are acknowledged and logged, never answered.
++ */
++static irqreturn_t s5000ap_irq(int irq, void *data)
++{
++	struct s5000ap *s = data;
++	u32 stat, msg, status;
++
++	stat = mbox_rd(s, MBOX_INTSR0) & 0xffff0000;
++	if (!stat)
++		return IRQ_NONE;
++	mbox_wr(s, stat, MBOX_INTCR0);
++
++	msg = mbox_rd(s, MBOX_ISSR(MBX_CP2AP_MSG));
++	status = mbox_rd(s, MBOX_ISSR(MBX_CP2AP_STATUS));
++	atomic_inc(&s->irqs);
++
++	/*
++	 * Downstream keeps the system up 200 ms per received frame and follows
++	 * the CP's own wake lock request (mailbox int 8, CP2AP status bit 6).
++	 * Give userspace (daemon, ModemManager) a second to pick the event up.
++	 */
++	/*
++	 * While the system suspends with dark_wake on, every CP interrupt is a
++	 * hard wakeup: a frame that comes after the dark-wake check aborts the
++	 * next SLEEP instead of waiting in the queue until the next wake.
++	 */
++	pm_wakeup_dev_event(s->dev, S5000AP_WAKE_MS, READ_ONCE(s->dw_armed));
++	/*
++	 * Int 8 is the CP's wake lock line; the CP toggles it around the
++	 * frames it sends.  The dark-wake check looks at the lock's state
++	 * (cp_wakelock), so the toggle itself is not "other".
++	 */
++	s->dw_irq_bits |= stat;
++	if (stat & ~(BIT(16) | BIT(16 + 8)))	/* DVFS, status, ... */
++		atomic_inc(&s->dw_other);
++	if (stat & (BIT(16 + 6) | BIT(16 + 7)))
++		schedule_work(&s->dvfs_work);
++	if (stat & BIT(16 + 8)) {
++		WRITE_ONCE(s->cp_wakelock, !!(status & BIT(6)));
++		if (status & BIT(6))
++			pm_stay_awake(s->dev);
++		else
++			pm_relax(s->dev);
++	}
++
++	if ((stat & BIT(16)) && (msg & MASK_INT_VALID) && (msg & MASK_CMD_VALID)) {
++		u16 cmd = msg & MASK_CMD_FIELD;
++
++		/* PHONE_START repeats until answered: log it once per link. */
++		if (cmd != 0x8 || !test_bit(cmd, &s->link_events))
++			dev_info(s->dev, "CP -> AP command 0x%04x (%s), cp_status %lu\n",
++				 msg & 0xffff, cmd_name(cmd),
++				 FIELD_GET(CP_STATUS_CP_STATUS, status));
++		set_bit(cmd, &s->link_events);
++		atomic_inc(&s->dw_other);
++		schedule_work(&s->link_work);
++	} else if ((stat & BIT(16)) && (msg & MASK_INT_VALID) &&
++		 (msg & MASK_SEND_DATA) && s->sbd_ready) {
++		atomic_inc(&s->data_irqs);
++		s->tx_gate = false;	/* the CP is talking: uplink may go */
++		s->cp_spoke = true;
++	} else {
++		if (stat & BIT(16))
++			atomic_inc(&s->dw_other);
++		dev_info_ratelimited(s->dev,
++				     "CP irq 0x%04x msg 0x%08x status 0x%08x\n",
++				     stat >> 16, msg, status);
++	}
++
++	/* Downstream checks pktproc on every CP interrupt, commands included. */
++	if (s->link_up)
++		schedule_work(&s->rx_work);
++	return IRQ_HANDLED;
++}
++
++/* enum smc_error_flag in downstream link_device_shmem.c */
++static const char *smc_err_name(unsigned long r)
++{
++	static const char * const names[] = {
++		"CP_NO_ERROR", "CP_NOT_ALIGN_64KB", "CP_MEM_TOO_BIG",
++		"CP_FLAG_OUT_RANGE", "CP_WRONG_TZASC_REGION_NUM",
++		"CP_WRONG_BL_SIZE", "CP_MEM_OUT_OF_RANGE", "CP_NOT_ALIGN_16B",
++		"CP_MEM_IN_SECURE_DRAM", "CP_ASP_ENABLE_FAIL",
++		"CP_ASP_DISABLE_FAIL", "CP_NOT_WORKING", "CP_ALREADY_WORKING",
++		"CP_ALREADY_DUMP_MODE", "CP_NOT_VALID_MAGIC",
++		"CP_SHOULD_BE_DISABLE", "CP_ALREADY_ENABLE_CPMEM_ON",
++		"CP_ALREADY_SET_WND", "CP_FAIL_TO_SET_WND",
++		"CP_INVALID_CP_BASE", "CP_CORRUPTED_CP_MEM_INFO",
++		"CP_WHILE_CHECKING_SIGN", "CP_NOT_WHILE_CHECKING_SIGN",
++		"CP_IS_IN_INVALID_STATE", "CP_IS_IN_INVALID_STATE2",
++		"CP_ERR_WHILE_CP_SIGN_CHECK",
++	};
++
++	return r < ARRAY_SIZE(names) ? names[r] : "?";
++}
++
++static int s5000ap_map(struct s5000ap *s)
++{
++	/*
++	 * cbd issues the re-init security request (mode 2) before the first
++	 * byte goes into the CP memory; do not touch it earlier.
++	 */
++	if (!s->reinit && !s->secured) {
++		dev_warn(s->dev, "CP memory not touched before 'secure 2 0 0'\n");
++		return -EBUSY;
++	}
++	if (s->mem)
++		return 0;
++
++	s->mem = memremap(s->mem_phys, s->mem_size, MEMREMAP_WC);
++	if (!s->mem)
++		return -ENOMEM;
++	dev_info(s->dev, "CP memory %pa + 0x%zx mapped\n", &s->mem_phys,
++		 s->mem_size);
++	return 0;
++}
++
++static void s5000ap_pmu_show(struct s5000ap *s, const char *when)
++{
++	u32 conf = 0, stat = 0, out = 0, in = 0;
++
++	regmap_read(s->pmu, PMU_CP_CONFIGURATION, &conf);
++	regmap_read(s->pmu, PMU_CP_STATUS, &stat);
++	regmap_read(s->pmu, PMU_CP_OUT, &out);
++	regmap_read(s->pmu, PMU_CP_IN, &in);
++	dev_info(s->dev,
++		 "%s: CP_CONFIGURATION 0x%x CP_STATUS 0x%x CP_OUT 0x%x CP_IN 0x%x\n",
++		 when, conf, stat, out, in);
++}
++
++static void s5000ap_mbox_show(struct s5000ap *s, const char *when)
++{
++	dev_info(s->dev,
++		 "%s: MCUCTLR 0x%x INTMR0 0x%x INTSR0 0x%x\n", when,
++		 mbox_rd(s, MBOX_MCUCTLR), mbox_rd(s, MBOX_INTMR0),
++		 mbox_rd(s, MBOX_INTSR0));
++	dev_info(s->dev,
++		 "%s: ISSR ap2cp_msg 0x%x cp2ap_msg 0x%x ap2cp_status 0x%x cp2ap_status 0x%x\n",
++		 when, mbox_rd(s, MBOX_ISSR(MBX_AP2CP_MSG)),
++		 mbox_rd(s, MBOX_ISSR(MBX_CP2AP_MSG)),
++		 mbox_rd(s, MBOX_ISSR(MBX_AP2CP_STATUS)),
++		 mbox_rd(s, MBOX_ISSR(MBX_CP2AP_STATUS)));
++}
++
++/* First access to the mailbox block: clock on, look, take the interrupt. */
++static int s5000ap_step_mbox(struct s5000ap *s)
++{
++	int ret;
++
++	if (s->mbox_up) {
++		s5000ap_mbox_show(s, "mbox");
++		return 0;
++	}
++
++	ret = clk_prepare_enable(s->pclk);
++	if (ret)
++		return ret;
++
++	s5000ap_mbox_show(s, "mbox (first read)");
++
++	if (!allow_boot) {
++		clk_disable_unprepare(s->pclk);
++		return 0;
++	}
++
++	ret = request_irq(s->irq, s5000ap_irq, 0, dev_name(s->dev), s);
++	if (!ret && enable_irq_wake(s->irq))
++		dev_warn(s->dev, "mailbox irq cannot wake the system\n");
++	if (ret) {
++		clk_disable_unprepare(s->pclk);
++		return ret;
++	}
++	/* As mcu_ipc_probe(): drop stale AP -> CP requests. */
++	mbox_wr(s, 0xffff, MBOX_INTCR1);
++	s->mbox_up = true;
++	return 0;
++}
++
++/*
++ * AP2CP_CFG sits behind the CP power domain: reading it with the CP off
++ * hangs the bus (seen on the phone).  Downstream only touches it in
++ * s5000ap_on(), which cbd calls after both security requests, i.e. after
++ * cal_cp_init() has powered the CP.
++ */
++static int s5000ap_cp_powered(struct s5000ap *s)
++{
++	u32 stat = 0;
++
++	regmap_read(s->pmu, PMU_CP_STATUS, &stat);
++	if (stat & BIT(0))
++		return 0;
++	dev_warn(s->dev, "CP is off (CP_STATUS 0x%x): AP2CP_CFG not touched\n",
++		 stat);
++	return -EHOSTDOWN;
++}
++
++/* Read-only look at AP2CP_CFG. */
++static int s5000ap_step_cfg(struct s5000ap *s)
++{
++	int ret = s5000ap_cp_powered(s);
++
++	if (ret)
++		return ret;
++	dev_info(s->dev, "AP2CP_CFG 0x%08x\n", readl(s->cfg));
++	return 0;
++}
++
++static int s5000ap_sys_rev(struct s5000ap *s)
++{
++	DECLARE_BITMAP(values, 8) = { 0 };
++	int ret;
++
++	if (!s->rev_gpios)
++		return 0;
++
++	ret = gpiod_get_array_value_cansleep(s->rev_gpios->ndescs,
++					     s->rev_gpios->desc,
++					     s->rev_gpios->info, values);
++	if (ret)
++		return ret;
++	return values[0] & 0xff;
++}
++
++/* s5000ap_on(): mailbox shared registers and AP2CP_CFG. */
++static int s5000ap_step_on(struct s5000ap *s)
++{
++	u32 status, cfg;
++	int rev, i;
++
++	if (!s->mbox_up)
++		return -ENXIO;
++	rev = s5000ap_cp_powered(s);
++	if (rev)
++		return rev;
++
++	rev = s5000ap_sys_rev(s);
++	if (rev < 0)
++		return rev;
++
++	for (i = 0; i < MBOX_NUM_ISSR; i++)
++		mbox_wr(s, 0, MBOX_ISSR(i));
++
++	status = FIELD_PREP(AP_STATUS_DS_DET, S5000AP_DS_DET) |
++		 FIELD_PREP(AP_STATUS_SYS_REV, rev) |
++		 FIELD_PREP(AP_STATUS_DEVICE_TYPE, S5000AP_DEVICE_TYPE) |
++		 AP_STATUS_PDA_ACTIVE;
++	mbox_wr(s, status, MBOX_ISSR(MBX_AP2CP_STATUS));
++	s->pda_low = 0;		/* every CP start: PDA_ACTIVE high, as stock */
++	dev_info(s->dev, "on: sys_rev 0x%02x ap_status 0x%08x\n", rev,
++		 mbox_rd(s, MBOX_ISSR(MBX_AP2CP_STATUS)));
++
++	cfg = readl(s->cfg);
++	writel(1, s->cfg);
++	dev_info(s->dev, "on: AP2CP_CFG 0x%08x -> 0x%08x\n", cfg, readl(s->cfg));
++	if (readl(s->cfg) != 1)
++		return -EIO;
++	return 0;
++}
++
++static unsigned long s5000ap_smc(struct s5000ap *s, unsigned long id,
++				 unsigned long a1, unsigned long a2,
++				 unsigned long a3)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(id, a1, a2, a3, 0, 0, 0, 0, &res);
++	dev_info(s->dev, "smc(0x%lx, 0x%lx, 0x%lx, 0x%lx) = 0x%lx\n", id, a1,
++		 a2, a3, res.a0);
++	return res.a0;
++}
++
++/* CP_CTRL_S is only reachable through EL3, 16 bits at a time. */
++static int s5000ap_ctrl_s_read(struct s5000ap *s, u32 *val)
++{
++	unsigned long lo, hi;
++
++	lo = s5000ap_smc(s, SMC_CP, SMC_CP_READ_CTRL, 0, SMC_CP_CTRL_S);
++	if (lo & 0xffff)
++		return -EIO;
++	hi = s5000ap_smc(s, SMC_CP, SMC_CP_READ_CTRL, 1, SMC_CP_CTRL_S);
++	if (hi & 0xffff)
++		return -EIO;
++	*val = (lower_32_bits(hi) & 0xffff0000) | (lower_32_bits(lo) >> 16);
++	return 0;
++}
++
++static int s5000ap_pmu_wait(struct s5000ap *s, u32 reg, u32 mask, u32 want)
++{
++	u32 val;
++	int ret;
++
++	ret = regmap_read_poll_timeout(s->pmu, reg, val, (val & mask) == want,
++				       10, PMU_WAIT_US);
++	if (ret)
++		dev_err(s->dev, "PMU 0x%x: 0x%x, wanted 0x%x/0x%x\n", reg, val,
++			want, mask);
++	return ret;
++}
++
++/* cal_cp_init(): the downstream cp_init[] sequence. */
++static int s5000ap_cp_init(struct s5000ap *s)
++{
++	unsigned long r;
++	u32 ctrl;
++	int ret;
++
++	ret = s5000ap_ctrl_s_read(s, &ctrl);
++	if (ret)
++		return ret;
++	r = s5000ap_smc(s, SMC_CP, SMC_CP_WRITE_CTRL, ctrl | BIT(3),
++			SMC_CP_CTRL_S);
++	if ((long)r > 0)
++		return -EIO;
++	s5000ap_ctrl_s_read(s, &ctrl);
++
++	s->cp_on = true;
++	regmap_update_bits(s->pmu, PMU_CP_CONFIGURATION, BIT(0), BIT(0));
++	ret = s5000ap_pmu_wait(s, PMU_CP_STATUS, BIT(0), BIT(0));
++	if (ret)
++		return ret;
++	return s5000ap_pmu_wait(s, PMU_CP_IN, BIT(4), BIT(4));
++}
++
++/* shmem_security_request() for CONFIG_CP_SECURE_BOOT. */
++static int s5000ap_step_secure(struct s5000ap *s, unsigned long mode,
++			       unsigned long bl_size, unsigned long main_size)
++{
++	unsigned long r, p2, p3;
++	unsigned int tries = 0;
++	u32 stat = 0;
++	int ret = 0;
++
++	if (!s->mbox_up)
++		return -ENXIO;
++
++	switch (mode) {
++	case 0:		/* normal: verify and start */
++		p2 = bl_size;
++		p3 = main_size;
++		break;
++	case 2:		/* re-init */
++		p2 = 0;
++		p3 = 0;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/*
++	 * EL3 changes the TZASC windows of the CP memory in these calls: no
++	 * mapping of it may be live (the downstream Exynos 2100 driver unmaps
++	 * before every security request); it is mapped again on demand.
++	 */
++	if (s->mem && !s->link_up) {
++		memunmap(s->mem);
++		s->mem = NULL;
++	}
++
++	s5000ap_smc(s, SMC_SSS_CLK, 0, 0, 0);
++
++	/* The CP image carries its own memory map: pass the base in mode. */
++	if (mode == 0)
++		mode |= s->mem_phys;
++
++	regmap_read(s->pmu, PMU_CP_STATUS, &stat);
++	if (!(stat & BIT(0))) {
++		dev_info(s->dev, "secure: CP first init\n");
++		ret = s5000ap_cp_init(s);
++		s5000ap_pmu_show(s, "after cp_init");
++		if (ret)
++			goto out;
++	}
++
++	r = s5000ap_smc(s, SMC_CP, mode, p2, p3);
++	while (r == CP_CHECK_SIGN_NOT_FINISH && tries++ < CP_CHECK_MAX_TRY) {
++		struct arm_smccc_res res;
++
++		arm_smccc_smc(SMC_CP, SMC_CP_CHECK_CONTINUE, 0, 0, 0, 0, 0, 0,
++			      &res);
++		r = res.a0;
++	}
++	dev_info(s->dev, "secure: result 0x%lx (%s) after %u continue calls\n",
++		 r, smc_err_name(r), tries);
++	if ((mode & 0xf) == 0) {
++		if (r) {
++			ret = -EACCES;
++		} else {
++			s->secured = true;
++			s->ran_once = true;
++		}
++	} else if (s->ran_once) {
++		/*
++		 * Restart (cbd's silent reset runs the same boot sequence): only
++		 * an exact 0 means EL3 released the CP image area again.
++		 */
++		if (!r) {
++			s->secured = false;
++			s->reinit = true;
++			dev_info(s->dev, "secure: re-init after a run: CP memory released\n");
++		} else {
++			dev_err(s->dev, "secure: re-init after a run refused (%s): CP memory stays locked\n",
++				smc_err_name(r));
++			ret = -EACCES;
++		}
++	} else if (!r || r == CP_NOT_WORKING) {
++		/*
++		 * Re-init of a CP that has not run yet is refused with
++		 * CP_NOT_WORKING.  That is the normal first-boot answer: cbd
++		 * only stops on a negative ioctl result and goes on to load
++		 * the image.
++		 */
++		s->reinit = true;
++	} else {
++		ret = -EACCES;
++	}
++out:
++	s5000ap_smc(s, SMC_SSS_CLK, 1, 0, 0);
++	s5000ap_pmu_show(s, "after secure");
++	return ret;
++}
++
++/* s5000ap_boot_on(): wait for cp_status in the CP's status register. */
++static int s5000ap_step_boot_on(struct s5000ap *s)
++{
++	u32 status = 0;
++	int i;
++
++	if (!s->mbox_up)
++		return -ENXIO;
++
++	for (i = 0; i < 100; i++) {
++		status = mbox_rd(s, MBOX_ISSR(MBX_CP2AP_STATUS));
++		if (FIELD_GET(CP_STATUS_CP_STATUS, status))
++			break;
++		usleep_range(10000, 20000);
++	}
++	dev_info(s->dev, "boot_on: cp2ap status 0x%08x cp_status %lu lte_active %lu (%d polls)\n",
++		 status, FIELD_GET(CP_STATUS_CP_STATUS, status),
++		 FIELD_GET(CP_STATUS_LTE_ACTIVE, status), i);
++	return FIELD_GET(CP_STATUS_CP_STATUS, status) ? 0 : -ETIMEDOUT;
++}
++
++static u32 ipc_rd(struct s5000ap *s, u32 off)
++{
++	return readl((void __iomem *)s->mem + s->ipc_off + off);
++}
++
++static void ipc_wr(struct s5000ap *s, u32 val, u32 off)
++{
++	writel(val, (void __iomem *)s->mem + s->ipc_off + off);
++}
++
++/*
++ * IOCTL_MODEM_DL_START: shmem_start_download() (empty legacy queues, BOOT
++ * magic) followed by s5000ap_modem_boot_confirm() (ap_status = 1 in the
++ * AP status mailbox).  The CP boot stage sets cp_status and then spins
++ * until it sees that ap_status bit; only then does it read the magic and
++ * start polling the RAW queue for the 0x900d word.
++ */
++static int s5000ap_step_dl_start(struct s5000ap *s)
++{
++	u32 off, status;
++	int ret;
++
++	if (!s->mbox_up)
++		return -ENXIO;
++	ret = s5000ap_map(s);
++	if (ret)
++		return ret;
++
++	for (off = 0x08; off <= SHM_RAW_RX_TAIL; off += 4)
++		ipc_wr(s, 0, off);
++	ipc_wr(s, MEM_BOOT_MAGIC, SHM_MAGIC);
++	dev_info(s->dev, "dl_start: magic 0x%08x access 0x%x\n",
++		 ipc_rd(s, SHM_MAGIC), ipc_rd(s, SHM_ACCESS));
++	if (ipc_rd(s, SHM_MAGIC) != MEM_BOOT_MAGIC)
++		return -EFAULT;
++
++	status = mbox_rd(s, MBOX_ISSR(MBX_AP2CP_STATUS));
++	status &= ~AP_STATUS_AP_STATUS;
++	status |= FIELD_PREP(AP_STATUS_AP_STATUS, 1);
++	mbox_wr(s, status, MBOX_ISSR(MBX_AP2CP_STATUS));
++	dev_info(s->dev, "dl_start: boot confirm, ap_status 0x%08x\n",
++		 mbox_rd(s, MBOX_ISSR(MBX_AP2CP_STATUS)));
++	return 0;
++}
++
++/* One legacy RX queue: log and consume what the CP put there. */
++static bool s5000ap_rx_queue(struct s5000ap *s, const char *name, u32 head_off,
++			     u32 buff_off, u32 size)
++{
++	u32 head = ipc_rd(s, head_off), tail = ipc_rd(s, head_off + 4);
++	u8 buf[64];
++	u32 len, i;
++	char *base;
++
++	if (head == tail || head >= size || tail >= size)
++		return false;
++
++	len = (head - tail + size) % size;
++	base = (char *)s->mem + s->ipc_off + buff_off;
++	for (i = 0; i < min_t(u32, len, sizeof(buf)); i++)
++		buf[i] = base[(tail + i) % size];
++	dev_info(s->dev, "rx %s: %u bytes (head %u tail %u): %*ph\n", name, len,
++		 head, tail, (int)i, buf);
++	ipc_wr(s, head, head_off + 4);
++	return true;
++}
++
++/*
++ * Wait for the CP to put something in a legacy RX queue.  Downstream reads
++ * every legacy queue when the CP raises its message interrupt
++ * (recv_ipc_frames()), so look at FMT as well as RAW.
++ */
++static int s5000ap_step_rx(struct s5000ap *s, unsigned int wait_ms)
++{
++	unsigned long end = jiffies + msecs_to_jiffies(wait_ms);
++	bool got = false;
++	int ret;
++
++	ret = s5000ap_map(s);
++	if (ret)
++		return ret;
++
++	for (;;) {
++		got |= s5000ap_rx_queue(s, "FMT", SHM_FMT_RX_HEAD,
++					SHM_FMT_RX_BUFF, SHM_FMT_RX_SIZE);
++		got |= s5000ap_rx_queue(s, "RAW", SHM_RAW_RX_HEAD,
++					SHM_RAW_RX_BUFF, SHM_RAW_RX_SIZE);
++		if (got || time_after(jiffies, end))
++			break;
++		msleep(20);
++	}
++	if (!got)
++		dev_info(s->dev, "rx: nothing in %u ms (raw tx head %u tail %u, irqs %d)\n",
++			 wait_ms, ipc_rd(s, SHM_RAW_TX_HEAD),
++			 ipc_rd(s, SHM_RAW_TX_TAIL), atomic_read(&s->irqs));
++	return got ? 0 : -ETIMEDOUT;
++}
++
++/*
++ * Read-only look at the IPC region: magic, the legacy queue pointers (a
++ * moved RAW TX tail means the CP consumed our frame) and the CP boot log
++ * that downstream prints for IOCTL_MODEM_GET_CP_BOOTLOG.
++ */
++static int s5000ap_step_ipc(struct s5000ap *s)
++{
++	char log[SHM_BOOTLOG_MAX + 1];
++	u32 size, i;
++	int ret;
++
++	ret = s5000ap_map(s);
++	if (ret)
++		return ret;
++
++	dev_info(s->dev, "ipc: magic 0x%08x access 0x%08x fmt tx %u/%u rx %u/%u raw tx %u/%u rx %u/%u (head/tail)\n",
++		 ipc_rd(s, SHM_MAGIC), ipc_rd(s, SHM_ACCESS),
++		 ipc_rd(s, 0x08), ipc_rd(s, 0x0c), ipc_rd(s, SHM_FMT_RX_HEAD),
++		 ipc_rd(s, SHM_FMT_RX_TAIL), ipc_rd(s, SHM_RAW_TX_HEAD),
++		 ipc_rd(s, SHM_RAW_TX_TAIL), ipc_rd(s, SHM_RAW_RX_HEAD),
++		 ipc_rd(s, SHM_RAW_RX_TAIL));
++
++	size = ipc_rd(s, SHM_BOOTLOG);
++	if (!size || size > SHM_BOOTLOG_MAX) {
++		dev_info(s->dev, "ipc: no CP boot log (size word 0x%08x)\n",
++			 size);
++	} else {
++		memcpy(log, (char *)s->mem + s->ipc_off + SHM_BOOTLOG + 4, size);
++		for (i = 0; i < size; i++)
++			if (log[i] && (log[i] < 0x20 || log[i] > 0x7e))
++				log[i] = '.';
++		log[size] = '\0';
++		dev_info(s->dev, "ipc: CP boot log[%u]: %s\n", size, log);
++	}
++	if (s->mbox_up)
++		s5000ap_mbox_show(s, "ipc");
++	dev_info(s->dev, "ipc: irqs %d\n", atomic_read(&s->irqs));
++	return 0;
++}
++
++/*
++ * One boot-channel command as cbd writes it to umts_boot0: a SIPC5 link
++ * header for channel 215 and a 32-bit little-endian word, placed in the
++ * legacy RAW TX queue (xmit_udl()).  The boot ROM polls the queue.
++ */
++static int s5000ap_step_udl(struct s5000ap *s, u32 word, unsigned int wait_ms)
++{
++	u8 frame[8] = { SIPC5_START | SIPC5_PADDING, SIPC_CH_BOOT, 8, 0 };
++	u32 head, tail, i;
++	char *base;
++	int ret;
++
++	ret = s5000ap_map(s);
++	if (ret)
++		return ret;
++	if (ipc_rd(s, SHM_MAGIC) != MEM_BOOT_MAGIC)
++		return -EPROTO;
++
++	head = ipc_rd(s, SHM_RAW_TX_HEAD);
++	tail = ipc_rd(s, SHM_RAW_TX_TAIL);
++	if (head >= SHM_RAW_TX_SIZE || tail >= SHM_RAW_TX_SIZE)
++		return -EIO;
++
++	put_unaligned_le32(word, frame + 4);
++	base = (char *)s->mem + s->ipc_off + SHM_RAW_TX_BUFF;
++	for (i = 0; i < sizeof(frame); i++)
++		base[(head + i) % SHM_RAW_TX_SIZE] = frame[i];
++	ipc_wr(s, (head + sizeof(frame)) % SHM_RAW_TX_SIZE, SHM_RAW_TX_HEAD);
++	dev_info(s->dev, "udl: sent 0x%08x (head %u tail %u)\n", word, head,
++		 tail);
++
++	/* cbd polls umts_boot0 for 30 s before it gives up. */
++	return s5000ap_step_rx(s, wait_ms);
++}
++
++static u16 ipc_rd16(struct s5000ap *s, u32 off)
++{
++	return readw((void __iomem *)s->mem + s->ipc_off + off);
++}
++
++static void ipc_wr16(struct s5000ap *s, u16 val, u32 off)
++{
++	writew(val, (void __iomem *)s->mem + s->ipc_off + off);
++}
++
++/* Offsets of the ring pointers: {rp[UL], wp[UL], rp[DL], wp[DL]} arrays. */
++static u32 sbd_rp(struct s5000ap *s, int dir, int id)
++{
++	return s->sbd_rbps + 2 * (dir * 2 * SBD_NCH + id);
++}
++
++static u32 sbd_wp(struct s5000ap *s, int dir, int id)
++{
++	return s->sbd_rbps + 2 * ((dir * 2 + 1) * SBD_NCH + id);
++}
++
++/* AP -> CP link command: value in the message mailbox, then the doorbell. */
++static void s5000ap_send_cmd(struct s5000ap *s, u16 cmd)
++{
++	u16 val = cmd | MASK_CMD_VALID | MASK_INT_VALID;
++
++	mbox_wr(s, val, MBOX_ISSR(MBX_AP2CP_MSG));
++	mbox_wr(s, BIT(0), MBOX_INTGR1);
++	dev_info(s->dev, "AP -> CP command 0x%04x\n", val);
++}
++
++/*
++ * PDA_ACTIVE (AP2CP status bit 5) tells the CP whether the AP is awake.  With
++ * it low the CP firmware holds back non-urgent NTFs (signal, icon, NET REG,
++ * serving network, CP channel info, ...) and releases its MIF lock; on high it
++ * re-sends the registration state.  Downstream sets it once in s5000ap_on()
++ * and never lowers it.  After the change the CP is rung on mailbox interrupt
++ * INT_AP2CP_ACTIVE (downstream DT: int_ap2cp_active = 3, unused there); that
++ * the CP reads the bit on that interrupt is inferred, not confirmed.
++ *
++ * Lowering needs the link up.  Raising sets every bit an earlier lowering
++ * cleared and works with the link down, so
++ * a release path never fails; step_on() rewrites the status anyway.
++ *
++ * Called with s->lock: step_on() and dl_start() rewrite ISSR2 under it, and
++ * mbox_up / link_up change under it.
++ */
++static int s5000ap_pda_set(struct s5000ap *s, bool on, const char *why)
++{
++	u32 mask, old, v;
++
++	lockdep_assert_held(&s->lock);
++	if (on && !s->pda_low)
++		return 0;
++	if (!s->mbox_up)
++		return -ENXIO;
++	if (on) {
++		mask = s->pda_low;
++	} else {
++		if (!s->link_up)
++			return -ENOLINK;
++		mask = AP_STATUS_PDA_ACTIVE;
++	}
++
++	old = mbox_rd(s, MBOX_ISSR(MBX_AP2CP_STATUS));
++	v = on ? old | mask : old & ~mask;
++	mbox_wr(s, v, MBOX_ISSR(MBX_AP2CP_STATUS));
++	/* no doorbell for a CP that is down: step_on() starts it with 1 */
++	if (s->link_up)
++		mbox_wr(s, BIT(INT_AP2CP_ACTIVE), MBOX_INTGR1);
++	s->pda_low = on ? 0 : s->pda_low | mask;
++	dev_info(s->dev, "pda_active %u (%s): ap_status 0x%08x -> 0x%08x, int %d\n",
++		 on, why, old, v, s->link_up ? INT_AP2CP_ACTIVE : -1);
++	return 0;
++}
++
++/*
++ * setup_pktproc(): the packet processor's global descriptor at the start of
++ * modem_spare (CP 0x50000000).  Five words; no packet buffers are offered.
++ */
++static int s5000ap_step_pktproc(struct s5000ap *s)
++{
++	struct device_node *np;
++	struct resource res;
++	u32 __iomem *g;
++	int ret;
++
++	if (!s->secured)
++		return -EBUSY;
++
++	np = of_find_node_by_path("/reserved-memory/modem_spare@d0000000");
++	if (!np)
++		return -ENODEV;
++	ret = of_address_to_resource(np, 0, &res);
++	of_node_put(np);
++	if (ret)
++		return ret;
++
++	if (resource_size(&res) < PKTPROC_MAP_SIZE)
++		return -EINVAL;
++	if (!s->pkt)
++		s->pkt = memremap(res.start, PKTPROC_MAP_SIZE, MEMREMAP_WC);
++	if (!s->pkt)
++		return -ENOMEM;
++	g = s->pkt;
++	writel(PKTPROC_CP_BASE | PKTPROC_DESC_OFF, &g[0]);
++	writel(PKTPROC_NUM_DESC, &g[1]);
++	writel(PKTPROC_CP_BASE | PKTPROC_DATA_OFF, &g[2]);
++	writel(0, &g[3]);
++	writel(0, &g[4]);
++	dev_info(s->dev, "pktproc: gdesc at %pa: 0x%08x %u 0x%08x %u %u\n",
++		 &res.start, readl(&g[0]), readl(&g[1]), readl(&g[2]),
++		 readl(&g[3]), readl(&g[4]));
++	return 0;
++}
++
++/*
++ * init_sbd_link(): global descriptor, ring pointer set, per-ring descriptor
++ * vectors and data buffers in the IPC region, exactly as downstream lays them
++ * out.  The zero-copy downlink ring (pdp) gets no buffers: no PS data.
++ */
++static int s5000ap_step_sbd_init(struct s5000ap *s)
++{
++	u32 gdesc = SBD_DESC_OFF, desc, buff, i, k;
++	int ret, dir;
++
++	if (!s->secured)
++		return -EBUSY;
++	ret = s5000ap_map(s);
++	if (ret)
++		return ret;
++
++	/* Rings are rebuilt: stop the rx worker first (it never takes s->lock). */
++	s->link_up = false;
++	cancel_work_sync(&s->rx_work);
++
++	memset(s->mem + s->ipc_off + SBD_DESC_OFF, 0,
++	       SBD_BUFF_OFF - SBD_DESC_OFF);
++
++	s->sbd_rbps = gdesc + SBD_GDESC_SIZE;
++	desc = s->sbd_rbps + 2 * 2 * 2 * SBD_NCH;
++	buff = SBD_BUFF_OFF;
++
++	ipc_wr(s, SBD_VERSION, gdesc);
++	ipc_wr(s, SBD_NCH, gdesc + 4);
++	ipc_wr(s, s->sbd_rbps, gdesc + 8);
++
++	for (i = 0; i < SBD_NCH; i++) {
++		const struct sbd_chan *c = &sbd_chans[i];
++		u32 rb_ch = gdesc + 12 + i * 16;
++
++		for (dir = SBD_UL; dir <= SBD_DL; dir++) {
++			u32 rbd = gdesc + 12 + SBD_MAX_CH * 16 +
++				  (i * 2 + dir) * SBD_RBD_SIZE;
++			u32 addr_v, size_v;
++
++			s->sbd_buff[i][dir] = buff;
++			buff += (u32)c->len[dir] * c->size[dir];
++			addr_v = desc;
++			desc += 4 * c->len[dir];
++			size_v = desc;
++			desc += 4 * c->len[dir];
++			s->sbd_sizev[i][dir] = size_v;
++			if (desc > SBD_BUFF_OFF || buff > s->ipc_size)
++				return -ENOSPC;
++
++			for (k = 0; k < c->len[dir]; k++)
++				ipc_wr(s, s->sbd_buff[i][dir] + k * c->size[dir],
++				       addr_v + 4 * k);
++
++			ipc_wr16(s, c->ch, rbd);
++			ipc_wr16(s, dir, rbd + 4);
++			ipc_wr16(s, 1, rbd + 6);
++			ipc_wr(s, MASK_INT_VALID | MASK_SEND_DATA, rbd + 8);
++			ipc_wr16(s, c->len[dir], rbd + 12);
++			ipc_wr16(s, i, rbd + 14);
++			ipc_wr16(s, c->size[dir], rbd + 16);
++
++			ipc_wr(s, rbd, rb_ch + dir * 8);
++			ipc_wr(s, addr_v, rb_ch + dir * 8 + 4);
++		}
++	}
++
++	for (i = 0; i < NCHDEV; i++) {
++		kfree_skb(s->chdev[i].part);
++		s->chdev[i].part = NULL;
++		skb_queue_purge(&s->chdev[i].mfq);
++		s->chdev[i].mf_len = 0;
++		skb_queue_purge(&s->chdev[i].rxq);
++	}
++	s->link_up = false;
++	s->sbd_ready = true;
++	s->link_reset = false;
++	dev_info(s->dev, "sbd_init: %zu channels, gdesc 0x%x rbps 0x%x desc end 0x%x buff end 0x%x\n",
++		 SBD_NCH, gdesc, s->sbd_rbps, desc, buff);
++	return 0;
++}
++
++/* Answer to INIT_START once the rings exist (cmd_init_start_handler()). */
++static int s5000ap_step_pif_done(struct s5000ap *s)
++{
++	if (!s->mbox_up || !s->sbd_ready)
++		return -EBUSY;
++	s5000ap_send_cmd(s, CMD_PIF_INIT_DONE);
++	return 0;
++}
++
++/* shmem_reset_ipc_link(): done when the CP sends PHONE_START. */
++static int s5000ap_step_link_reset(struct s5000ap *s)
++{
++	u32 off;
++
++	if (!s->sbd_ready)
++		return -EBUSY;
++
++	ipc_wr(s, 0, SHM_ACCESS);
++	ipc_wr(s, 0, SHM_MAGIC);
++	for (off = 0x08; off <= SHM_RAW_RX_TAIL; off += 4)
++		ipc_wr(s, 0, off);
++	ipc_wr(s, MEM_IPC_MAGIC, SHM_MAGIC);
++	ipc_wr(s, 1, SHM_ACCESS);
++	dev_info(s->dev, "link_reset: magic 0x%x access %u\n",
++		 ipc_rd(s, SHM_MAGIC), ipc_rd(s, SHM_ACCESS));
++	if (ipc_rd(s, SHM_MAGIC) != MEM_IPC_MAGIC || ipc_rd(s, SHM_ACCESS) != 1)
++		return -EACCES;
++	s->link_reset = true;
++	return 0;
++}
++
++/*
++ * shmem_init_comm(): clock table, then INIT_END.  The table is the one
++ * downstream writes when it has no ECT data: four named tables, no levels.
++ * The ETDAC OTP word (RF envelope tracking) is left out.
++ */
++/* MIF/INT levels ACPM accepts here (beyond2lte-dvfs), ascending */
++static const u32 cp_mif_khz[] = { 421000, 676000, 845000, 1014000, 1352000,
++				  1794000, 2093000 };
++static const u32 cp_int_khz[] = { 200000, 400000, 534000 };
++
++static int s5000ap_step_init_end(struct s5000ap *s)
++{
++	static const char * const names[] = { "CL0", "CL1", "MIF", "INT" };
++	char *tb;
++	int i;
++
++	if (!s->mbox_up || !s->link_reset)
++		return -EBUSY;
++
++	/*
++	 * DVFS level table the CP indexes in its MIF/INT requests (mailbox ints
++	 * 6/7, value 1..count = table[v-1], ascending; 0 = no request): "CT0",
++	 * u32 count, {name[4], u32 n} x 4, then the kHz values of all tables.
++	 * Only MIF and INT; no CPU tables.
++	 */
++	tb = (char *)s->mem + s->ipc_off + SHM_CLK_TABLE;
++	memset(tb, 0, 8 + 8 * ARRAY_SIZE(names) +
++	       4 * (ARRAY_SIZE(cp_mif_khz) + ARRAY_SIZE(cp_int_khz)));
++	memcpy(tb, "CT0", 4);
++	ipc_wr(s, ARRAY_SIZE(names), SHM_CLK_TABLE + 4);
++	for (i = 0; i < ARRAY_SIZE(names); i++)
++		memcpy(tb + 8 + 8 * i, names[i], 4);
++	ipc_wr(s, ARRAY_SIZE(cp_mif_khz), SHM_CLK_TABLE + 8 + 8 * 2 + 4);
++	ipc_wr(s, ARRAY_SIZE(cp_int_khz), SHM_CLK_TABLE + 8 + 8 * 3 + 4);
++	for (i = 0; i < ARRAY_SIZE(cp_mif_khz); i++)
++		ipc_wr(s, cp_mif_khz[i], SHM_CLK_TABLE + 40 + 4 * i);
++	for (i = 0; i < ARRAY_SIZE(cp_int_khz); i++)
++		ipc_wr(s, cp_int_khz[i],
++		       SHM_CLK_TABLE + 40 + 4 * (ARRAY_SIZE(cp_mif_khz) + i));
++	s->cp_mif_req = s->cp_int_req = 0;
++
++	s5000ap_zc_init(s);
++	/* no uplink doorbell may overwrite INIT_END in ISSR0 before the CP
++	 * answers (first DL frame or data interrupt), 1 s at most */
++	s->tx_gate = true;
++	s->cp_spoke = false;
++	s->tx_gate_until = jiffies + HZ;
++	s->init_end_resends = 0;
++	s5000ap_send_cmd(s, CMD_INIT_END);
++	s->link_up = true;
++	if (s->ndev)
++		netif_carrier_on(s->ndev);
++	if (s->ndev_ims)
++		netif_carrier_on(s->ndev_ims);
++	dev_info(s->dev, "link up: /dev/umts_ipc0, umts_ipc1, umts_rfs0 carry IPC\n");
++	return 0;
++}
++
++/* Read-only: ring pointers of every channel. */
++static int s5000ap_step_sbd(struct s5000ap *s)
++{
++	int i;
++
++	if (!s->sbd_ready)
++		return -EBUSY;
++
++	for (i = 0; i < SBD_NCH; i++)
++		dev_info(s->dev, "sbd %-8s ch %3u: UL rp %u wp %u, DL rp %u wp %u\n",
++			 sbd_chans[i].name, sbd_chans[i].ch,
++			 ipc_rd16(s, sbd_rp(s, SBD_UL, i)),
++			 ipc_rd16(s, sbd_wp(s, SBD_UL, i)),
++			 ipc_rd16(s, sbd_rp(s, SBD_DL, i)),
++			 ipc_rd16(s, sbd_wp(s, SBD_DL, i)));
++	dev_info(s->dev, "sbd: magic 0x%x access %u irqs %d data irqs %d\n",
++		 ipc_rd(s, SHM_MAGIC), ipc_rd(s, SHM_ACCESS),
++		 atomic_read(&s->irqs), atomic_read(&s->data_irqs));
++	dev_info(s->dev, "link: up %d rx frames %u tx frames %u dropped %u tx timeouts %u\n",
++		 s->link_up, s->rx_frames, s->tx_frames, s->rx_dropped, s->tx_full);
++	if (s->pkt) {
++		u32 *g = s->pkt;
++
++		dev_info(s->dev, "pktproc: fore %u rear %u rx %u bad %u other ch %u\n",
++			 READ_ONCE(g[3]), READ_ONCE(g[4]), s->pkt_rx, s->pkt_bad,
++			 s->pkt_other_ch);
++		dev_info(s->dev, "zerocopy: pre %u rx %u bad %u\n", s->zc_pre,
++			 s->zc_rx, s->zc_bad);
++	}
++	for (i = 0; i < NCHDEV; i++)
++		dev_info(s->dev, "link: %s users %d queued %u dropped %u\n",
++			 s->chdev[i].misc.name, atomic_read(&s->chdev[i].users),
++			 skb_queue_len(&s->chdev[i].rxq), s->chdev[i].drops);
++	return 0;
++}
++
++/*
++ * Take what the CP put in the downlink rings and log the start of each
++ * frame.  Only S5000AP_DUMP_LEN bytes are printed (the SIPC5 link header
++ * and the IPC header), so payloads stay out of the log.
++ */
++static int s5000ap_step_sbd_rx(struct s5000ap *s, unsigned int max)
++{
++	unsigned int total = 0, n = S5000AP_DUMP_LEN;
++	u8 buf[64];
++	int i;
++
++	if (!s->sbd_ready)
++		return -EBUSY;
++	if (s->link_up) {
++		/* The rx worker owns the rings now; s->lock is held: no flush. */
++		schedule_work(&s->rx_work);
++		return 0;
++	}
++	if (!max)
++		max = 16;
++
++	for (i = 0; i < SBD_NCH; i++) {
++		const struct sbd_chan *c = &sbd_chans[i];
++		u16 rp = ipc_rd16(s, sbd_rp(s, SBD_DL, i));
++		u16 wp = ipc_rd16(s, sbd_wp(s, SBD_DL, i));
++		unsigned int cnt = 0;
++
++		if (rp >= c->len[SBD_DL] || wp >= c->len[SBD_DL]) {
++			dev_warn(s->dev, "sbd_rx %s: bad pointers rp %u wp %u\n",
++				 c->name, rp, wp);
++			continue;
++		}
++		if (c->size[SBD_DL] < 16)	/* zero-copy ring, no buffers */
++			continue;
++
++		while (rp != wp && cnt < max) {
++			u32 len = ipc_rd(s, s->sbd_sizev[i][SBD_DL] + 4 * rp) &
++				  0xffff;
++			u32 show = min3(len, n, (u32)c->size[SBD_DL]);
++
++			memcpy(buf, s->mem + s->ipc_off +
++			       s->sbd_buff[i][SBD_DL] + rp * c->size[SBD_DL],
++			       show);
++			dev_info(s->dev, "sbd_rx %s ch %u [%u] len %u: %*ph\n",
++				 c->name, c->ch, rp, len, (int)show, buf);
++			rp = (rp + 1) % c->len[SBD_DL];
++			cnt++;
++		}
++		if (cnt)
++			ipc_wr16(s, rp, sbd_rp(s, SBD_DL, i));
++		total += cnt;
++	}
++	dev_info(s->dev, "sbd_rx: %u frames\n", total);
++	return 0;
++}
++
++/*
++ * Link layer: character devices for the IPC channels.
++ *
++ * Each downlink buffer holds one SIPC5 link frame (config 0xf8, channel,
++ * 16-bit length incl. the header) or the continuation of a frame that is
++ * longer than the ring's buffer size (downstream check_more()).  A read
++ * returns the payload of one frame without the link header, exactly what
++ * downstream misc_read() hands to rild/cbd.  A write puts one frame into the
++ * uplink ring (sbd_pio_tx()) and rings the CP with INT_VALID | SEND_DATA.
++ */
++/*
++ * A report for the dark wake: a single-frame IPC NOTI on umts_ipc0 that
++ * only carries periodic status: DISP (0x07) ICON_INFO (0x01) or RSSI_INFO
++ * (0x06), and the undocumented MISC (0x0a) 0x52 and CFG (0x0f) 0x36 that
++ * the CP sends every 10-20 s while idle on LTE (no AP user reads them).
++ * IPC header: u16 length (whole message), mseq, aseq, main, sub, type
++ * (3 = NOTI).
++ */
++#define DW_MARK		0x44574b31	/* skb->mark of a queued report */
++
++static bool s5000ap_dw_report(const struct s5000ap_chan *ch,
++			      const struct sk_buff *skb)
++{
++	const u8 *p = skb->data;
++
++	if (ch->idx != 1 || skb->len < 7 ||
++	    get_unaligned_le16(p) != skb->len || p[6] != 0x03)
++		return false;
++	return (p[4] == 0x07 && (p[5] == 0x01 || p[5] == 0x06)) ||
++	       (p[4] == 0x0a && p[5] == 0x52) ||
++	       (p[4] == 0x0f && p[5] == 0x36);
++}
++
++/* Count what came in; during a suspend replace an older report of the kind. */
++static void s5000ap_dw_account(struct s5000ap *s, struct s5000ap_chan *ch,
++			       struct sk_buff *skb)
++{
++	struct sk_buff *old, *tmp;
++	unsigned long flags;
++
++	if (!s5000ap_dw_report(ch, skb)) {
++		atomic_inc(&s->dw_other);
++		return;
++	}
++	s->dw_benign++;
++	if (!READ_ONCE(s->dw_armed))
++		return;
++	skb->mark = DW_MARK;
++	spin_lock_irqsave(&ch->rxq.lock, flags);
++	skb_queue_walk_safe(&ch->rxq, old, tmp) {
++		if (old->mark == DW_MARK && old->len >= 6 &&
++		    old->data[4] == skb->data[4] &&
++		    old->data[5] == skb->data[5]) {
++			__skb_unlink(old, &ch->rxq);
++			kfree_skb(old);
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&ch->rxq.lock, flags);
++}
++
++static void s5000ap_chan_queue(struct s5000ap *s, struct s5000ap_chan *ch,
++			       struct sk_buff *skb)
++{
++	s5000ap_dw_account(s, ch, skb);
++	if (skb_queue_len(&ch->rxq) >= CHAN_RXQ_MAX) {
++		kfree_skb(skb_dequeue(&ch->rxq));
++		ch->drops++;
++	}
++	skb_queue_tail(&ch->rxq, skb);
++	wake_up_interruptible(&ch->wq);
++}
++
++/*
++ * A complete link frame.  Pieces of a multi-frame message (config 0xfb,
++ * downstream sipc5_build_header()) are collected until the piece without
++ * the MORE bit, so one read() still returns one whole IPC message.
++ */
++static void s5000ap_chan_deliver(struct s5000ap *s, struct s5000ap_chan *ch,
++				 struct sk_buff *skb, bool mf, u8 ctrl)
++{
++	struct sk_buff *all, *p;
++
++	if (!mf) {
++		s5000ap_chan_queue(s, ch, skb);
++		return;
++	}
++	if (!skb_queue_empty(&ch->mfq) && (ctrl & SIPC5_MF_ID) != ch->mf_id) {
++		dev_warn_ratelimited(s->dev, "%s: multi-frame %u cut by %u\n",
++				     ch->misc.name, ch->mf_id, ctrl & SIPC5_MF_ID);
++		skb_queue_purge(&ch->mfq);
++		ch->mf_len = 0;
++		ch->drops++;
++	}
++	ch->mf_id = ctrl & SIPC5_MF_ID;
++	if (ch->mf_len + skb->len > CHAN_MSG_MAX) {
++		skb_queue_purge(&ch->mfq);
++		ch->mf_len = 0;
++		kfree_skb(skb);
++		ch->drops++;
++		return;
++	}
++	skb_queue_tail(&ch->mfq, skb);
++	ch->mf_len += skb->len;
++	if (ctrl & SIPC5_MF_MORE)
++		return;
++
++	all = alloc_skb(ch->mf_len, GFP_KERNEL);
++	while ((p = skb_dequeue(&ch->mfq))) {
++		if (all)
++			skb_put_data(all, p->data, p->len);
++		kfree_skb(p);
++	}
++	ch->mf_len = 0;
++	if (all)
++		s5000ap_chan_queue(s, ch, all);
++	else
++		ch->drops++;
++}
++
++static void s5000ap_chan_rx(struct s5000ap *s, struct s5000ap_chan *ch,
++			    const u8 *src, u32 len)
++{
++	const struct sbd_chan *c = &sbd_chans[ch->idx];
++	struct sk_buff *skb;
++	u32 hdr, flen, n;
++	bool mf = false;
++	u8 ctrl = 0;
++
++	if (ch->part) {
++		n = min(len, ch->part_left);
++		skb_put_data(ch->part, src, n);
++		ch->part_left -= n;
++		if (!ch->part_left) {
++			s5000ap_chan_deliver(s, ch, ch->part, ch->part_mf,
++					     ch->part_ctrl);
++			ch->part = NULL;
++		}
++		return;
++	}
++
++	if (len < SIPC5_HDR_LEN || (src[0] & SIPC5_START) != SIPC5_START ||
++	    src[1] != c->ch) {
++		dev_warn_ratelimited(s->dev, "%s: bad frame len %u: %*ph\n",
++				     ch->misc.name, len, (int)min(len, 8u), src);
++		s->rx_dropped++;
++		return;
++	}
++
++	hdr = SIPC5_HDR_LEN;
++	flen = get_unaligned_le16(src + 2);
++	if ((src[0] & SIPC5_MULTI_FRAME) == SIPC5_EXT_FIELD) {
++		if (len < SIPC5_HDR_EXT_LEN)
++			return;
++		hdr = SIPC5_HDR_EXT_LEN;
++		flen = get_unaligned_le32(src + 2);
++	} else if ((src[0] & SIPC5_MULTI_FRAME) == SIPC5_MULTI_FRAME) {
++		if (len < SIPC5_HDR_MF_LEN)
++			return;
++		hdr = SIPC5_HDR_MF_LEN;
++		mf = true;
++		ctrl = src[4];
++	}
++	if (flen < hdr || flen > SZ_1M) {
++		dev_warn_ratelimited(s->dev, "%s: bad frame length %u\n",
++				     ch->misc.name, flen);
++		s->rx_dropped++;
++		return;
++	}
++
++	skb = alloc_skb(flen - hdr, GFP_KERNEL);
++	if (!skb) {
++		s->rx_dropped++;
++		return;
++	}
++	n = min(len, flen);
++	skb_put_data(skb, src + hdr, n - hdr);
++	if (flen > n) {
++		ch->part = skb;
++		ch->part_left = flen - n;
++		ch->part_mf = mf;
++		ch->part_ctrl = ctrl;
++	} else {
++		s5000ap_chan_deliver(s, ch, skb, mf, ctrl);
++	}
++}
++
++/* One downlink IP packet for SIPC channel ch (10 = rmnet0, 11 = rmnet1/IMS). */
++static void s5000ap_net_rx(struct s5000ap *s, u8 ch, const u8 *src, u32 len)
++{
++	struct net_device *ndev = ch == SIPC_CH_RMNET0 ? s->ndev :
++				  ch == SIPC_CH_RMNET1 ? s->ndev_ims : NULL;
++	struct sk_buff *skb;
++	__be16 proto;
++
++	if (!ndev) {
++		s->pkt_other_ch++;
++		return;
++	}
++	if (!len || len > PKTPROC_MAX_PKT) {
++		ndev->stats.rx_length_errors++;
++		return;
++	}
++	switch (src[0] >> 4) {
++	case 4:
++		proto = htons(ETH_P_IP);
++		break;
++	case 6:
++		proto = htons(ETH_P_IPV6);
++		break;
++	default:
++		ndev->stats.rx_frame_errors++;
++		return;
++	}
++	skb = netdev_alloc_skb(ndev, len);
++	if (!skb) {
++		ndev->stats.rx_dropped++;
++		return;
++	}
++	skb_put_data(skb, src, len);
++	skb->protocol = proto;
++	skb_reset_mac_header(skb);
++	skb_reset_network_header(skb);
++	ndev->stats.rx_packets++;
++	ndev->stats.rx_bytes += len;
++	netif_rx(skb);
++}
++
++/*
++ * Zero-copy downlink of the multipdp ring (downstream link_rx_zerocopy.c):
++ * the AP is the buffer producer.  Each DL slot holds a u64 "data offset" of
++ * a 2 KiB cell in the ZMB pool, counted from the IPC base in CP space plus
++ * NET_HEADROOM.  The AP posts cells by moving the ring's DL rp, the CP fills
++ * them and moves DL wp.  Slot k always carries cell k here, so a consumed
++ * slot is simply posted again.
++ */
++static u64 s5000ap_zc_offset(struct s5000ap *s, u32 k)
++{
++	/* CP address of the cell's data minus the CP address of the IPC base
++	 * (downstream: data - zmb_va + shmem_size, shmem_size = ipc_size +
++	 * 0x5a00000 = 0x5f00000 here). */
++	return (u64)(PKTPROC_CP_BASE + ZMB_OFF + k * ZMB_CELL + ZMB_HEADROOM) -
++	       (CP_VIEW_BASE + s->ipc_off);
++}
++
++static void s5000ap_zc_post(struct s5000ap *s, u32 k)
++{
++	u8 *slot = (u8 *)s->mem + s->ipc_off + s->sbd_buff[SBD_PDP][SBD_DL] + k * 8;
++
++	put_unaligned_le64(s5000ap_zc_offset(s, k), slot);
++}
++
++static void s5000ap_zc_init(struct s5000ap *s)
++{
++	u16 len = sbd_chans[SBD_PDP].len[SBD_DL];
++	u32 k;
++
++	if (!s->pkt || len * ZMB_CELL > ZMB_SIZE)
++		return;
++	for (k = 0; k < len; k++)
++		s5000ap_zc_post(s, k);
++	s->zc_pre = 0;
++	dma_wmb();
++	ipc_wr16(s, 0, sbd_wp(s, SBD_DL, SBD_PDP));
++	ipc_wr16(s, len - 1, sbd_rp(s, SBD_DL, SBD_PDP));	/* len - 1 cells posted */
++}
++
++static void s5000ap_zc_rx(struct s5000ap *s)
++{
++	u16 len = sbd_chans[SBD_PDP].len[SBD_DL];
++	u16 filled = ipc_rd16(s, sbd_wp(s, SBD_DL, SBD_PDP));
++	u16 prod = ipc_rd16(s, sbd_rp(s, SBD_DL, SBD_PDP));
++	bool moved = false;
++
++	if (!s->pkt || filled >= len || prod >= len)
++		return;
++	dma_rmb();
++	while (s->zc_pre != filled) {
++		u16 k = s->zc_pre;
++		u32 sizev = ipc_rd(s, s->sbd_sizev[SBD_PDP][SBD_DL] + 4 * k);
++		u8 *slot = (u8 *)s->mem + s->ipc_off + s->sbd_buff[SBD_PDP][SBD_DL] + k * 8;
++		u64 off = get_unaligned_le64(slot);
++		u64 base = s5000ap_zc_offset(s, 0) - ZMB_HEADROOM;
++		u32 plen = sizev & 0xffff;
++
++		if (off >= base + ZMB_HEADROOM && off - base + plen <= ZMB_SIZE &&
++		    plen <= ZMB_CELL - ZMB_HEADROOM) {
++			s5000ap_net_rx(s, sizev >> 16,
++				       (u8 *)s->pkt + ZMB_OFF + (off - base), plen);
++			s->zc_rx++;
++		} else {
++			s->zc_bad++;
++		}
++		s->zc_pre = (k + 1) % len;
++		/* hand the cell after the last posted one back to the CP */
++		s5000ap_zc_post(s, prod);
++		prod = (prod + 1) % len;
++		moved = true;
++	}
++	if (moved) {
++		dma_wmb();
++		ipc_wr16(s, prod, sbd_rp(s, SBD_DL, SBD_PDP));
++	}
++}
++
++/*
++ * Downlink packets through the CP packet processor (downstream
++ * pktproc_pio_rx()): the CP fills descriptors and data in modem_spare and
++ * moves fore_ptr; the AP copies each packet out and hands the slot back by
++ * moving rear_ptr.  No doorbell back to the CP.
++ */
++static void s5000ap_pktproc_rx(struct s5000ap *s)
++{
++	u32 *g = s->pkt;
++	u32 fore, rear, budget = PKTPROC_NUM_DESC;
++
++	if (!g || READ_ONCE(g[1]) != PKTPROC_NUM_DESC)
++		return;
++	fore = READ_ONCE(g[3]);
++	rear = READ_ONCE(g[4]);
++	if (fore >= PKTPROC_NUM_DESC || rear >= PKTPROC_NUM_DESC) {
++		dev_warn_ratelimited(s->dev, "pktproc: bad pointers fore %u rear %u\n",
++				     fore, rear);
++		return;
++	}
++	if (fore == rear)
++		return;
++
++	dma_rmb();
++	while (rear != fore && budget--) {
++		const u8 *d = (u8 *)s->pkt + PKTPROC_DESC_OFF +
++			      rear * PKTPROC_DESC_SIZE;
++		u32 addr = get_unaligned_le32(d);
++		u32 len = get_unaligned_le16(d + 0x10);
++		u8 ch = d[0x12];
++		u32 lo = PKTPROC_CP_BASE + PKTPROC_DATA_OFF;
++
++		if (ch != 0xff && len && len <= PKTPROC_MAX_PKT &&
++		    addr >= lo && addr - lo + len <= PKTPROC_DATA_SIZE) {
++			s5000ap_net_rx(s, ch, (u8 *)s->pkt + (addr - PKTPROC_CP_BASE),
++				       len);
++			s->pkt_rx++;
++		} else {
++			s->pkt_bad++;
++		}
++		rear = (rear + 1) % PKTPROC_NUM_DESC;
++	}
++	dma_mb();
++	WRITE_ONCE(g[4], rear);
++}
++
++static void s5000ap_rx_ring(struct s5000ap *s, int i)
++{
++	const struct sbd_chan *c = &sbd_chans[i];
++	struct s5000ap_chan *ch = s->chans[i];
++	u16 rlen = c->len[SBD_DL], size = c->size[SBD_DL];
++	u16 rp = ipc_rd16(s, sbd_rp(s, SBD_DL, i));
++	u16 wp = ipc_rd16(s, sbd_wp(s, SBD_DL, i));
++	unsigned int n = S5000AP_DUMP_LEN;
++	bool moved = false;
++
++	if (rp >= rlen || wp >= rlen) {
++		dev_warn_ratelimited(s->dev, "rx %s: bad pointers rp %u wp %u\n",
++				     c->name, rp, wp);
++		return;
++	}
++	if (size < 16)		/* zero-copy ring, no buffers */
++		return;
++
++	/* The CP wrote the buffers and size vector before moving wp. */
++	dma_rmb();
++	while (rp != wp) {
++		u32 len = ipc_rd(s, s->sbd_sizev[i][SBD_DL] + 4 * rp) & 0xffff;
++		const u8 *src = (u8 *)s->mem + s->ipc_off +
++				s->sbd_buff[i][SBD_DL] + rp * size;
++
++		if (len > size)
++			len = size;
++		if (i == SBD_PDP_HI)
++			s5000ap_net_rx(s, ipc_rd(s, s->sbd_sizev[i][SBD_DL] + 4 * rp) >> 16,
++				       src, len);
++		else if (ch)
++			s5000ap_chan_rx(s, ch, src, len);
++		else
++			dev_info_ratelimited(s->dev, "rx %s ch %u len %u (no device): %*ph\n",
++					     c->name, c->ch, len,
++					     (int)min_t(u32, len, n), src);
++		rp = (rp + 1) % rlen;
++		s->rx_frames++;
++		moved = true;
++	}
++	if (moved) {
++		dma_mb();
++		ipc_wr16(s, rp, sbd_rp(s, SBD_DL, i));
++	}
++}
++
++static void s5000ap_rx_work(struct work_struct *w)
++{
++	struct s5000ap *s = container_of(w, struct s5000ap, rx_work);
++	int i;
++
++	if (!s->link_up)
++		return;
++	for (i = 0; i < SBD_NCH; i++)
++		s5000ap_rx_ring(s, i);
++	s5000ap_zc_rx(s);
++	s5000ap_pktproc_rx(s);
++}
++
++static void s5000ap_link_down(struct s5000ap *s, const char *why)
++{
++	int i;
++
++	if (s->link_up)
++		dev_info(s->dev, "link down (%s)\n", why);
++	s->link_up = false;
++	if (s->ndev)
++		netif_carrier_off(s->ndev);
++	if (s->ndev_ims)
++		netif_carrier_off(s->ndev_ims);
++	for (i = 0; i < NCHDEV; i++)
++		wake_up_interruptible(&s->chdev[i].wq);
++}
++
++/*
++ * Downstream cmd_init_start_handler() and cmd_phone_start_handler(), done by
++ * the module.  Runs with s->lock, so it waits for a
++ * step (e.g. the boot handshake) that is still in progress.
++ */
++static void s5000ap_link_work(struct work_struct *w)
++{
++	struct s5000ap *s = container_of(w, struct s5000ap, link_work);
++	bool crash;
++	int ret;
++
++	mutex_lock(&s->lock);
++	crash = test_and_clear_bit(0x7, &s->link_events);
++	crash |= test_and_clear_bit(0x9, &s->link_events);	/* clear both */
++	if (crash) {
++		s5000ap_link_down(s, "CP crash");
++		goto out;
++	}
++	if (!s->secured || !s->mbox_up)
++		goto out;
++
++	if (test_and_clear_bit(0x1, &s->link_events) && !s->link_up) {
++		ret = 0;
++		if (!s->sbd_ready) {
++			ret = s5000ap_step_pktproc(s);
++			if (!ret)
++				ret = s5000ap_step_sbd_init(s);
++		}
++		if (!ret)
++			ret = s5000ap_step_pif_done(s);
++		if (ret)
++			dev_err(s->dev, "auto link: INIT_START answer failed: %d\n",
++				ret);
++	}
++
++	if (test_bit(0x8, &s->link_events) && s->sbd_ready && !s->link_up) {
++		ret = s5000ap_step_link_reset(s);
++		if (!ret)
++			ret = s5000ap_step_init_end(s);
++		if (ret)
++			dev_err(s->dev, "auto link: PHONE_START answer failed: %d\n",
++				ret);
++		clear_bit(0x8, &s->link_events);
++	} else if (test_and_clear_bit(0x8, &s->link_events) && s->link_up &&
++		   !s->cp_spoke) {
++		/*
++		 * The CP repeats PHONE_START until it has seen INIT_END; a
++		 * doorbell for uplink data can overwrite ISSR0 before it does
++		 * (downstream resends the start commands the same way).
++		 */
++		if (s->init_end_resends < 20) {
++			s->init_end_resends++;
++			s5000ap_send_cmd(s, CMD_INIT_END);
++			dev_info(s->dev, "PHONE_START again: INIT_END resent (%u)\n",
++				 s->init_end_resends);
++		}
++	}
++out:
++	mutex_unlock(&s->lock);
++	if (s->link_up)
++		schedule_work(&s->rx_work);
++}
++
++static int s5000ap_chan_open(struct inode *inode, struct file *file)
++{
++	struct s5000ap_chan *ch = container_of(file->private_data,
++					       struct s5000ap_chan, misc);
++
++	file->private_data = ch;
++	atomic_inc(&ch->users);
++	return nonseekable_open(inode, file);
++}
++
++static int s5000ap_chan_release(struct inode *inode, struct file *file)
++{
++	struct s5000ap_chan *ch = file->private_data;
++	struct s5000ap *s = ch->s;
++
++	/*
++	 * The FMT client (shannon-modemd) is gone, maybe killed: it lowers
++	 * PDA_ACTIVE with the screen off, and nothing else would raise it.
++	 */
++	if (atomic_dec_and_test(&ch->users) && ch == &s->chdev[0]) {
++		mutex_lock(&s->lock);
++		s5000ap_pda_set(s, true, "umts_ipc0 closed");
++		/* the daemon is gone: it can no longer clear call_active */
++		WRITE_ONCE(s->call_busy, false);
++		mutex_unlock(&s->lock);
++	}
++	return 0;
++}
++
++static ssize_t s5000ap_chan_read(struct file *file, char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	struct s5000ap_chan *ch = file->private_data;
++	struct sk_buff *skb;
++	size_t n;
++	int ret;
++
++	for (;;) {
++		skb = skb_dequeue(&ch->rxq);
++		if (skb)
++			break;
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		ret = wait_event_interruptible(ch->wq,
++					       !skb_queue_empty(&ch->rxq));
++		if (ret)
++			return ret;
++	}
++
++	n = min_t(size_t, count, skb->len);
++	if (copy_to_user(ubuf, skb->data, n)) {
++		skb_queue_head(&ch->rxq, skb);
++		return -EFAULT;
++	}
++	if (n < skb->len) {
++		/* As downstream misc_read(): the rest comes with the next read. */
++		skb_pull(skb, n);
++		skb_queue_head(&ch->rxq, skb);
++	} else {
++		consume_skb(skb);
++	}
++	return n;
++}
++
++/* Put one link frame into the uplink ring and ring the CP (sbd_pio_tx()). */
++static int s5000ap_tx_ring(struct s5000ap *s, int idx, const u8 *frame,
++			   u32 flen, u32 sizev)
++{
++	const struct sbd_chan *c = &sbd_chans[idx];
++	u16 rlen = c->len[SBD_UL], size = c->size[SBD_UL];
++	unsigned long flags;
++	int ret = 0;
++	u16 rp, wp;
++	u8 *dst;
++
++	spin_lock_irqsave(&s->tx_lock, flags);
++	if (!s->link_up) {
++		ret = -ENOLINK;
++		goto out;
++	}
++	if (s->tx_gate) {
++		if (time_before(jiffies, s->tx_gate_until)) {
++			ret = -EAGAIN;	/* retried by the callers */
++			goto out;
++		}
++		s->tx_gate = false;
++		dev_info(s->dev, "uplink gate opened by timeout\n");
++	}
++	rp = ipc_rd16(s, sbd_rp(s, SBD_UL, idx));
++	wp = ipc_rd16(s, sbd_wp(s, SBD_UL, idx));
++	if (rp >= rlen || wp >= rlen || flen > size) {
++		ret = -EIO;
++		goto out;
++	}
++	if ((wp + 1) % rlen == rp) {
++		ret = -EAGAIN;		/* ring full, the CP has not caught up */
++		goto out;
++	}
++
++	dst = (u8 *)s->mem + s->ipc_off + s->sbd_buff[idx][SBD_UL] +
++	      wp * size;
++	memcpy(dst, frame, flen);
++	ipc_wr(s, sizev, s->sbd_sizev[idx][SBD_UL] + 4 * wp);
++	dma_wmb();
++	ipc_wr16(s, (wp + 1) % rlen, sbd_wp(s, SBD_UL, idx));
++	dma_mb();
++
++	mbox_wr(s, MASK_INT_VALID | MASK_SEND_DATA, MBOX_ISSR(MBX_AP2CP_MSG));
++	mbox_wr(s, BIT(0), MBOX_INTGR1);
++	s->tx_frames++;
++out:
++	spin_unlock_irqrestore(&s->tx_lock, flags);
++	return ret;
++}
++
++static int s5000ap_tx_frame(struct s5000ap *s, struct s5000ap_chan *ch,
++			    const u8 *frame, u32 flen)
++{
++	return s5000ap_tx_ring(s, ch->idx, frame, flen, flen);
++}
++
++/*
++ * One write() is one IPC message, as downstream misc_write().  A message
++ * that does not fit one uplink buffer goes out as a multi-frame (config
++ * 0xfb, control byte = MORE | 7-bit id) split at the buffer size, like
++ * downstream with iod->max_tx_size = ul_buffer_size.  A full ring is waited
++ * out (downstream retries from its TX timer); the CP drains it on its own.
++ */
++static ssize_t s5000ap_chan_write(struct file *file, const char __user *ubuf,
++				  size_t count, loff_t *ppos)
++{
++	struct s5000ap_chan *ch = file->private_data;
++	struct s5000ap *s = ch->s;
++	u16 size = sbd_chans[ch->idx].size[SBD_UL];
++	bool mf = count + SIPC5_HDR_LEN > size;
++	u32 hdr = mf ? SIPC5_HDR_MF_LEN : SIPC5_HDR_LEN;
++	size_t copied = 0;
++	unsigned long deadline;
++	int ret = 0;
++	u8 *buf;
++
++	if (!count)
++		return 0;
++	if (count > CHAN_MSG_MAX || size <= hdr)
++		return -EMSGSIZE;
++	if (!s->link_up)
++		return -ENOLINK;
++
++	buf = kmalloc(size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	if (mutex_lock_interruptible(&ch->tx_mutex)) {
++		kfree(buf);
++		return -ERESTARTSYS;
++	}
++	if (mf)
++		ch->tx_id = (ch->tx_id + 1) & SIPC5_MF_ID;
++
++	while (copied < count) {
++		u32 n = min_t(size_t, count - copied, size - hdr);
++
++		buf[0] = SIPC5_START | (mf ? SIPC5_MULTI_FRAME : 0);
++		buf[1] = sbd_chans[ch->idx].ch;
++		put_unaligned_le16(hdr + n, buf + 2);
++		if (mf)
++			buf[4] = (copied + n < count ? SIPC5_MF_MORE : 0) |
++				 ch->tx_id;
++		if (copy_from_user(buf + hdr, ubuf + copied, n)) {
++			ret = -EFAULT;
++			break;
++		}
++
++		deadline = jiffies + msecs_to_jiffies(CHAN_TX_TIMEOUT_MS);
++		for (;;) {
++			ret = s5000ap_tx_frame(s, ch, buf, hdr + n);
++			if (ret != -EAGAIN)
++				break;
++			if (time_after(jiffies, deadline)) {
++				s->tx_full++;
++				ret = -ETIMEDOUT;
++				break;
++			}
++			if (fatal_signal_pending(current)) {
++				ret = -EINTR;
++				break;
++			}
++			usleep_range(200, 500);
++		}
++		if (ret)
++			break;
++		copied += n;
++	}
++
++	mutex_unlock(&ch->tx_mutex);
++	kfree(buf);
++	if (ret && copied)
++		dev_warn_ratelimited(s->dev, "%s: message cut after %zu of %zu bytes: %d\n",
++				     ch->misc.name, copied, count, ret);
++	return ret ? ret : count;
++}
++
++static __poll_t s5000ap_chan_poll(struct file *file, poll_table *wait)
++{
++	struct s5000ap_chan *ch = file->private_data;
++	__poll_t mask = 0;
++
++	poll_wait(file, &ch->wq, wait);
++	if (!skb_queue_empty(&ch->rxq))
++		mask |= EPOLLIN | EPOLLRDNORM;
++	if (ch->s->link_up)
++		mask |= EPOLLOUT | EPOLLWRNORM;
++	return mask;
++}
++
++static const struct file_operations s5000ap_chan_fops = {
++	.owner = THIS_MODULE,
++	.open = s5000ap_chan_open,
++	.release = s5000ap_chan_release,
++	.read = s5000ap_chan_read,
++	.write = s5000ap_chan_write,
++	.poll = s5000ap_chan_poll,
++	.llseek = noop_llseek,
++};
++
++/*
++ * rmnet0: raw IP, no link header (downstream ATTR_NO_LINK_HDR).  UL
++ * goes into the multipdp ring with the SIPC channel in the size word
++ * (downstream sbd_pio_tx() for PS: size_v = len | ch << 16); DL comes from
++ * pktproc or the pdp_hi ring.  The daemon brings the data call up over IPC
++ * and configures the addresses.
++ */
++struct s5000ap_net {
++	struct s5000ap *s;
++	u8 ch;				/* SIPC channel of this link */
++};
++
++static void s5000ap_tx_wake(struct work_struct *w)
++{
++	struct s5000ap *s = container_of(to_delayed_work(w), struct s5000ap,
++					 tx_wake);
++	const struct sbd_chan *c = &sbd_chans[SBD_PDP];
++	u16 rp, wp;
++
++	if (!(s->ndev && netif_queue_stopped(s->ndev)) &&
++	    !(s->ndev_ims && netif_queue_stopped(s->ndev_ims)))
++		return;
++	if (s->link_up) {
++		rp = ipc_rd16(s, sbd_rp(s, SBD_UL, SBD_PDP));
++		wp = ipc_rd16(s, sbd_wp(s, SBD_UL, SBD_PDP));
++		if ((wp + 1) % c->len[SBD_UL] == rp) {
++			schedule_delayed_work(&s->tx_wake, 1);
++			return;
++		}
++	}
++	/* both links share the multipdp UL ring */
++	if (s->ndev)
++		netif_wake_queue(s->ndev);
++	if (s->ndev_ims)
++		netif_wake_queue(s->ndev_ims);
++}
++
++static netdev_tx_t s5000ap_net_xmit(struct sk_buff *skb, struct net_device *ndev)
++{
++	struct s5000ap_net *priv = wwan_netdev_drvpriv(ndev);
++	struct s5000ap *s = priv->s;
++	unsigned int len = skb->len;
++	int ret;
++
++	if (!s->link_up || len > sbd_chans[SBD_PDP].size[SBD_UL] ||
++	    skb_linearize(skb)) {
++		ndev->stats.tx_dropped++;
++		dev_kfree_skb_any(skb);
++		return NETDEV_TX_OK;
++	}
++	ret = s5000ap_tx_ring(s, SBD_PDP, skb->data, len,
++			      len | priv->ch << 16);
++	if (ret == -EAGAIN) {
++		netif_stop_queue(ndev);
++		schedule_delayed_work(&s->tx_wake, 1);
++		return NETDEV_TX_BUSY;
++	}
++	if (ret) {
++		ndev->stats.tx_errors++;
++	} else {
++		ndev->stats.tx_packets++;
++		ndev->stats.tx_bytes += len;
++	}
++	dev_consume_skb_any(skb);
++	return NETDEV_TX_OK;
++}
++
++static int s5000ap_net_open(struct net_device *ndev)
++{
++	netif_start_queue(ndev);
++	return 0;
++}
++
++static int s5000ap_net_stop(struct net_device *ndev)
++{
++	netif_stop_queue(ndev);
++	return 0;
++}
++
++static const struct net_device_ops s5000ap_net_ops = {
++	.ndo_open = s5000ap_net_open,
++	.ndo_stop = s5000ap_net_stop,
++	.ndo_start_xmit = s5000ap_net_xmit,
++};
++
++static void s5000ap_net_setup(struct net_device *ndev)
++{
++	ndev->netdev_ops = &s5000ap_net_ops;
++	ndev->type = ARPHRD_RAWIP;
++	ndev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
++	ndev->hard_header_len = 0;
++	ndev->addr_len = 0;
++	ndev->mtu = 1500;
++	ndev->min_mtu = 68;
++	ndev->max_mtu = PKTPROC_MAX_PKT;
++	ndev->tx_queue_len = 1000;
++	ndev->needs_free_netdev = true;		/* WWAN core frees it */
++}
++
++/*
++ * WWAN links: the default link 0 is the netdev ModemManager pairs with
++ * MBIM session 0 (cid 1, SIPC ch 10).  Link 1 (`ip link add dev wwan1 parentdev
++ * wwan0 type wwan linkid 1`) is the IMS PDN (cid 2, SIPC ch 11, stock rmnet1),
++ * created and configured by shannon-modemd for VoLTE.
++ */
++static int s5000ap_wwan_newlink(void *ctxt, struct net_device *ndev, u32 if_id,
++				struct netlink_ext_ack *extack)
++{
++	struct s5000ap *s = ctxt;
++	struct s5000ap_net *priv = wwan_netdev_drvpriv(ndev);
++	struct net_device **slot;
++	int ret;
++
++	if (if_id == 0)
++		slot = &s->ndev;
++	else if (if_id == 1)
++		slot = &s->ndev_ims;
++	else
++		return -EOPNOTSUPP;
++	if (*slot)
++		return -EBUSY;
++	priv->s = s;
++	priv->ch = if_id ? SIPC_CH_RMNET1 : SIPC_CH_RMNET0;
++	ret = register_netdevice(ndev);
++	if (ret)
++		return ret;
++	*slot = ndev;
++	if (s->link_up)
++		netif_carrier_on(ndev);
++	else
++		netif_carrier_off(ndev);
++	return 0;
++}
++
++static void s5000ap_wwan_dellink(void *ctxt, struct net_device *ndev,
++				 struct list_head *head)
++{
++	struct s5000ap *s = ctxt;
++
++	if (s->ndev == ndev)
++		s->ndev = NULL;
++	if (s->ndev_ims == ndev)
++		s->ndev_ims = NULL;
++	unregister_netdevice_queue(ndev, head);
++}
++
++static const struct wwan_ops s5000ap_wwan_ops = {
++	.priv_size = sizeof(struct s5000ap_net),
++	.setup = s5000ap_net_setup,
++	.newlink = s5000ap_wwan_newlink,
++	.dellink = s5000ap_wwan_dellink,
++};
++
++/*
++ * MBIM control port.  The modem speaks Samsung IPC, so the MBIM function is
++ * emulated in userspace (shannon-modemd): messages the host writes to
++ * /dev/wwan0mbim0 are queued for /dev/umts_mbim, and each write() to
++ * /dev/umts_mbim is one message to the host.  Port open/close reach the
++ * daemon as 4-byte markers (ff ff ff ff = host opened, fe ff ff ff = closed,
++ * fd ff ff ff = the host already had the port open when the daemon came; no
++ * MBIM message is that short).  While no daemon is attached, host messages
++ * are kept, so a daemon restart does not end the host's MBIM session.
++ */
++static void s5000ap_mbim_mark(struct s5000ap *s, u8 m, bool head)
++{
++	struct sk_buff *skb = alloc_skb(4, GFP_KERNEL);
++
++	if (!skb)
++		return;
++	memset(skb_put(skb, 4), 0xff, 4);
++	skb->data[0] = m;
++	if (head)
++		skb_queue_head(&s->mbim_q, skb);
++	else
++		skb_queue_tail(&s->mbim_q, skb);
++	wake_up_interruptible(&s->mbim_wq);
++}
++
++static int s5000ap_mbim_start(struct wwan_port *port)
++{
++	struct s5000ap *s = wwan_port_get_drvdata(port);
++
++	s->mbim_host_open = true;
++	s5000ap_mbim_mark(s, 0xff, false);
++	return 0;
++}
++
++static void s5000ap_mbim_stop(struct wwan_port *port)
++{
++	struct s5000ap *s = wwan_port_get_drvdata(port);
++
++	s->mbim_host_open = false;
++	s5000ap_mbim_mark(s, 0xfe, false);
++}
++
++static int s5000ap_mbim_tx(struct wwan_port *port, struct sk_buff *skb)
++{
++	struct s5000ap *s = wwan_port_get_drvdata(port);
++
++	if (skb_queue_len(&s->mbim_q) >= CHAN_RXQ_MAX)
++		return -EBUSY;
++	skb_queue_tail(&s->mbim_q, skb);
++	wake_up_interruptible(&s->mbim_wq);
++	return 0;
++}
++
++static const struct wwan_port_ops s5000ap_mbim_ops = {
++	.start = s5000ap_mbim_start,
++	.stop = s5000ap_mbim_stop,
++	.tx = s5000ap_mbim_tx,
++};
++
++static int s5000ap_mbim_open(struct inode *inode, struct file *file)
++{
++	struct s5000ap *s = container_of(file->private_data, struct s5000ap,
++					 mbim_misc);
++
++	if (s->mbim_bridge_open)
++		return -EBUSY;
++	s->mbim_bridge_open = true;
++	file->private_data = s;
++	/* Drop stale open/close markers; keep host messages that waited for us. */
++	if (s->mbim_host_open)
++		s5000ap_mbim_mark(s, 0xfd, true);
++	return nonseekable_open(inode, file);
++}
++
++static int s5000ap_mbim_release(struct inode *inode, struct file *file)
++{
++	struct s5000ap *s = file->private_data;
++
++	s->mbim_bridge_open = false;
++	if (!s->mbim_host_open)
++		skb_queue_purge(&s->mbim_q);
++	return 0;
++}
++
++static ssize_t s5000ap_mbim_read(struct file *file, char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	struct s5000ap *s = file->private_data;
++	struct sk_buff *skb;
++	size_t n;
++	int ret;
++
++	for (;;) {
++		skb = skb_dequeue(&s->mbim_q);
++		if (skb)
++			break;
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		ret = wait_event_interruptible(s->mbim_wq,
++					       !skb_queue_empty(&s->mbim_q));
++		if (ret)
++			return ret;
++	}
++	n = min_t(size_t, count, skb->len);
++	if (copy_to_user(ubuf, skb->data, n)) {
++		skb_queue_head(&s->mbim_q, skb);
++		return -EFAULT;
++	}
++	consume_skb(skb);
++	return n;
++}
++
++static ssize_t s5000ap_mbim_write(struct file *file, const char __user *ubuf,
++				  size_t count, loff_t *ppos)
++{
++	struct s5000ap *s = file->private_data;
++	struct sk_buff *skb;
++
++	if (!count || count > SZ_64K)
++		return -EINVAL;
++	if (!s->mbim_port)
++		return -ENODEV;
++	skb = alloc_skb(count, GFP_KERNEL);
++	if (!skb)
++		return -ENOMEM;
++	if (copy_from_user(skb_put(skb, count), ubuf, count)) {
++		kfree_skb(skb);
++		return -EFAULT;
++	}
++	wwan_port_rx(s->mbim_port, skb);
++	return count;
++}
++
++static __poll_t s5000ap_mbim_poll(struct file *file, poll_table *wait)
++{
++	struct s5000ap *s = file->private_data;
++
++	poll_wait(file, &s->mbim_wq, wait);
++	return (skb_queue_empty(&s->mbim_q) ? 0 : EPOLLIN | EPOLLRDNORM) |
++	       EPOLLOUT | EPOLLWRNORM;
++}
++
++static const struct file_operations s5000ap_mbim_fops = {
++	.owner = THIS_MODULE,
++	.open = s5000ap_mbim_open,
++	.release = s5000ap_mbim_release,
++	.read = s5000ap_mbim_read,
++	.write = s5000ap_mbim_write,
++	.poll = s5000ap_mbim_poll,
++	.llseek = noop_llseek,
++};
++
++/*
++ * AT control port: ModemManager drives voice calls over AT on an MBIM modem
++ * that also has an AT port.  shannon-modemd emulates the AT command set on
++ * top of Samsung IPC through /dev/umts_at.  Without a daemon every command is
++ * answered with ERROR so the host never times out on this port.
++ */
++static void s5000ap_at_reply(struct s5000ap *s, const char *str)
++{
++	size_t n = strlen(str);
++	struct sk_buff *skb = alloc_skb(n, GFP_KERNEL);
++
++	if (!skb || !s->at_port) {
++		kfree_skb(skb);
++		return;
++	}
++	skb_put_data(skb, str, n);
++	wwan_port_rx(s->at_port, skb);
++}
++
++static int s5000ap_at_start(struct wwan_port *port)
++{
++	return 0;
++}
++
++static void s5000ap_at_stop(struct wwan_port *port)
++{
++}
++
++static int s5000ap_at_tx(struct wwan_port *port, struct sk_buff *skb)
++{
++	struct s5000ap *s = wwan_port_get_drvdata(port);
++
++	if (!s->at_bridge_open) {
++		if (memchr(skb->data, '\r', skb->len))
++			s5000ap_at_reply(s, "\r\nERROR\r\n");
++		consume_skb(skb);
++		return 0;
++	}
++	if (skb_queue_len(&s->at_q) >= CHAN_RXQ_MAX)
++		return -EBUSY;
++	skb_queue_tail(&s->at_q, skb);
++	wake_up_interruptible(&s->at_wq);
++	return 0;
++}
++
++static const struct wwan_port_ops s5000ap_at_ops = {
++	.start = s5000ap_at_start,
++	.stop = s5000ap_at_stop,
++	.tx = s5000ap_at_tx,
++};
++
++static int s5000ap_atb_open(struct inode *inode, struct file *file)
++{
++	struct s5000ap *s = container_of(file->private_data, struct s5000ap,
++					 at_misc);
++
++	if (s->at_bridge_open)
++		return -EBUSY;
++	s->at_bridge_open = true;
++	file->private_data = s;
++	return nonseekable_open(inode, file);
++}
++
++static int s5000ap_atb_release(struct inode *inode, struct file *file)
++{
++	struct s5000ap *s = file->private_data;
++
++	s->at_bridge_open = false;
++	skb_queue_purge(&s->at_q);
++	return 0;
++}
++
++static ssize_t s5000ap_atb_read(struct file *file, char __user *ubuf,
++				size_t count, loff_t *ppos)
++{
++	struct s5000ap *s = file->private_data;
++	struct sk_buff *skb;
++	size_t n;
++	int ret;
++
++	for (;;) {
++		skb = skb_dequeue(&s->at_q);
++		if (skb)
++			break;
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		ret = wait_event_interruptible(s->at_wq, !skb_queue_empty(&s->at_q));
++		if (ret)
++			return ret;
++	}
++	n = min_t(size_t, count, skb->len);
++	if (copy_to_user(ubuf, skb->data, n)) {
++		skb_queue_head(&s->at_q, skb);
++		return -EFAULT;
++	}
++	if (n < skb->len) {
++		skb_pull(skb, n);
++		skb_queue_head(&s->at_q, skb);
++	} else {
++		consume_skb(skb);
++	}
++	return n;
++}
++
++static ssize_t s5000ap_atb_write(struct file *file, const char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	struct s5000ap *s = file->private_data;
++	struct sk_buff *skb;
++
++	if (!count || count > SZ_4K)
++		return -EINVAL;
++	if (!s->at_port)
++		return -ENODEV;
++	skb = alloc_skb(count, GFP_KERNEL);
++	if (!skb)
++		return -ENOMEM;
++	if (copy_from_user(skb_put(skb, count), ubuf, count)) {
++		kfree_skb(skb);
++		return -EFAULT;
++	}
++	wwan_port_rx(s->at_port, skb);
++	return count;
++}
++
++static __poll_t s5000ap_atb_poll(struct file *file, poll_table *wait)
++{
++	struct s5000ap *s = file->private_data;
++
++	poll_wait(file, &s->at_wq, wait);
++	return (skb_queue_empty(&s->at_q) ? 0 : EPOLLIN | EPOLLRDNORM) |
++	       EPOLLOUT | EPOLLWRNORM;
++}
++
++static const struct file_operations s5000ap_atb_fops = {
++	.owner = THIS_MODULE,
++	.open = s5000ap_atb_open,
++	.release = s5000ap_atb_release,
++	.read = s5000ap_atb_read,
++	.write = s5000ap_atb_write,
++	.poll = s5000ap_atb_poll,
++	.llseek = noop_llseek,
++};
++
++static int s5000ap_net_register(struct s5000ap *s)
++{
++	struct wwan_port_caps caps = { .frag_len = SZ_4K };
++	int ret;
++
++	skb_queue_head_init(&s->mbim_q);
++	init_waitqueue_head(&s->mbim_wq);
++	s->mbim_misc.minor = MISC_DYNAMIC_MINOR;
++	s->mbim_misc.name = "umts_mbim";
++	s->mbim_misc.fops = &s5000ap_mbim_fops;
++	s->mbim_misc.mode = 0600;
++	ret = misc_register(&s->mbim_misc);
++	if (ret)
++		return ret;
++
++	ret = wwan_register_ops(s->dev, &s5000ap_wwan_ops, s, 0);
++	if (ret)
++		goto err_misc;
++	s->mbim_port = wwan_create_port(s->dev, WWAN_PORT_MBIM,
++					&s5000ap_mbim_ops, &caps, s);
++	if (IS_ERR(s->mbim_port)) {
++		ret = PTR_ERR(s->mbim_port);
++		s->mbim_port = NULL;
++		goto err_ops;
++	}
++
++	/* AT port for voice: optional, the modem works without it */
++	skb_queue_head_init(&s->at_q);
++	init_waitqueue_head(&s->at_wq);
++	s->at_misc.minor = MISC_DYNAMIC_MINOR;
++	s->at_misc.name = "umts_at";
++	s->at_misc.fops = &s5000ap_atb_fops;
++	s->at_misc.mode = 0600;
++	if (!misc_register(&s->at_misc)) {
++		struct wwan_port_caps atcaps = { .frag_len = SZ_4K };
++
++		s->at_port = wwan_create_port(s->dev, WWAN_PORT_AT,
++					      &s5000ap_at_ops, &atcaps, s);
++		if (IS_ERR(s->at_port)) {
++			dev_warn(s->dev, "no AT port: %ld\n", PTR_ERR(s->at_port));
++			s->at_port = NULL;
++			misc_deregister(&s->at_misc);
++			s->at_misc.minor = MISC_DYNAMIC_MINOR;
++			s->at_misc.this_device = NULL;
++		}
++	}
++	return 0;
++
++err_ops:
++	wwan_unregister_ops(s->dev);
++err_misc:
++	misc_deregister(&s->mbim_misc);
++	return ret;
++}
++
++static void s5000ap_net_unregister(struct s5000ap *s)
++{
++	if (s->at_port) {
++		wwan_remove_port(s->at_port);
++		s->at_port = NULL;
++		misc_deregister(&s->at_misc);
++		skb_queue_purge(&s->at_q);
++	}
++	if (s->mbim_port)
++		wwan_remove_port(s->mbim_port);
++	s->mbim_port = NULL;
++	wwan_unregister_ops(s->dev);	/* removes the links */
++	cancel_delayed_work_sync(&s->tx_wake);
++	misc_deregister(&s->mbim_misc);
++	skb_queue_purge(&s->mbim_q);
++}
++
++static int s5000ap_chan_register(struct s5000ap *s)
++{
++	int i, ret;
++
++	for (i = 0; i < NCHDEV; i++) {
++		struct s5000ap_chan *ch = &s->chdev[i];
++
++		ch->s = s;
++		ch->idx = chan_devs[i].idx;
++		skb_queue_head_init(&ch->rxq);
++		skb_queue_head_init(&ch->mfq);
++		mutex_init(&ch->tx_mutex);
++		init_waitqueue_head(&ch->wq);
++		ch->misc.minor = MISC_DYNAMIC_MINOR;
++		ch->misc.name = chan_devs[i].name;
++		ch->misc.fops = &s5000ap_chan_fops;
++		ch->misc.mode = 0600;
++		ret = misc_register(&ch->misc);
++		if (ret) {
++			while (--i >= 0)
++				misc_deregister(&s->chdev[i].misc);
++			return ret;
++		}
++		s->chans[ch->idx] = ch;
++	}
++	return 0;
++}
++
++static void s5000ap_chan_unregister(struct s5000ap *s)
++{
++	int i;
++
++	for (i = 0; i < NCHDEV; i++) {
++		misc_deregister(&s->chdev[i].misc);
++		skb_queue_purge(&s->chdev[i].rxq);
++		skb_queue_purge(&s->chdev[i].mfq);
++		kfree_skb(s->chdev[i].part);
++	}
++}
++
++/* s5000ap_off(): wake the CP, then assert its reset through the PMU. */
++static int s5000ap_step_off(struct s5000ap *s)
++{
++	int ret;
++
++	s5000ap_link_down(s, "CP off");
++	s->link_events = 0;
++	s->sbd_ready = false;
++	s->link_reset = false;
++	s->reinit = false;	/* no CP memory writes until the next re-init */
++
++	if (s->mbox_up) {
++		mbox_wr(s, BIT(INT_AP2CP_WAKEUP), MBOX_INTGR1);
++		usleep_range(5000, 10000);
++	}
++
++	regmap_update_bits(s->pmu, PMU_CP_OUT, BIT(16), BIT(16));
++	regmap_update_bits(s->pmu, PMU_CP_CONFIGURATION, BIT(0), 0);
++	ret = s5000ap_pmu_wait(s, PMU_CP_STATUS, BIT(0), 0);
++	s5000ap_pmu_show(s, "after off");
++	if (!ret)
++		s->cp_on = false;
++	return ret;
++}
++
++/* mcu_ipc software reset (downstream s5000ap_reset), keeping the irq mask. */
++static int s5000ap_step_mbox_reset(struct s5000ap *s)
++{
++	u32 mask;
++
++	if (!s->mbox_up)
++		return -ENXIO;
++	if (s->link_up)
++		return -EBUSY;
++	mask = mbox_rd(s, MBOX_INTMR0);
++	mbox_wr(s, mbox_rd(s, MBOX_MCUCTLR) | BIT(0), MBOX_MCUCTLR);
++	udelay(5);
++	mbox_wr(s, mask, MBOX_INTMR0);
++	mbox_wr(s, 0xffff0000, MBOX_INTCR0);
++	mbox_wr(s, 0xffff, MBOX_INTCR1);
++	s->link_events = 0;
++	dev_info(s->dev, "mbox_reset: INTMR0 %#x -> %#x\n", mask,
++		 mbox_rd(s, MBOX_INTMR0));
++	return 0;
++}
++
++/* IOCTL_MODEM_BOOT_OFF: CP_OUT bit 16 ("dump PC, no power gating") off again. */
++static int s5000ap_step_boot_off(struct s5000ap *s)
++{
++	if (!s->cp_on)
++		return -ENXIO;
++	regmap_update_bits(s->pmu, PMU_CP_OUT, BIT(16), 0);
++	s5000ap_pmu_show(s, "boot_off");
++	return 0;
++}
++
++static int s5000ap_step_status(struct s5000ap *s)
++{
++	s5000ap_pmu_show(s, "status");
++	if (s->mbox_up)
++		s5000ap_mbox_show(s, "status");
++	dev_info(s->dev, "status: mbox_up %d cp_on %d secured %d ran_once %d irqs %d\n",
++		 s->mbox_up, s->cp_on, s->secured, s->ran_once,
++		 atomic_read(&s->irqs));
++	return 0;
++}
++
++static ssize_t s5000ap_ctl_write(struct file *file, const char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	struct s5000ap *s = file->private_data;
++	long a = 0, b = 0, c = 0;
++	char buf[64], cmd[16] = "";
++	bool writes;
++	int n, ret;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++
++	n = sscanf(buf, "%15s %li %li %li", cmd, &a, &b, &c);
++	if (n < 1)
++		return -EINVAL;
++
++	writes = strcmp(cmd, "status") && strcmp(cmd, "mbox") &&
++		 strcmp(cmd, "cfg") && strcmp(cmd, "boot_on") &&
++		 strcmp(cmd, "ipc") && strcmp(cmd, "sbd");
++	if (writes && !allow_boot) {
++		dev_warn(s->dev, "'%s' needs allow_boot=1\n", cmd);
++		return -EPERM;
++	}
++
++	mutex_lock(&s->lock);
++	dev_info(s->dev, "step: %s", buf);
++	if (!strcmp(cmd, "status"))
++		ret = s5000ap_step_status(s);
++	else if (!strcmp(cmd, "mbox"))
++		ret = s5000ap_step_mbox(s);
++	else if (!strcmp(cmd, "cfg"))
++		ret = s5000ap_step_cfg(s);
++	else if (!strcmp(cmd, "on"))
++		ret = s5000ap_step_on(s);
++	else if (!strcmp(cmd, "secure") && n == 4)
++		ret = s5000ap_step_secure(s, a, b, c);
++	else if (!strcmp(cmd, "boot_on"))
++		ret = s5000ap_step_boot_on(s);
++	else if (!strcmp(cmd, "dl_start"))
++		ret = s5000ap_step_dl_start(s);
++	else if (!strcmp(cmd, "udl") && n >= 2)
++		ret = s5000ap_step_udl(s, a, n >= 3 ? b : SHM_UDL_WAIT_MS);
++	else if (!strcmp(cmd, "ipc"))
++		ret = s5000ap_step_ipc(s);
++	else if (!strcmp(cmd, "rx"))
++		ret = s5000ap_step_rx(s, n >= 2 ? a : 0);
++	else if (!strcmp(cmd, "pktproc"))
++		ret = s5000ap_step_pktproc(s);
++	else if (!strcmp(cmd, "sbd_init"))
++		ret = s5000ap_step_sbd_init(s);
++	else if (!strcmp(cmd, "pif_done"))
++		ret = s5000ap_step_pif_done(s);
++	else if (!strcmp(cmd, "link_reset"))
++		ret = s5000ap_step_link_reset(s);
++	else if (!strcmp(cmd, "init_end"))
++		ret = s5000ap_step_init_end(s);
++	else if (!strcmp(cmd, "sbd"))
++		ret = s5000ap_step_sbd(s);
++	else if (!strcmp(cmd, "sbd_rx"))
++		ret = s5000ap_step_sbd_rx(s, n >= 2 ? a : 0);
++	else if (!strcmp(cmd, "mbox_reset"))
++		ret = s5000ap_step_mbox_reset(s);
++	else if (!strcmp(cmd, "boot_off"))
++		ret = s5000ap_step_boot_off(s);
++	else if (!strcmp(cmd, "off"))
++		ret = s5000ap_step_off(s);
++	else
++		ret = -EINVAL;
++	dev_info(s->dev, "step %s: %d\n", cmd, ret);
++	mutex_unlock(&s->lock);
++
++	return ret ?: count;
++}
++
++static const struct file_operations s5000ap_ctl_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = s5000ap_ctl_write,
++	.llseek = noop_llseek,
++};
++
++/*
++ * Raw window on the CP memory, used by the user space loader to place the
++ * TOC sections (as IOCTL_MODEM_XMIT_BOOT does) and to look at the result.
++ * Once EL3 has taken the CP image area only the IPC region stays reachable.
++ */
++static int s5000ap_mem_check(struct s5000ap *s, loff_t pos, size_t *count)
++{
++	loff_t start = 0, end = s->mem_size;
++
++	if (s->secured) {
++		start = s->ipc_off;
++		end = s->ipc_off + s->ipc_size;
++	}
++	if (pos < start || pos >= end)
++		return -ENXIO;
++	*count = min_t(u64, *count, end - pos);
++	*count = min_t(size_t, *count, PAGE_SIZE);
++	return s5000ap_map(s);
++}
++
++static ssize_t s5000ap_mem_read(struct file *file, char __user *ubuf,
++				size_t count, loff_t *ppos)
++{
++	struct s5000ap *s = file->private_data;
++	void *tmp;
++	int ret;
++
++	mutex_lock(&s->lock);
++	ret = s5000ap_mem_check(s, *ppos, &count);
++	if (ret == -ENXIO && *ppos >= s->mem_size)
++		ret = count = 0;
++	if (ret || !count)
++		goto out;
++
++	tmp = (void *)__get_free_page(GFP_KERNEL);
++	if (!tmp) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	memcpy(tmp, s->mem + *ppos, count);
++	if (copy_to_user(ubuf, tmp, count))
++		ret = -EFAULT;
++	free_page((unsigned long)tmp);
++out:
++	mutex_unlock(&s->lock);
++	if (ret)
++		return ret;
++	*ppos += count;
++	return count;
++}
++
++static ssize_t s5000ap_mem_write(struct file *file, const char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	struct s5000ap *s = file->private_data;
++	void *tmp;
++	int ret;
++
++	if (!allow_boot)
++		return -EPERM;
++
++	mutex_lock(&s->lock);
++	ret = s5000ap_mem_check(s, *ppos, &count);
++	if (ret)
++		goto out;
++
++	tmp = (void *)__get_free_page(GFP_KERNEL);
++	if (!tmp) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	if (copy_from_user(tmp, ubuf, count))
++		ret = -EFAULT;
++	else
++		memcpy(s->mem + *ppos, tmp, count);
++	free_page((unsigned long)tmp);
++out:
++	mutex_unlock(&s->lock);
++	if (ret)
++		return ret;
++	*ppos += count;
++	return count;
++}
++
++static const struct file_operations s5000ap_mem_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = s5000ap_mem_read,
++	.write = s5000ap_mem_write,
++	.llseek = default_llseek,
++};
++
++/*
++ * CP DVFS requests (downstream link_device_shmem: mailbox int 6 = MIF, 7 = INT,
++ * ISSR6/7 & 0xff = index 1..count into the published table, else unlock).
++ * The AP side only keeps floors: userspace (beyond2lte-dvfs) owns ACPM and reads
++ * cp_mif_khz / cp_int_khz (sysfs, poll-able).
++ */
++static u32 cp_level(u32 v, const u32 *tab, unsigned int n)
++{
++	v &= 0xff;
++	return v >= 1 && v <= n ? tab[v - 1] : 0;
++}
++
++static void s5000ap_dvfs_work(struct work_struct *w)
++{
++	struct s5000ap *s = container_of(w, struct s5000ap, dvfs_work);
++	u32 m, i, rm, ri;
++
++	if (!s->mbox_up)
++		return;
++	rm = mbox_rd(s, MBOX_ISSR(6));
++	ri = mbox_rd(s, MBOX_ISSR(7));
++	m = cp_level(rm, cp_mif_khz, ARRAY_SIZE(cp_mif_khz));
++	i = cp_level(ri, cp_int_khz, ARRAY_SIZE(cp_int_khz));
++	if (m != s->cp_mif_req) {
++		s->cp_mif_req = m;
++		sysfs_notify(&s->dev->kobj, NULL, "cp_mif_khz");
++	}
++	if (i != s->cp_int_req) {
++		s->cp_int_req = i;
++		sysfs_notify(&s->dev->kobj, NULL, "cp_int_khz");
++	}
++	dev_dbg(s->dev, "CP DVFS: ISSR6 %#x ISSR7 %#x -> MIF %u INT %u kHz\n",
++		rm, ri, m, i);
++}
++
++static ssize_t cp_mif_khz_show(struct device *dev, struct device_attribute *attr,
++			       char *buf)
++{
++	struct s5000ap *s = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", s->link_up ? s->cp_mif_req : 0);
++}
++static DEVICE_ATTR_RO(cp_mif_khz);
++
++static ssize_t cp_int_khz_show(struct device *dev, struct device_attribute *attr,
++			       char *buf)
++{
++	struct s5000ap *s = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", s->link_up ? s->cp_int_req : 0);
++}
++static DEVICE_ATTR_RO(cp_int_khz);
++
++/*
++ * PDA_ACTIVE for the modem daemon's screen-off policy:
++ * "0" lowers it (link up only), "1" raises it.  Reads give what was last set;
++ * dmesg has the register.  It goes back to 1 at every CP start, when the last
++ * user of umts_ipc0 closes it and at module removal.
++ */
++static ssize_t pda_active_show(struct device *dev, struct device_attribute *attr,
++			       char *buf)
++{
++	struct s5000ap *s = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", !READ_ONCE(s->pda_low));
++}
++
++static ssize_t pda_active_store(struct device *dev, struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct s5000ap *s = dev_get_drvdata(dev);
++	bool on;
++	int ret;
++
++	ret = kstrtobool(buf, &on);
++	if (ret)
++		return ret;
++	mutex_lock(&s->lock);
++	ret = s5000ap_pda_set(s, on, "sysfs");
++	mutex_unlock(&s->lock);
++	return ret ?: count;
++}
++static DEVICE_ATTR_RW(pda_active);
++
++/*
++ * call_active: set by shannon-modemd while a call rings or is up.  A system
++ * suspend then fails with -EBUSY in this driver's suspend callback, so even a
++ * suspend that userspace started just before the call arrived (a block
++ * inhibitor taken after the request does not stop it) is aborted.  Sleeping
++ * during a voice call stops the call audio path and crashed the CP on resume
++ * (CRASH_EXIT).  Cleared when umts_ipc0 is closed.
++ */
++static ssize_t call_active_show(struct device *dev, struct device_attribute *attr,
++				char *buf)
++{
++	struct s5000ap *s = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(s->call_busy));
++}
++
++static ssize_t call_active_store(struct device *dev, struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct s5000ap *s = dev_get_drvdata(dev);
++	bool on;
++	int ret;
++
++	ret = kstrtobool(buf, &on);
++	if (ret)
++		return ret;
++	WRITE_ONCE(s->call_busy, on);
++	if (on)
++		/* a suspend already past this driver aborts on the wakeup event */
++		pm_wakeup_event(dev, 0);
++	return count;
++}
++static DEVICE_ATTR_RW(call_active);
++
++/* ModemManager names the modem from these attributes of the physical device. */
++static ssize_t manufacturer_show(struct device *dev, struct device_attribute *attr,
++				 char *buf)
++{
++	return sysfs_emit(buf, "Samsung\n");
++}
++static DEVICE_ATTR_RO(manufacturer);
++
++static ssize_t product_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	return sysfs_emit(buf, "Shannon S5000AP\n");
++}
++static DEVICE_ATTR_RO(product);
++
++static struct attribute *s5000ap_attrs[] = {
++	&dev_attr_manufacturer.attr,
++	&dev_attr_product.attr,
++	&dev_attr_cp_mif_khz.attr,
++	&dev_attr_cp_int_khz.attr,
++	&dev_attr_pda_active.attr,
++	&dev_attr_call_active.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(s5000ap);
++
++static int s5000ap_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np;
++	struct resource res;
++	struct s5000ap *s;
++	int ret;
++
++	s = devm_kzalloc(dev, sizeof(*s), GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++	s->dev = dev;
++	mutex_init(&s->lock);
++	platform_set_drvdata(pdev, s);
++
++	/* Mapping does not touch the blocks; nothing is read or written here. */
++	s->mbox = devm_platform_ioremap_resource_byname(pdev, "mailbox");
++	if (IS_ERR(s->mbox))
++		return PTR_ERR(s->mbox);
++	s->cfg = devm_platform_ioremap_resource_byname(pdev, "ap2cp-cfg");
++	if (IS_ERR(s->cfg))
++		return PTR_ERR(s->cfg);
++
++	s->irq = platform_get_irq(pdev, 0);
++	if (s->irq < 0)
++		return s->irq;
++
++	s->pclk = devm_clk_get(dev, "pclk");
++	if (IS_ERR(s->pclk))
++		return dev_err_probe(dev, PTR_ERR(s->pclk), "no mailbox clock\n");
++
++	s->pmu = syscon_regmap_lookup_by_phandle(dev->of_node,
++						 "samsung,syscon-phandle");
++	if (IS_ERR(s->pmu))
++		return dev_err_probe(dev, PTR_ERR(s->pmu), "no PMU regmap\n");
++
++	s->rev_gpios = devm_gpiod_get_array_optional(dev, "samsung,rev",
++						     GPIOD_ASIS);
++	if (IS_ERR(s->rev_gpios))
++		return dev_err_probe(dev, PTR_ERR(s->rev_gpios), "rev gpios\n");
++
++	np = of_parse_phandle(dev->of_node, "memory-region", 0);
++	if (!np)
++		return -ENODEV;
++	ret = of_address_to_resource(np, 0, &res);
++	of_node_put(np);
++	if (ret)
++		return ret;
++	s->mem_phys = res.start;
++	s->mem_size = resource_size(&res);
++
++	ret = of_property_read_u32(dev->of_node, "samsung,ipc-offset",
++				   &s->ipc_off);
++	if (!ret)
++		ret = of_property_read_u32(dev->of_node, "samsung,ipc-size",
++					   &s->ipc_size);
++	if (ret || s->ipc_off + s->ipc_size > s->mem_size ||
++	    s->ipc_size < SHM_RAW_RX_BUFF + SHM_RAW_RX_SIZE)
++		return -EINVAL;
++
++	device_init_wakeup(dev, true);
++	atomic_set(&s->dw_other, 0);
++	spin_lock_init(&s->tx_lock);
++	INIT_WORK(&s->rx_work, s5000ap_rx_work);
++	INIT_WORK(&s->link_work, s5000ap_link_work);
++	INIT_DELAYED_WORK(&s->tx_wake, s5000ap_tx_wake);
++	INIT_WORK(&s->dvfs_work, s5000ap_dvfs_work);
++	ret = s5000ap_chan_register(s);
++	if (ret)
++		return ret;
++	ret = s5000ap_net_register(s);
++	if (ret) {
++		s5000ap_chan_unregister(s);
++		return ret;
++	}
++
++	s->dbg = debugfs_create_dir("s5000ap", NULL);
++	debugfs_create_file("ctl", 0200, s->dbg, s, &s5000ap_ctl_fops);
++	debugfs_create_file_size("cpmem", 0600, s->dbg, s, &s5000ap_mem_fops,
++				 s->mem_size);
++	debugfs_create_bool("link_up", 0400, s->dbg, &s->link_up);
++
++	/* last: nothing below can fail, s5000ap_remove() unregisters it */
++	s->dw.again = s5000ap_dark_again;
++	s->dw.data = s;
++	s->dw.irq = s->irq;
++	s->dw.ws = dev->power.wakeup;
++	s->dw.enabled = &dark_wake;
++	if (exynos9820_dark_wake_register(&s->dw))
++		dev_info(dev, "dark wake not available\n");
++
++	dev_info(dev, "ready, nothing touched (allow_boot %d)\n", allow_boot);
++	return 0;
++}
++
++static void s5000ap_remove(struct platform_device *pdev)
++{
++	struct s5000ap *s = platform_get_drvdata(pdev);
++
++	exynos9820_dark_wake_unregister(&s->dw);
++	debugfs_remove_recursive(s->dbg);
++	s5000ap_net_unregister(s);
++	s5000ap_chan_unregister(s);
++	if (s->mbox_up)
++		disable_irq(s->irq);
++	cancel_work_sync(&s->link_work);
++	cancel_work_sync(&s->rx_work);
++	cancel_work_sync(&s->dvfs_work);
++	mutex_lock(&s->lock);
++	s5000ap_pda_set(s, true, "remove");
++	if (s->cp_on)
++		s5000ap_step_off(s);
++	if (s->mbox_up) {
++		enable_irq(s->irq);
++		disable_irq_wake(s->irq);
++		free_irq(s->irq, s);
++		clk_disable_unprepare(s->pclk);
++	}
++	if (s->mem)
++		memunmap(s->mem);
++	if (s->pkt)
++		memunmap(s->pkt);
++	mutex_unlock(&s->lock);
++}
++
++/*
++ * The mailbox keeps its registers through suspend (the CP runs on), so
++ * PDA_ACTIVE stays as userspace set it.  Repair a lost high bit.  trylock:
++ * a step may still hold the lock; the next resume looks again.
++ */
++static int s5000ap_resume(struct device *dev)
++{
++	struct s5000ap *s = dev_get_drvdata(dev);
++	u32 v;
++
++	if (!mutex_trylock(&s->lock))
++		return 0;
++	if (s->mbox_up && s->link_up) {
++		if (!s->pda_low) {
++			v = mbox_rd(s, MBOX_ISSR(MBX_AP2CP_STATUS));
++			if (!(v & AP_STATUS_PDA_ACTIVE)) {
++				dev_warn(dev, "resume: PDA_ACTIVE lost (ap_status 0x%08x), raising\n",
++					 v);
++				mbox_wr(s, v | AP_STATUS_PDA_ACTIVE,
++					MBOX_ISSR(MBX_AP2CP_STATUS));
++				mbox_wr(s, BIT(INT_AP2CP_ACTIVE), MBOX_INTGR1);
++			}
++		}
++	}
++	mutex_unlock(&s->lock);
++	return 0;
++}
++
++/* packet-data counters: any change means DL traffic (or a dropped frame) */
++static u32 s5000ap_dw_pkts(struct s5000ap *s)
++{
++	return s->pkt_rx + s->pkt_bad + s->pkt_other_ch + s->zc_rx +
++	       s->zc_bad + s->rx_dropped;
++}
++
++static void s5000ap_dw_snap(struct s5000ap *s)
++{
++	s->dw_snap_benign = s->dw_benign;
++	s->dw_snap_other = atomic_read(&s->dw_other);
++	s->dw_snap_frames = s->rx_frames;
++	s->dw_snap_pkts = s5000ap_dw_pkts(s);
++	s->dw_irq_bits = 0;
++}
++
++/*
++ * exynos9820-suspend ->suspend_again, after the early resume of a SLEEP the
++ * CP mailbox ended (and nothing else): true = SLEEP again.  Every ring
++ * buffer since the snapshot must be a signal report; anything else, or no
++ * link, or a CP wake lock, resumes the system.
++ */
++static bool s5000ap_dark_again(void *data)
++{
++	struct s5000ap *s = data;
++	u32 benign, frames, other, pkts;
++	const char *why = NULL;
++
++	if (!READ_ONCE(s->dw_armed))
++		return false;
++	flush_work(&s->rx_work);
++	msleep(S5000AP_DARK_SETTLE_MS);
++	flush_work(&s->rx_work);
++	benign = s->dw_benign - s->dw_snap_benign;
++	frames = s->rx_frames - s->dw_snap_frames;
++	other = atomic_read(&s->dw_other) - s->dw_snap_other;
++	pkts = s5000ap_dw_pkts(s) - s->dw_snap_pkts;
++
++	if (!s->link_up)
++		why = "link down";
++	else if (READ_ONCE(s->cp_wakelock))
++		why = "CP wake lock";
++	else if (other)
++		why = "IPC or CP interrupt";
++	else if (pkts)
++		why = "packet data";
++	else if (frames != benign)
++		why = "other ring data";
++	else if (s->dw_loops >= S5000AP_DARK_MAX)
++		why = "dark wake limit reached";
++	if (why) {
++		dev_info(s->dev, "dark wake: no (%s), %u dark wakes before, irq bits %#x\n",
++			 why, s->dw_loops, s->dw_irq_bits >> 16);
++		return false;
++	}
++	s->dw_loops++;
++	s5000ap_dw_snap(s);
++	pm_relax(s->dev);	/* end the wakeup event; no CP wake lock held */
++	dev_dbg(s->dev, "dark wake %u: %u reports\n", s->dw_loops, benign);
++	return true;
++}
++
++static int s5000ap_suspend(struct device *dev)
++{
++	struct s5000ap *s = dev_get_drvdata(dev);
++
++	s->dw_loops = 0;
++	if (READ_ONCE(s->call_busy) && s->link_up) {
++		dev_warn(dev, "voice call in progress: refusing system sleep\n");
++		return -EBUSY;
++	}
++	if (!READ_ONCE(dark_wake) || !s->link_up)
++		return 0;
++	flush_work(&s->rx_work);
++	s5000ap_dw_snap(s);
++	WRITE_ONCE(s->dw_armed, true);
++	return 0;
++}
++
++static int s5000ap_pm_resume(struct device *dev)
++{
++	struct s5000ap *s = dev_get_drvdata(dev);
++
++	if (READ_ONCE(s->dw_armed)) {
++		WRITE_ONCE(s->dw_armed, false);
++		if (s->dw_loops)
++			dev_info(dev, "dark wake: slept again %u times before this resume\n",
++				 s->dw_loops);
++	}
++	return s5000ap_resume(dev);
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(s5000ap_pm, s5000ap_suspend, s5000ap_pm_resume);
++
++static const struct of_device_id s5000ap_of_match[] = {
++	{ .compatible = "samsung,exynos9820-s5000ap-boot" },
++	{ }
++};
++/* No MODULE_DEVICE_TABLE: load by hand only. */
++
++static struct platform_driver s5000ap_driver = {
++	.probe = s5000ap_probe,
++	.remove = s5000ap_remove,
++	.driver = {
++		.name = "s5000ap-boot",
++		.of_match_table = s5000ap_of_match,
++		.suppress_bind_attrs = true,
++		.dev_groups = s5000ap_groups,
++		.pm = pm_sleep_ptr(&s5000ap_pm),
++	},
++};
++module_platform_driver(s5000ap_driver);
++
++MODULE_DESCRIPTION("Samsung S5000AP (Exynos 9820 CP) boot and SBD link");
++MODULE_LICENSE("GPL");

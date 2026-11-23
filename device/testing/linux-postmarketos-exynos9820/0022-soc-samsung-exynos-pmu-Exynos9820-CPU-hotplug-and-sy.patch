@@ -1,0 +1,580 @@
+From 0eca13dc77809561e93857df137b77fcfd91c5d7 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] soc: samsung: exynos-pmu: Exynos9820 CPU hotplug and system
+ sleep support
+
+- The lookup of a CPU's PMU register block is factored out of the
+  Exynos 9820 hotplug/idle callbacks, and a cpu_pmu_powered() callback
+  reports whether the PMU sees a core's power domain on;
+  exynos_pmu_cpu_powered() exports it for the suspend code.
+- exynos_pmu_sys_sleep(): for a firmware system sleep the CPU_PM
+  notifier refuses CPU_PM_ENTER from suspend_noirq on, which also
+  failed the syscore cpu_pm_suspend(). The platform sleep code sets
+  this flag from its own syscore suspend; while it is set
+  CPU_PM_ENTER/EXIT pass without touching the C2 PMU setup.
+- PSCI v0.1 has no AFFINITY_INFO, so nothing waits for a dying core.
+  A core still powering down when the boot CPU entered a SoC sleep
+  never booted again. A teardown in the prepare hotplug state polls
+  the core power status until it is off, for at most 100 ms.
+- Cluster 2 is powered down properly on hotplug, as the vendor kernel
+  does: the last CPU of the cluster going offline gets the CPD hint in
+  CPU_INFORM (cpd_hint) and affinity level 1 in the PSCI CPU_OFF power
+  state (cl2_off_affl), both default on; SYSREG_CPUCL2
+  BUS_COMPONENT_DRCG_EN, which a SoC sleep resets, is restored when a
+  cluster 2 CPU comes online. A cpu_pmu_pre_on hook runs on the
+  control CPU before CPU_ON.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ arch/arm64/kernel/psci.c               |   7 +
+ drivers/soc/samsung/exynos-pmu.c       | 113 ++++++++++++-
+ drivers/soc/samsung/exynos-pmu.h       |   9 ++
+ drivers/soc/samsung/exynos9820-pmu.c   | 216 +++++++++++++++++++------
+ include/linux/soc/samsung/exynos-pmu.h |  17 ++
+ 5 files changed, 309 insertions(+), 53 deletions(-)
+
+diff --git a/arch/arm64/kernel/psci.c b/arch/arm64/kernel/psci.c
+index fabd732d0a..ea17cca022 100644
+--- a/arch/arm64/kernel/psci.c
++++ b/arch/arm64/kernel/psci.c
+@@ -14,6 +14,7 @@
+ #include <linux/delay.h>
+ #include <linux/psci.h>
+ #include <linux/mm.h>
++#include <linux/soc/samsung/exynos-pmu.h>
+ 
+ #include <uapi/linux/psci.h>
+ 
+@@ -74,6 +75,12 @@ static void cpu_psci_cpu_die(unsigned int cpu)
+ 	u32 state = PSCI_POWER_STATE_TYPE_POWER_DOWN <<
+ 		    PSCI_0_2_POWER_STATE_TYPE_SHIFT;
+ 
++	/*
++	 * Exynos9820 firmware does use it: Samsung's kernel passes affinity
++	 * level 1 for the last CPU of a cluster (exynos_cpuhp_last_cpu()).
++	 */
++	state |= exynos_pmu_cpu_off_affl(cpu) << PSCI_0_2_POWER_STATE_AFFL_SHIFT;
++
+ 	psci_ops.cpu_off(state);
+ }
+ 
+diff --git a/drivers/soc/samsung/exynos-pmu.c b/drivers/soc/samsung/exynos-pmu.c
+index 13919ae319..501412e318 100644
+--- a/drivers/soc/samsung/exynos-pmu.c
++++ b/drivers/soc/samsung/exynos-pmu.c
+@@ -7,8 +7,13 @@
+ 
+ #include <linux/array_size.h>
+ #include <linux/bitmap.h>
++#include <linux/cpu.h>
+ #include <linux/cpuhotplug.h>
+ #include <linux/cpu_pm.h>
++#include <linux/iopoll.h>
++#include <linux/ktime.h>
++#include <linux/smp.h>
++#include <linux/timekeeping.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/mfd/core.h>
+@@ -226,7 +231,7 @@ static int exynos_cpu_pmu_online(void)
+ 
+ 	raw_spin_lock(&pmu_context->cpupm_lock);
+ 
+-	if (pmu_context->sys_inreboot) {
++	if (pmu_context->sys_inreboot || pmu_context->sys_insleep) {
+ 		raw_spin_unlock(&pmu_context->cpupm_lock);
+ 		return NOTIFY_OK;
+ 	}
+@@ -243,6 +248,10 @@ static int exynos_cpuhp_pmu_online(unsigned int cpu)
+ {
+ 	unsigned long flags;
+ 
++	/* on the control CPU, before CPU_ON of @cpu */
++	if (pmu_context->pmu_data->cpu_pmu_pre_on)
++		pmu_context->pmu_data->cpu_pmu_pre_on(pmu_context, cpu);
++
+ 	raw_spin_lock_irqsave(&pmu_context->cpupm_lock, flags);
+ 
+ 	/*
+@@ -278,6 +287,17 @@ static int exynos_cpu_pmu_offline(void)
+ 		return NOTIFY_BAD;
+ 	}
+ 
++	/*
++	 * The platform system sleep code (exynos9820-suspend) programs the
++	 * PMU for the boot CPU itself. Let the CPU_PM_ENTER of the syscore
++	 * cpu_pm_suspend() through without touching the PMU: refusing it
++	 * would fail syscore_suspend() and abort every suspend-to-RAM.
++	 */
++	if (pmu_context->sys_insleep) {
++		raw_spin_unlock(&pmu_context->cpupm_lock);
++		return NOTIFY_OK;
++	}
++
+ 	/* Ignore CPU_PM_ENTER event in reboot or suspend sequence. */
+ 	if (pmu_context->sys_insuspend || pmu_context->sys_inreboot) {
+ 		raw_spin_unlock(&pmu_context->cpupm_lock);
+@@ -290,6 +310,42 @@ static int exynos_cpu_pmu_offline(void)
+ 	return ret ? NOTIFY_BAD : NOTIFY_OK;
+ }
+ 
++/*
++ * PSCI v0.1 firmware (Exynos 9820) has no AFFINITY_INFO, so cpu_psci_cpu_kill()
++ * returns at once and nothing waits for the dying core to be powered down.
++ * If the boot CPU then enters a SoC sleep while the last core is still on its
++ * way down, that core is left powered with a stuck power-on request and never
++ * boots again (CPU7 "failed to come online" after every deep sleep).
++ *
++ * Wait in the prepare-state teardown, which runs on the control CPU after the
++ * dying CPU called CPU_OFF, until the PMU reports the core power domain off.
++ */
++#define EXYNOS_CPU_DEAD_WAIT_MS		100
++
++static int exynos_cpuhp_pmu_dead(unsigned int cpu)
++{
++	const struct exynos_pmu_data *d = pmu_context->pmu_data;
++	unsigned int wait_ms = EXYNOS_CPU_DEAD_WAIT_MS;
++	ktime_t t0 = ktime_get();
++	unsigned int us;
++	int pwr, ret;
++
++	if (!d->cpu_pmu_powered)
++		return 0;
++
++	ret = read_poll_timeout(d->cpu_pmu_powered, pwr, pwr <= 0, 20,
++				wait_ms * USEC_PER_MSEC, false, pmu_context, cpu);
++	us = ktime_us_delta(ktime_get(), t0);
++
++	if (ret)
++		pr_warn("CPU%u: core still powered %u ms after CPU_OFF\n", cpu, wait_ms);
++	else if (us > 1000)
++		pr_info("CPU%u: core powered down after %u us\n", cpu, us);
++
++	/* never fail the teardown: the CPU is already gone for the kernel */
++	return 0;
++}
++
+ /* Called from CPU hot plug callback with IRQs enabled */
+ static int exynos_cpuhp_pmu_offline(unsigned int cpu)
+ {
+@@ -432,7 +488,7 @@ static int setup_cpuhp_and_cpuidle(struct device *dev)
+ 	pmu_context->cpuhp_online_state = CPUHP_INVALID;
+ 
+ 	ret = cpuhp_setup_state(CPUHP_BP_PREPARE_DYN, "soc/exynos-pmu:prepare",
+-				exynos_cpuhp_pmu_online, NULL);
++				exynos_cpuhp_pmu_online, exynos_cpuhp_pmu_dead);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -609,6 +665,59 @@ static int exynos_pmu_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++/**
++ * exynos_pmu_sys_sleep() - mark a platform system sleep (suspend-to-RAM)
++ * @on: true from the syscore suspend of the platform sleep code, with only
++ *      the boot CPU online and interrupts disabled; false from its resume.
++ *
++ * While set, the CPU_PM notifier neither programs nor undoes the C2 PMU
++ * setup: the boot CPU's CPU_PM_ENTER/EXIT come from cpu_pm_suspend() and
++ * cpu_pm_resume() (GIC save/restore), not from cpuidle, and the PMU is
++ * prepared by the platform sleep sequence instead.
++ */
++void exynos_pmu_sys_sleep(bool on)
++{
++	if (!pmu_context)
++		return;
++
++	raw_spin_lock(&pmu_context->cpupm_lock);
++	pmu_context->sys_insleep = on;
++	raw_spin_unlock(&pmu_context->cpupm_lock);
++}
++EXPORT_SYMBOL_GPL(exynos_pmu_sys_sleep);
++
++/**
++ * exynos_pmu_cpu_powered() - PMU power status of a CPU core
++ * @cpu: logical CPU
++ *
++ * Return: 1 if the PMU reports the core's power domain on, 0 if off, a
++ * negative errno if the SoC has no such status. Lockless (one regmap read).
++ */
++int exynos_pmu_cpu_powered(unsigned int cpu)
++{
++	if (!pmu_context || !pmu_context->pmu_data ||
++	    !pmu_context->pmu_data->cpu_pmu_powered)
++		return -ENODEV;
++
++	return pmu_context->pmu_data->cpu_pmu_powered(pmu_context, cpu);
++}
++EXPORT_SYMBOL_GPL(exynos_pmu_cpu_powered);
++
++/**
++ * exynos_pmu_cpu_off_affl() - affinity level for the PSCI CPU_OFF of a CPU
++ * @cpu: the dying CPU, called on it from cpu_die()
++ *
++ * Return: 0 (the core only) unless the SoC wants a higher level for this CPU.
++ */
++unsigned int exynos_pmu_cpu_off_affl(unsigned int cpu)
++{
++	if (!pmu_context || !pmu_context->pmu_data ||
++	    !pmu_context->pmu_data->cpu_off_affl)
++		return 0;
++
++	return pmu_context->pmu_data->cpu_off_affl(cpu);
++}
++
+ static int exynos_cpupm_suspend_noirq(struct device *dev)
+ {
+ 	raw_spin_lock(&pmu_context->cpupm_lock);
+diff --git a/drivers/soc/samsung/exynos-pmu.h b/drivers/soc/samsung/exynos-pmu.h
+index 67581a3972..e1afadf10f 100644
+--- a/drivers/soc/samsung/exynos-pmu.h
++++ b/drivers/soc/samsung/exynos-pmu.h
+@@ -42,6 +42,8 @@ struct exynos_pmu_context {
+ 	unsigned long *in_cpuhp;
+ 	bool sys_insuspend;
+ 	bool sys_inreboot;
++	/* platform system sleep in progress, see exynos_pmu_sys_sleep() */
++	bool sys_insleep;
+ 	int cpuhp_prepare_state;
+ 	int cpuhp_power_up;
+ 	int cpuhp_power_down;
+@@ -76,6 +78,10 @@ struct exynos_pmu_context {
+  *                   or idle state. Only valid when pmu_cpuhp set to true.
+  * @cpu_pmu_online: Optional callback to be called after CPU onlined or after
+  *                  exiting idle state. Only valid when pmu_cpuhp set to true.
++ * @cpu_pmu_powered: Optional: 1 if the PMU reports @cpu's power domain on,
++ *                   0 if off, negative on error (diagnostics, any context).
++ * @cpu_off_affl: Optional: affinity level of the PSCI CPU_OFF power state of
++ *                @cpu (0: core, 1: cluster). Called on the dying CPU.
+  */
+ struct exynos_pmu_data {
+ 	const struct exynos_pmu_conf *pmu_config;
+@@ -92,6 +98,9 @@ struct exynos_pmu_data {
+ 
+ 	int (*cpu_pmu_offline)(struct exynos_pmu_context *pmu_context, unsigned int cpu);
+ 	int (*cpu_pmu_online)(struct exynos_pmu_context *pmu_context, unsigned int cpu);
++	int (*cpu_pmu_powered)(struct exynos_pmu_context *pmu_context, unsigned int cpu);
++	void (*cpu_pmu_pre_on)(struct exynos_pmu_context *pmu_context, unsigned int cpu);
++	unsigned int (*cpu_off_affl)(unsigned int cpu);
+ };
+ 
+ extern void __iomem *pmu_base_addr;
+diff --git a/drivers/soc/samsung/exynos9820-pmu.c b/drivers/soc/samsung/exynos9820-pmu.c
+index 6fc3a05221..4b164ccda8 100644
+--- a/drivers/soc/samsung/exynos9820-pmu.c
++++ b/drivers/soc/samsung/exynos9820-pmu.c
+@@ -7,6 +7,9 @@
+ 
+ #include <linux/array_size.h>
+ #include <linux/bits.h>
++#include <linux/cpumask.h>
++#include <linux/io.h>
++#include <linux/moduleparam.h>
+ #include <linux/soc/samsung/exynos-pmu.h>
+ #include <linux/soc/samsung/exynos-regs-pmu.h>
+ #include <linux/regmap.h>
+@@ -20,58 +23,163 @@ static unsigned exynos9820_cluster_offsets[] = {
+ 	GS101_CLUSTER2_OFFSET,
+ };
+ 
+-static int exynos9820_cpu_pmu_offline(struct exynos_pmu_context *pmu_context,
+-				      unsigned int cpu)
+-	__must_hold(&pmu_context->cpupm_lock)
++/*
++ * Default on: when CPU hotplug takes the last online CPU of cluster 2 down, give it the CPD (cluster power down) hint instead
++ * of C2, as Samsung's cpuhp_cpupm_offline() -> cluster_disable() does
++ * (pmucal_cpu_cluster_disable() only writes CPU_INFORM = CPD on 9820).
++ * Never used for cpuidle: the cluster still has online CPUs then.
++ * /sys/module/exynos_pmu/parameters/cpd_hint
++ *
++ * The first test of this knob (memory corruption) was broken: the
++ * "last CPU" check used topology_cluster_cpumask() of the dying CPU, which
++ * remove_cpu_topology() has already emptied by then, so EVERY offlined CPU
++ * gave the hint, with its siblings still running. Samsung also pairs the
++ * hint with affinity level 1 in the CPU_OFF power state (cl2_off_affl).
++ * Now only the last CPU of cluster 2 gives it. Together with cl2_off_affl
++ * cluster 2 really powers down (CLUSTER2_NONCPU_STATUS 0), no memory
++ * corruption in 11 hotplug cycles, and CPU7 came back after 20/20 deep
++ * sleeps (it failed ~1 in 3-4 before). cpd_hint=0 also turns cl2_off_affl
++ * off: affinity level 1 without the hint leaves the CPU stuck powered.
++ */
++static bool cpd_hint = true;
++module_param(cpd_hint, bool, 0644);
++MODULE_PARM_DESC(cpd_hint, "Exynos9820: CPD hint for the last CPU of cluster 2 going offline (default Y)");
++
++#define EXYNOS9820_CPU_INFORM_CPD	2
++
++/*
++ * Default on (only with cpd_hint): the PSCI CPU_OFF of the last online CPU of
++ * cluster 2 carries affinity level 1, as Samsung's cpu_psci_cpu_die() does
++ * for exynos_cpuhp_last_cpu(). Without it the firmware is never told that
++ * the cluster goes down: CLUSTER2_NONCPU_STATUS stays 1 with CPU6 and CPU7
++ * offline, and a SoC SLEEP is entered with the firmware believing cluster 2
++ * is up, which Samsung's kernel never does (lead for CPU7 not starting
++ * after a SLEEP).
++ * /sys/module/exynos_pmu/parameters/cl2_off_affl
++ */
++static bool cl2_off_affl = true;
++module_param(cl2_off_affl, bool, 0644);
++MODULE_PARM_DESC(cl2_off_affl, "Exynos9820: CPU_OFF affinity level 1 for the last CPU of cluster 2, only with cpd_hint (default Y)");
++
++/*
++ * SYSREG_CPUCL2 BUS_COMPONENT_DRCG_EN: downstream's cluster2_on sequence
++ * (flexpmu_cal_cpu_exynos9820.h) writes it every time cluster 2 powers on.
++ * A SoC SLEEP resets it to 0, and with it at 0 the second core of the
++ * cluster (CPU7) is powered by CPU_ON but never starts. The register is in
++ * the cluster's power domain, so it is rewritten from the online path of a
++ * cluster 2 CPU (the cluster is on then): CPU6 coming up fixes it for CPU7.
++ */
++#define EXYNOS9820_SYSREG_CPUCL2_DRCG_EN	0x1d100104
++#define EXYNOS9820_CLUSTER2			2
++
++#define EXYNOS9820_CLUSTER2_NONCPU_STATUS	0x1604
++
++static void __iomem *exynos9820_cl2_drcg;
++
++static void exynos9820_pmu_init(void)
+ {
+-	int smp_id, cluster_id, core_id;
+-	u32 reg, mask;
++	exynos9820_cl2_drcg = ioremap(EXYNOS9820_SYSREG_CPUCL2_DRCG_EN, 4);
++	if (!exynos9820_cl2_drcg)
++		pr_warn("exynos9820-pmu: cannot map SYSREG_CPUCL2 DRCG_EN\n");
++}
+ 
+-	smp_id = smp_processor_id();
+-	if (cpu != smp_id) {
+-		pr_err_ratelimited(
+-			"offline: not on target CPU: cpu=%u smp_id=%d\n", cpu,
+-			smp_id);
++/*
++ * @cpu is offline and no other CPU of cluster 2 is online. For the dying
++ * CPU itself, after __cpu_disable(): its topology sibling masks are empty
++ * by then, so go by the cluster IDs.
++ */
++static bool exynos9820_last_cl2_cpu(unsigned int cpu)
++{
++	unsigned int c;
+ 
+-		return -EINVAL;
+-	}
++	if (topology_cluster_id(cpu) != EXYNOS9820_CLUSTER2 || cpu_online(cpu))
++		return false;
++
++	for_each_online_cpu(c)
++		if (topology_cluster_id(c) == EXYNOS9820_CLUSTER2)
++			return false;
++
++	return true;
++}
++
++static unsigned int exynos9820_cpu_off_affl(unsigned int cpu)
++{
++	return READ_ONCE(cl2_off_affl) && READ_ONCE(cpd_hint) &&
++	       exynos9820_last_cl2_cpu(cpu);
++}
++
++/* PMU register offset of the CLUSTERx_CPUy block of @cpu, or -EINVAL */
++static int exynos9820_cpu_offset(unsigned int cpu)
++{
++	int cluster_id, core_id;
+ 
+ 	cluster_id = topology_cluster_id(cpu);
+ 	if (cluster_id < 0 ||
+ 	    cluster_id >= ARRAY_SIZE(exynos9820_cluster_offsets)) {
+ 		pr_err_ratelimited("invalid cluster ID for cpu: %u\n", cpu);
+-
+ 		return -EINVAL;
+ 	}
+ 
+ 	core_id = topology_core_id(cpu);
+ 	if (core_id < 0) {
+ 		pr_err_ratelimited("invalid core ID for cpu: %u\n", cpu);
++		return -EINVAL;
++	}
++
++	return GS101_CLUSTER_CPU_OFFSET(exynos9820_cluster_offsets[cluster_id],
++					core_id);
++}
++
++static void exynos9820_clear_pend(struct exynos_pmu_context *pmu_context,
++				  unsigned int upend, unsigned int clear,
++				  u32 mask)
++{
++	u32 reg;
++
++	regmap_read(pmu_context->pmuintrgen, upend, &reg);
++	regmap_write(pmu_context->pmuintrgen, clear, reg & mask);
++}
++
++static int exynos9820_cpu_pmu_offline(struct exynos_pmu_context *pmu_context,
++				      unsigned int cpu)
++	__must_hold(&pmu_context->cpupm_lock)
++{
++	int smp_id, off;
++
++	smp_id = smp_processor_id();
++	if (cpu != smp_id) {
++		pr_err_ratelimited(
++			"offline: not on target CPU: cpu=%u smp_id=%d\n", cpu,
++			smp_id);
+ 
+ 		return -EINVAL;
+ 	}
+ 
++	off = exynos9820_cpu_offset(cpu);
++	if (off < 0)
++		return off;
++
+ 	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(smp_processor_id()),
+ 		     CPU_INFORM_C2);
+ 
+-	mask = BIT(cpu);
+ 	regmap_update_bits(pmu_context->pmuintrgen, EXYNOS_GRP2_INTR_BID_ENABLE,
+-			   mask, BIT(cpu));
++			   BIT(cpu), BIT(cpu));
+ 
+-	regmap_read(pmu_context->pmuintrgen, EXYNOS_GRP1_INTR_BID_UPEND, &reg);
+-	regmap_write(pmu_context->pmuintrgen, EXYNOS_GRP1_INTR_BID_CLEAR,
+-		     reg & mask);
++	exynos9820_clear_pend(pmu_context, EXYNOS_GRP1_INTR_BID_UPEND,
++			      EXYNOS_GRP1_INTR_BID_CLEAR, BIT(cpu));
++	exynos9820_clear_pend(pmu_context, EXYNOS_GRP1_INTR_BID_UPEND,
++			      EXYNOS_GRP1_INTR_BID_CLEAR, BIT(cpu + 8));
+ 
+-	mask = (BIT(cpu + 8));
+-	regmap_read(pmu_context->pmuintrgen, EXYNOS_GRP1_INTR_BID_UPEND, &reg);
+-	regmap_write(pmu_context->pmuintrgen, EXYNOS_GRP1_INTR_BID_CLEAR,
+-		     reg & mask);
++	regmap_update_bits(pmu_context->pmureg, off + 0x44 /* INT_EN */,
++			   BIT(3), BIT(3));
+ 
+-	regmap_update_bits(
+-		pmu_context->pmureg,
+-		GS101_CLUSTER_CPU_INT_EN(exynos9820_cluster_offsets[cluster_id],
+-					 core_id),
+-		BIT(3), BIT(3));
++	/*
++	 * Hotplug runs this on the dying CPU after it left cpu_online_mask;
++	 * cpuidle runs it on an online CPU.
++	 */
++	if (READ_ONCE(cpd_hint) && exynos9820_last_cl2_cpu(cpu))
++		regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(cpu),
++			     EXYNOS9820_CPU_INFORM_CPD);
+ 
+ 	return 0;
+ }
+@@ -80,8 +188,7 @@ static int exynos9820_cpu_pmu_online(struct exynos_pmu_context *pmu_context,
+ 				     unsigned int cpu)
+ 	__must_hold(&pmu_context->cpupm_lock)
+ {
+-	int smp_id, cluster_id, core_id;
+-	u32 reg, mask;
++	int smp_id, off;
+ 
+ 	smp_id = smp_processor_id();
+ 	if (cpu != smp_id) {
+@@ -92,41 +199,48 @@ static int exynos9820_cpu_pmu_online(struct exynos_pmu_context *pmu_context,
+ 		return -EINVAL;
+ 	}
+ 
+-	cluster_id = topology_cluster_id(cpu);
+-	if (cluster_id < 0 ||
+-	    cluster_id >= ARRAY_SIZE(exynos9820_cluster_offsets)) {
+-		pr_err_ratelimited("invalid cluster ID for cpu: %u\n", cpu);
+-		return -EINVAL;
+-	}
+-
+-	core_id = topology_core_id(cpu);
+-	if (core_id < 0) {
+-		pr_err_ratelimited("invalid core ID for cpu: %u\n", cpu);
+-		return -EINVAL;
+-	}
++	off = exynos9820_cpu_offset(cpu);
++	if (off < 0)
++		return off;
+ 
+ 	regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(smp_processor_id()),
+ 		     CPU_INFORM_CLEAR);
+ 
+-	mask = BIT(cpu);
+ 	regmap_update_bits(pmu_context->pmuintrgen, EXYNOS_GRP2_INTR_BID_ENABLE,
+-			   mask, (0 << cpu));
++			   BIT(cpu), 0);
+ 
+-	regmap_read(pmu_context->pmuintrgen, EXYNOS_GRP2_INTR_BID_UPEND, &reg);
+-	regmap_write(pmu_context->pmuintrgen, EXYNOS_GRP2_INTR_BID_CLEAR,
+-		     reg & mask);
++	exynos9820_clear_pend(pmu_context, EXYNOS_GRP2_INTR_BID_UPEND,
++			      EXYNOS_GRP2_INTR_BID_CLEAR, BIT(cpu));
+ 
+-	regmap_update_bits(
+-		pmu_context->pmureg,
+-		GS101_CLUSTER_CPU_INT_EN(exynos9820_cluster_offsets[cluster_id],
+-					 core_id),
+-		BIT(3), 0);
++	regmap_update_bits(pmu_context->pmureg, off + 0x44 /* INT_EN */,
++			   BIT(3), 0);
++
++	if (topology_cluster_id(cpu) == EXYNOS9820_CLUSTER2) {
++		if (exynos9820_cl2_drcg)
++			writel(0xffffffff, exynos9820_cl2_drcg);
++	}
+ 
+ 	return 0;
+ }
+ 
++/* CLUSTERx_CPUy_STATUS bit 0: the core's power domain is on. */
++static int exynos9820_cpu_pmu_powered(struct exynos_pmu_context *pmu_context,
++				      unsigned int cpu)
++{
++	int off = exynos9820_cpu_offset(cpu);
++	u32 status;
++
++	if (off < 0 || regmap_read(pmu_context->pmureg, off + 0x04, &status))
++		return -EINVAL;
++
++	return status & BIT(0);
++}
++
+ const struct exynos_pmu_data exynos9820_pmu_data = {
++	.pmu_init = exynos9820_pmu_init,
+ 	.pmu_cpuhp = true,
+ 	.cpu_pmu_offline = exynos9820_cpu_pmu_offline,
+ 	.cpu_pmu_online = exynos9820_cpu_pmu_online,
++	.cpu_pmu_powered = exynos9820_cpu_pmu_powered,
++	.cpu_off_affl = exynos9820_cpu_off_affl,
+ };
+diff --git a/include/linux/soc/samsung/exynos-pmu.h b/include/linux/soc/samsung/exynos-pmu.h
+index 2bd9d12d9a..dbb7dc16e0 100644
+--- a/include/linux/soc/samsung/exynos-pmu.h
++++ b/include/linux/soc/samsung/exynos-pmu.h
+@@ -24,7 +24,24 @@ extern void exynos_sys_powerdown_conf(enum sys_powerdown mode);
+ struct regmap *exynos_get_pmu_regmap(void);
+ struct regmap *exynos_get_pmu_regmap_by_phandle(struct device_node *np,
+ 						const char *propname);
++void exynos_pmu_sys_sleep(bool on);
++int exynos_pmu_cpu_powered(unsigned int cpu);
++unsigned int exynos_pmu_cpu_off_affl(unsigned int cpu);
+ #else
++static inline unsigned int exynos_pmu_cpu_off_affl(unsigned int cpu)
++{
++	return 0;
++}
++
++static inline int exynos_pmu_cpu_powered(unsigned int cpu)
++{
++	return -ENODEV;
++}
++
++static inline void exynos_pmu_sys_sleep(bool on)
++{
++}
++
+ static inline struct regmap *exynos_get_pmu_regmap(void)
+ {
+ 	return ERR_PTR(-ENODEV);

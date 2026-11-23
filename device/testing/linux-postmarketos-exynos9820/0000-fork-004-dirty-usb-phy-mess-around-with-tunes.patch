@@ -1,0 +1,29 @@
+From 9689e01ba3ac5e4b1db8b28d5dd891470121920f Mon Sep 17 00:00:00 2001
+From: chiffathefox <chiffathefoxx@gmail.com>
+Date: Sat, 6 Jun 2026 07:56:54 +0300
+Subject: [PATCH 04/46] dirty: usb: phy: mess around with tunes
+
+(cherry picked from commit 53040cbb820b7b43f3a8d6ae03368a59a6736afc)
+---
+ drivers/phy/samsung/phy-exynos5-usbdrd.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/phy/samsung/phy-exynos5-usbdrd.c b/drivers/phy/samsung/phy-exynos5-usbdrd.c
+index 5a208a584b..5c218c0189 100644
+--- a/drivers/phy/samsung/phy-exynos5-usbdrd.c
++++ b/drivers/phy/samsung/phy-exynos5-usbdrd.c
+@@ -2110,11 +2110,11 @@ static const struct exynos5_usbdrd_phy_tuning exynos990_tunes_utmi_postinit[] =
+ 	PHY_TUNING_ENTRY_PHY(EXYNOS850_DRD_HSPPARACON,
+ 			     (HSPPARACON_TXVREF |
+ 			      HSPPARACON_TXPREEMPAMP | HSPPARACON_SQRX |
+-			      HSPPARACON_COMPDIS),
+-			     (FIELD_PREP_CONST(HSPPARACON_TXVREF, 7) |
++			      HSPPARACON_COMPDIS | HSPPARACON_TXRES),
++			     (FIELD_PREP_CONST(HSPPARACON_TXVREF, 0xc) |
+ 			      FIELD_PREP_CONST(HSPPARACON_TXPREEMPAMP, 3) |
+ 			      FIELD_PREP_CONST(HSPPARACON_SQRX, 5) |
+-			      FIELD_PREP_CONST(HSPPARACON_COMPDIS, 7))),
++			      FIELD_PREP_CONST(HSPPARACON_COMPDIS, 7) | FIELD_PREP_CONST(HSPPARACON_TXRES, 1))),
+ 	PHY_TUNING_ENTRY_LAST
+ };
+ 

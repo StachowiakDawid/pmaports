@@ -1,0 +1,127 @@
+From e00b331f529482c123ecad9a68f88dc8e1a8f828 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] iommu/exynos: panic_on_fault parameter, block a suspended
+ System MMU
+
+- panic_on_fault (default: true, the old behaviour; writable at
+  runtime): faults in a domain without a fault handler panic, and
+  DMA-API default domains cannot have a handler, so a stray access of
+  a master that runs its own firmware (the Exynos 9820 ABOX) takes the
+  system down. With 0 the fault is logged and the System MMU aborts
+  the transaction.
+- __sysmmu_disable() turns translation off: anything the master still
+  issues goes out with its IOVA as the physical address, and on
+  Exynos 9820 the ABOX IOVA window is live DRAM. Leave a runtime or
+  system suspended System MMU in CTRL_BLOCK instead, as the vendor
+  kernel does; late traffic then stalls.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/iommu/exynos-iommu.c | 60 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/iommu/exynos-iommu.c b/drivers/iommu/exynos-iommu.c
+index 7c337ba96a..99696582af 100644
+--- a/drivers/iommu/exynos-iommu.c
++++ b/drivers/iommu/exynos-iommu.c
+@@ -15,8 +15,10 @@
+ #include <linux/io.h>
+ #include <linux/iommu.h>
+ #include <linux/interrupt.h>
++#include <linux/iopoll.h>
+ #include <linux/kmemleak.h>
+ #include <linux/list.h>
++#include <linux/moduleparam.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+@@ -579,6 +581,16 @@ static void show_fault_information(struct sysmmu_drvdata *data,
+ 	}
+ }
+ 
++/*
++ * A fault nobody handles (DMA-API domains cannot have a fault handler)
++ * panics by default. Bring-up of firmware-driven masters (Exynos9820 ABOX)
++ * can turn that into a log message: the faulting transaction is aborted
++ * and the master gets a bus error.
++ */
++static bool panic_on_fault = true;
++module_param(panic_on_fault, bool, 0644);
++MODULE_PARM_DESC(panic_on_fault, "Panic on an unhandled System MMU fault (default: true)");
++
+ static irqreturn_t exynos_sysmmu_irq(int irq, void *dev_id)
+ {
+ 	struct sysmmu_drvdata *data = dev_id;
+@@ -603,8 +615,12 @@ static irqreturn_t exynos_sysmmu_irq(int irq, void *dev_id)
+ 		ret = report_iommu_fault(&data->domain->domain, data->master,
+ 					 fault.addr, fault.type);
+ 	}
+-	if (ret)
++	if (ret && READ_ONCE(panic_on_fault))
+ 		panic("Unrecoverable System MMU Fault!");
++	if (ret)
++		dev_err_ratelimited(data->sysmmu,
++				    "unhandled fault at %#x, continuing\n",
++				    fault.addr);
+ 
+ out:
+ 	writel(1 << itype, SYSMMU_REG(data, int_clear));
+@@ -632,6 +648,46 @@ static void __sysmmu_disable(struct sysmmu_drvdata *data)
+ 	__sysmmu_disable_clocks(data);
+ }
+ 
++/*
++ * What a suspended SYSMMU does with traffic. __sysmmu_disable()
++ * writes CTRL_DISABLE, i.e. translation off: every transaction the master
++ * still issues goes out with its IOVA as the physical address. On Exynos9820
++ * the ABOX IOVA window (0x80000000-0xe07fffff, the addresses its firmware is
++ * built for) is all live DRAM, starting at the DRAM base where the kernel
++ * image is, so a late ABOX write lands 1:1 in kernel memory instead of
++ * faulting. Downstream never lets that happen: it disables with
++ * CTRL_BLOCK_DISABLE and keeps SYSMMU_AUD out of system sleep altogether
++ * ("sysmmu,no-suspend"). Here the runtime/system suspend leaves the SYSMMU
++ * blocked instead: late traffic stalls in the SYSMMU (and is lost with the
++ * power domain) rather than being written somewhere. __sysmmu_enable()
++ * starts from CTRL_BLOCK anyway, so resume is unchanged.
++ */
++static void __sysmmu_suspend_block(struct sysmmu_drvdata *data)
++{
++	unsigned long flags;
++	bool idle;
++	u32 st;
++
++	clk_enable(data->clk_master);
++
++	spin_lock_irqsave(&data->lock, flags);
++	writel(CTRL_BLOCK, data->sfrbase + REG_MMU_CTRL);
++	/* STATUS bit 0: blocked, i.e. nothing in flight any more */
++	idle = !readl_poll_timeout_atomic(data->sfrbase + REG_MMU_STATUS, st,
++					  st & 1, 1, 1000);
++	/* sysmmu_block() would unblock on a timeout: stay blocked here */
++	writel(CTRL_BLOCK, data->sfrbase + REG_MMU_CTRL);
++	data->active = false;
++	spin_unlock_irqrestore(&data->lock, flags);
++
++	if (!idle)
++		dev_warn(data->sysmmu,
++			 "%s still has traffic in flight at suspend, kept blocked\n",
++			 dev_name(data->master));
++
++	__sysmmu_disable_clocks(data);
++}
++
+ static void __sysmmu_init_config(struct sysmmu_drvdata *data)
+ {
+ 	unsigned int cfg;
+@@ -864,7 +920,7 @@ static int __maybe_unused exynos_sysmmu_suspend(struct device *dev)
+ 		mutex_lock(&owner->rpm_lock);
+ 		if (data->domain) {
+ 			dev_dbg(data->sysmmu, "saving state\n");
+-			__sysmmu_disable(data);
++			__sysmmu_suspend_block(data);
+ 		}
+ 		mutex_unlock(&owner->rpm_lock);
+ 	}

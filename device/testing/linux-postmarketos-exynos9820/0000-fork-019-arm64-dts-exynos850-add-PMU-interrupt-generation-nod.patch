@@ -1,0 +1,42 @@
+From c3fab1a41dee5eab589e417affa66ec85524e0d4 Mon Sep 17 00:00:00 2001
+From: Alexey Klimov <alexey.klimov@linaro.org>
+Date: Tue, 9 Jun 2026 18:39:28 +0100
+Subject: [PATCH 19/46] arm64: dts: exynos850: add PMU interrupt generation
+ node
+
+Add pmu_intr_gen node for Exynos850. This hw block is required
+for different power management routines like CPU hotplug and
+different sleep and idle states.
+Also reference this node from main PMU node.
+
+Reviewed-by: Peter Griffin <peter.griffin@linaro.org>
+Signed-off-by: Alexey Klimov <alexey.klimov@linaro.org>
+(cherry picked from commit e941d59283a4483bb93ad0434d418e449f55eacf)
+---
+ arch/arm64/boot/dts/exynos/exynos850.dtsi | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/exynos/exynos850.dtsi b/arch/arm64/boot/dts/exynos/exynos850.dtsi
+index 8a4771899a..803fc127d8 100644
+--- a/arch/arm64/boot/dts/exynos/exynos850.dtsi
++++ b/arch/arm64/boot/dts/exynos/exynos850.dtsi
+@@ -231,6 +231,7 @@ gic: interrupt-controller@12a01000 {
+ 		pmu_system_controller: system-controller@11860000 {
+ 			compatible = "samsung,exynos850-pmu", "syscon";
+ 			reg = <0x11860000 0x10000>;
++			google,pmu-intr-gen-syscon = <&pmu_intr_gen>;
+ 
+ 			poweroff: syscon-poweroff {
+ 				compatible = "syscon-poweroff";
+@@ -248,6 +249,11 @@ reboot: syscon-reboot {
+ 			};
+ 		};
+ 
++		pmu_intr_gen: syscon@11870000 {
++			compatible = "samsung,exynos850-pmu-intr-gen", "syscon";
++			reg = <0x11870000 0x10000>;
++		};
++
+ 		watchdog_cl0: watchdog@10050000 {
+ 			compatible = "samsung,exynos850-wdt";
+ 			reg = <0x10050000 0x100>;

@@ -1,0 +1,89 @@
+From 2985e57251af49397348966ce9be320cb17b62b0 Mon Sep 17 00:00:00 2001
+From: chiffathefox <chiffathefoxx@gmail.com>
+Date: Wed, 15 Jul 2026 04:38:31 +0300
+Subject: [PATCH 22/46] clk: samsung: acpm: exynos9820 support
+
+(cherry picked from commit a99ebaaab01f73deb3b24f54972341fb33d3c62e)
+---
+ drivers/clk/samsung/clk-acpm.c                | 37 +++++++++++++++++++
+ .../clock/samsung,exynos9820-acpm.h           |  3 +-
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/clk/samsung/clk-acpm.c b/drivers/clk/samsung/clk-acpm.c
+index 34a12ea0b6..bca8b6aacd 100644
+--- a/drivers/clk/samsung/clk-acpm.c
++++ b/drivers/clk/samsung/clk-acpm.c
+@@ -20,6 +20,7 @@ struct acpm_clk {
+ 	u32 id;
+ 	struct clk_hw hw;
+ 	unsigned int mbox_chan_id;
++	unsigned long rate;
+ 	struct acpm_handle *handle;
+ 	const struct acpm_clk_driver_data *drv_data;
+ };
+@@ -56,6 +57,35 @@ static const struct acpm_clk_variant exynos850_acpm_clks[] = {
+ 	ACPM_CLK("cp"),
+ };
+ 
++static unsigned long exynos9820_clk_recalc_rate(struct clk_hw *hw,
++						unsigned long parent_rate)
++{
++	struct acpm_clk *clk = to_acpm_clk(hw);
++
++	return clk->rate;
++}
++
++static int exynos9820_clk_determine_rate(struct clk_hw *hw,
++					 struct clk_rate_request *req)
++{
++	return 0;
++}
++
++static int exynos9820_clk_set_rate(struct clk_hw *hw, unsigned long rate,
++				   unsigned long parent_rate)
++{
++	int ret;
++	struct acpm_clk *clk = to_acpm_clk(hw);
++
++	ret = clk->handle->ops->dvfs.set_rate(clk->handle, clk->mbox_chan_id,
++					      clk->id, rate);
++	if (!ret) {
++		clk->rate = rate;
++	}
++
++	return ret;
++}
++
+ static const struct acpm_clk_variant gs101_acpm_clks[] = {
+ 	ACPM_CLK("mif"),
+ 	ACPM_CLK("int"),
+@@ -110,8 +140,15 @@ static const struct acpm_clk_variant exynos9820_acpm_clks[] = {
+ 	ACPM_CLK("mfc"),
+ };
+ 
++static const struct clk_ops exynos9820_clk_ops = {
++	.recalc_rate = exynos9820_clk_recalc_rate,
++	.determine_rate = exynos9820_clk_determine_rate,
++	.set_rate = exynos9820_clk_set_rate,
++};
++
+ static const struct acpm_clk_driver_data acpm_clk_exynos9820 = {
+ 	.clks = exynos9820_acpm_clks,
++	.clk_ops = &exynos9820_clk_ops,
+ 	.nr_clks = ARRAY_SIZE(exynos9820_acpm_clks),
+ 	.mbox_chan_id = 0,
+ };
+diff --git a/include/dt-bindings/clock/samsung,exynos9820-acpm.h b/include/dt-bindings/clock/samsung,exynos9820-acpm.h
+index 612248c602..ad3a99764c 100644
+--- a/include/dt-bindings/clock/samsung,exynos9820-acpm.h
++++ b/include/dt-bindings/clock/samsung,exynos9820-acpm.h
+@@ -17,7 +17,8 @@
+ #define EXYNOS9820_CLK_ACPM_DVFS_DISP			6
+ #define EXYNOS9820_CLK_ACPM_DVFS_SCORE			7
+ #define EXYNOS9820_CLK_ACPM_DVFS_AUD 			8
+-#define EXYNOS9820_CLK_ACPM_DVFS_GPU			10
++#define EXYNOS9820_CLK_ACPM_DVS_CP 			9
++#define EXYNOS9820_CLK_ACPM_DVFS_G3D			10
+ #define EXYNOS9820_CLK_ACPM_DVFS_INTCAM			11
+ #define EXYNOS9820_CLK_ACPM_DVFS_CAM			12
+ #define EXYNOS9820_CLK_ACPM_DVFS_IVA 			13

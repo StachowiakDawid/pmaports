@@ -1,0 +1,96 @@
+From a7750dbb9a44a49586a6766dfaa935bbaa87c132 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] clocksource: exynos_mct: re-arm the global comparator if it
+ was missed
+
+exynos4_mct_comp0_start() reads the FRC and then needs four
+synchronised register writes before COMP0 is enabled. With the minimum
+delta of 15 ticks (577 ns at 26 MHz) the FRC can already be past COMP0
+at that point and the event never fires.
+
+As a clock event device that costs a late tick. As the tick broadcast
+device (arch timer with C3STOP and idle states with local-timer-stop)
+a lost event is not recovered: the broadcast code still sees it as
+pending and does not reprogram the device, and the powered-down CPUs
+sleep until an unrelated interrupt.
+
+After programming, re-read the FRC; if it passed COMP0 and G_INT_CSTAT
+did not latch the match, program a longer delta (256 ticks, then
+doubling, about 1.3 ms at most).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/clocksource/exynos_mct.c | 44 +++++++++++++++++++++++++++++---
+ 1 file changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/clocksource/exynos_mct.c b/drivers/clocksource/exynos_mct.c
+index da09f467a6..716c5d0e8e 100644
+--- a/drivers/clocksource/exynos_mct.c
++++ b/drivers/clocksource/exynos_mct.c
+@@ -271,7 +271,7 @@ static void exynos4_mct_comp0_stop(void)
+ 	exynos4_mct_write(0, EXYNOS4_MCT_G_INT_ENB);
+ }
+ 
+-static void exynos4_mct_comp0_start(bool periodic, unsigned long cycles)
++static u64 exynos4_mct_comp0_start(bool periodic, unsigned long cycles)
+ {
+ 	unsigned int tcon;
+ 	u64 comp_cycle;
+@@ -291,14 +291,52 @@ static void exynos4_mct_comp0_start(bool periodic, unsigned long cycles)
+ 
+ 	tcon |= MCT_G_TCON_COMP0_ENABLE;
+ 	exynos4_mct_write(tcon , EXYNOS4_MCT_G_TCON);
++
++	return comp_cycle;
++}
++
++/*
++ * The global comparator raises its interrupt when the FRC reaches COMP0.
++ * exynos4_mct_comp0_start() reads the FRC first and then does four
++ * synchronised register writes (each one polls WSTAT), so with a short delta
++ * (min_delta is 15 ticks = 577 ns at 26 MHz) the FRC can be past COMP0 before
++ * COMP0_ENABLE is set, and the event never fires.
++ *
++ * As a clock event device that only costs a late tick. As the tick broadcast
++ * device (arch timer with C3STOP + idle states with local-timer-stop) it is
++ * fatal: the broadcast code believes the event is pending, and a CPU going
++ * idle with a later expiry does not reprogram the device. Every CPU that is
++ * powered down then sleeps until some unrelated interrupt or IPI wakes it,
++ * and timers on those CPUs stop, which looks like a hang the more CPUs use C2.
++ *
++ * So re-read the FRC after programming and, if the match was missed and has
++ * not latched in G_INT_CSTAT, program a longer delta (at most ~1.3 ms late).
++ */
++static bool exynos4_mct_comp0_missed(u64 comp_cycle)
++{
++	if ((s64)(exynos4_read_count_64() - comp_cycle) < 0)
++		return false;
++
++	/* Matched (or latched) in the meantime: the interrupt is pending. */
++	return !(readl_relaxed(reg_base + EXYNOS4_MCT_G_INT_CSTAT) & 1);
+ }
+ 
+ static int exynos4_comp_set_next_event(unsigned long cycles,
+ 				       struct clock_event_device *evt)
+ {
+-	exynos4_mct_comp0_start(false, cycles);
++	unsigned int i;
++	u64 comp_cycle;
+ 
+-	return 0;
++	for (i = 0; ; i++) {
++		comp_cycle = exynos4_mct_comp0_start(false, cycles);
++		if (!exynos4_mct_comp0_missed(comp_cycle))
++			return 0;
++
++		if (i == 8)
++			return -ETIME;
++		/* 256 ticks (~10 us), then doubling: last try ~1.3 ms */
++		cycles = max(cycles * 2, 256UL);
++	}
+ }
+ 
+ static int mct_set_state_shutdown(struct clock_event_device *evt)

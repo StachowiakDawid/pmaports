@@ -1,0 +1,114 @@
+From 5b05b60d2cbfabb27cb42e3673c2df1b98558001 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] pinctrl: samsung: export the EINT wakeup mask, noirq bank
+ save/restore
+
+- The Exynos 9820 pin controller data has no retention_data, so
+  nothing writes the EINT wakeup mask that irq_set_wake() collects
+  into the PMU EINT_WAKEUP_MASK registers. A PMU system sleep needs
+  them: with the reset value every ALIVE EINT, including the power
+  key, is masked as a wakeup source. Export the collected mask so
+  that the platform suspend code can program the PMU.
+- The banks lose their configuration in a SoC sleep and pad retention
+  keeps the pins frozen until the restore. The save/restore moves from
+  the late/early to the noirq phase: the Exynos 9820 PCIe host retrains
+  its link from resume_noirq and needs PERST#, CLKREQ# and the endpoint
+  supply GPIO working by then. DAT is restored before CON, so a pin
+  that came back as an input does not drive the reset DAT value for a
+  moment.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/pinctrl/samsung/pinctrl-exynos.c  | 18 ++++++++++++++++++
+ drivers/pinctrl/samsung/pinctrl-samsung.c | 17 +++++++++++++++--
+ include/linux/soc/samsung/exynos-pmu.h    |  9 +++++++++
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/pinctrl/samsung/pinctrl-exynos.c b/drivers/pinctrl/samsung/pinctrl-exynos.c
+index c45da9f134..35c241125a 100644
+--- a/drivers/pinctrl/samsung/pinctrl-exynos.c
++++ b/drivers/pinctrl/samsung/pinctrl-exynos.c
+@@ -50,6 +50,24 @@ static u32 eint_wake_mask_values[MAX_WAKEUP_REG] = { EXYNOS_EINT_WAKEUP_MASK_DIS
+ 						     EXYNOS_EINT_WAKEUP_MASK_DISABLED,
+ 						     EXYNOS_EINT_WAKEUP_MASK_DISABLED};
+ 
++/**
++ * exynos_eint_wake_mask() - EINT wakeup mask as set up by irq_set_wake()
++ * @reg: index of the PMU EINT_WAKEUP_MASK register (0 = the first one)
++ *
++ * A set bit means "this EINT does not wake the system", as in the PMU
++ * register. For SoCs whose pinctrl data has no retention_data (Exynos9820),
++ * nothing writes the PMU register, so platform suspend code has to do it.
++ *
++ * Return: the mask, or EXYNOS_EINT_WAKEUP_MASK_DISABLED for an unknown @reg.
++ */
++u32 exynos_eint_wake_mask(unsigned int reg)
++{
++	if (reg >= MAX_WAKEUP_REG)
++		return EXYNOS_EINT_WAKEUP_MASK_DISABLED;
++	return READ_ONCE(eint_wake_mask_values[reg]);
++}
++EXPORT_SYMBOL_GPL(exynos_eint_wake_mask);
++
+ static inline struct exynos_irq_chip *to_exynos_irq_chip(struct irq_chip *chip)
+ {
+ 	return container_of(chip, struct exynos_irq_chip, chip);
+diff --git a/drivers/pinctrl/samsung/pinctrl-samsung.c b/drivers/pinctrl/samsung/pinctrl-samsung.c
+index dab7562886..d7f72ca4f5 100644
+--- a/drivers/pinctrl/samsung/pinctrl-samsung.c
++++ b/drivers/pinctrl/samsung/pinctrl-samsung.c
+@@ -1437,6 +1437,13 @@ static int __maybe_unused samsung_pinctrl_resume(struct device *dev)
+ 		if (!widths[PINCFG_TYPE_CON_PDN])
+ 			continue;
+ 
++		/*
++		 * Output level first: a pin that came back as an input must
++		 * not drive the reset DAT (0) for a moment when CON turns it
++		 * into an output again (WLAN_REG_ON, PERST#, regulator enables).
++		 */
++		writel(bank->pm_save[PINCFG_TYPE_DAT], reg + offs[PINCFG_TYPE_DAT]);
++
+ 		if (widths[PINCFG_TYPE_FUNC] * bank->nr_pins > 32) {
+ 			/* Some banks have two config registers */
+ 			pr_debug("%s @ %p (con %#010x %08x => %#010x %08x)\n",
+@@ -1531,9 +1538,15 @@ static const struct of_device_id samsung_pinctrl_dt_match[] = {
+ 	{},
+ };
+ 
++/*
++ * Save/restore in the noirq phase: drivers that power their
++ * hardware back up from resume_noirq (PCIe host controllers retraining the
++ * link, with PERST#/CLKREQ#/the endpoint supply on GPIOs) need the bank
++ * configuration back and the pad retention released by then.
++ */
+ static const struct dev_pm_ops samsung_pinctrl_pm_ops = {
+-	SET_LATE_SYSTEM_SLEEP_PM_OPS(samsung_pinctrl_suspend,
+-				     samsung_pinctrl_resume)
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(samsung_pinctrl_suspend,
++				      samsung_pinctrl_resume)
+ };
+ 
+ static struct platform_driver samsung_pinctrl_driver = {
+diff --git a/include/linux/soc/samsung/exynos-pmu.h b/include/linux/soc/samsung/exynos-pmu.h
+index dbb7dc16e0..efd326d923 100644
+--- a/include/linux/soc/samsung/exynos-pmu.h
++++ b/include/linux/soc/samsung/exynos-pmu.h
+@@ -20,6 +20,15 @@ enum sys_powerdown {
+ };
+ 
+ extern void exynos_sys_powerdown_conf(enum sys_powerdown mode);
++
++#ifdef CONFIG_PINCTRL_EXYNOS
++u32 exynos_eint_wake_mask(unsigned int reg);
++#else
++static inline u32 exynos_eint_wake_mask(unsigned int reg)
++{
++	return 0xffffffff;
++}
++#endif
+ #ifdef CONFIG_EXYNOS_PMU
+ struct regmap *exynos_get_pmu_regmap(void);
+ struct regmap *exynos_get_pmu_regmap_by_phandle(struct device_node *np,

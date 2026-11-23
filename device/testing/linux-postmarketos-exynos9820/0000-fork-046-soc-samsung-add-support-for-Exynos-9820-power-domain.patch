@@ -1,0 +1,38 @@
+From 9038677ef6a3b1c419420185fd86f30fa609bbed Mon Sep 17 00:00:00 2001
+From: chiffathefox <chiffathefoxx@gmail.com>
+Date: Fri, 4 Sep 2026 21:56:49 +0300
+Subject: [PATCH 46/46] soc: samsung: add support for Exynos 9820 power domains
+
+The downstream additionaly makes an SMC call before disabling and after enabling a power domain (except FSYS0).
+For the time being, this driver is only used to disable domains to conserve power, so it's fine to omit the SMC. At the moment, I am not sure if the SMC call is required to restore or cycle power.
+
+(cherry picked from commit 84565683f09d7a377cbca18d168ef1f06d172a7d)
+---
+ drivers/pmdomain/samsung/exynos-pm-domains.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/pmdomain/samsung/exynos-pm-domains.c b/drivers/pmdomain/samsung/exynos-pm-domains.c
+index c8c2ea06e9..5e0790e0ae 100644
+--- a/drivers/pmdomain/samsung/exynos-pm-domains.c
++++ b/drivers/pmdomain/samsung/exynos-pm-domains.c
+@@ -81,6 +81,10 @@ static const struct exynos_pm_domain_config exynos5433_cfg = {
+ 	.local_pwr_cfg		= 0xf,
+ };
+ 
++static const struct exynos_pm_domain_config exynos9820_cfg = {
++	.local_pwr_cfg		= 0x1,
++};
++
+ static const struct of_device_id exynos_pm_domain_of_match[] = {
+ 	{
+ 		.compatible = "samsung,exynos4210-pd",
+@@ -88,6 +92,9 @@ static const struct of_device_id exynos_pm_domain_of_match[] = {
+ 	}, {
+ 		.compatible = "samsung,exynos5433-pd",
+ 		.data = &exynos5433_cfg,
++	}, {
++		.compatible = "samsung,exynos9820-pd",
++		.data = &exynos9820_cfg,
+ 	},
+ 	{ },
+ };

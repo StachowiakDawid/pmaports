@@ -1,0 +1,40 @@
+From d72ddc8f67f2d54eaef258318e8ca0838d7b40e0 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] mmc: queue: clear MQRQ_XFER_SINGLE_BLOCK for new requests
+
+MQRQ_XFER_SINGLE_BLOCK is set on a request's PDU when it is retried
+after an error, but nothing clears it. blk-mq reuses the PDU for later
+requests on the same tag, so after one recovery every later request on
+that tag is transferred one sector at a time and sequential reads drop
+to a few MB/s until the driver is rebound.
+
+Clear the flag where the retry counter is reset for a new request.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/mmc/core/queue.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mmc/core/queue.c b/drivers/mmc/core/queue.c
+index 5d187e063d..be4abc64d3 100644
+--- a/drivers/mmc/core/queue.c
++++ b/drivers/mmc/core/queue.c
+@@ -300,7 +300,15 @@ static blk_status_t mmc_mq_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	spin_unlock_irq(&mq->lock);
+ 
+ 	if (!(req->rq_flags & RQF_DONTPREP)) {
+-		req_to_mmc_queue_req(req)->retries = 0;
++		struct mmc_queue_req *mqrq = req_to_mmc_queue_req(req);
++
++		mqrq->retries = 0;
++		/*
++		 * The PDU is reused for later requests on the same tag: a
++		 * single-block recovery of an earlier request must not leak
++		 * into new ones.
++		 */
++		mqrq->flags &= ~MQRQ_XFER_SINGLE_BLOCK;
+ 		req->rq_flags |= RQF_DONTPREP;
+ 	}
+ 

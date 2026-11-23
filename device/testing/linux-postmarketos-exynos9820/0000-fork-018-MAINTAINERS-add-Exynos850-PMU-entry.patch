@@ -1,0 +1,34 @@
+From 4e8fc3a4a3310ae9701d685fa4ffee0e282fd165 Mon Sep 17 00:00:00 2001
+From: Alexey Klimov <alexey.klimov@linaro.org>
+Date: Tue, 9 Jun 2026 18:39:27 +0100
+Subject: [PATCH 18/46] MAINTAINERS: add Exynos850 PMU entry
+
+Add Exynos850 PMU entry describing new file
+drivers/soc/samsung/exynos850-pmu.c.
+Add myself as M there since I contributed Exynos850
+PMU support and intend to maintain that.
+
+Signed-off-by: Alexey Klimov <alexey.klimov@linaro.org>
+(cherry picked from commit 97e37db4547d9a566c7e2cd98932ab1292c0f00c)
+---
+ MAINTAINERS | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index f55c539efd..a7c109ea21 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -24969,6 +24969,13 @@ F:	arch/arm64/boot/dts/exynos/exynos2200*
+ F:	drivers/clk/samsung/clk-exynos2200.c
+ F:	include/dt-bindings/clock/samsung,exynos2200-cmu.h
+ 
++SAMSUNG EXYNOS850 PMU SUPPORT
++M:	Alexey Klimov <alexey.klimov@linaro.org>
++L:	linux-arm-kernel@lists.infradead.org (moderated for non-subscribers)
++L:	linux-samsung-soc@vger.kernel.org
++S:	Maintained
++F:	drivers/soc/samsung/exynos850-pmu.c
++
+ SAMSUNG EXYNOS850 SoC SUPPORT
+ M:	Sam Protsenko <semen.protsenko@linaro.org>
+ L:	linux-arm-kernel@lists.infradead.org (moderated for non-subscribers)

@@ -1,0 +1,1066 @@
+From cec2036081893ca20ba7906dbb59e168da21bc57 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] clk: samsung: exynos9820: add CMU_PERIC1, CMU_AUD,
+ pll_0831x_k3, CLKOUT
+
+Clocks the Galaxy S10 family needs on top of the Exynos 9820 clock
+driver:
+
+ - CMU_PERIC1: muxes, dividers and gates of UART_BT, USI07/08/10/16/17
+   with their USI_I2C blocks and the camera I2C_CAM0..3 blocks.
+ - CMU_AUD: audio PLL, ABOX core, UAIF/DSIF bit clocks and their
+   gates, for the ABOX audio DSP.
+ - pll_0831x_k3: on Exynos 9820 PMS, ENABLE and STABLE of the 0831x
+   PLL live in PLL_CON0 and K in PLL_CON3 (three registers further
+   instead of two), so PLL_AUD0 needs a PLL type that only moves the K
+   register.
+ - exynos-clkout: the Exynos 9820 PMU clock outputs, CLKOUT0, and
+   CLKOUT1 as a gate whose parent is the PMU node's "tcxo" clock (it
+   feeds the NFC controller).
+
+The binding IDs are part of this commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Signed-off-by: StachowiakDawid <dawidos234@gmail.com>
+---
+ drivers/clk/samsung/clk-exynos-clkout.c |  83 +++-
+ drivers/clk/samsung/clk-exynos9820.c    | 605 +++++++++++++++++++++++-
+ drivers/clk/samsung/clk-pll.c           |  17 +-
+ drivers/clk/samsung/clk-pll.h           |   1 +
+ include/dt-bindings/clock/exynos9820.h  |  98 ++++
+ 5 files changed, 796 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/clk/samsung/clk-exynos-clkout.c b/drivers/clk/samsung/clk-exynos-clkout.c
+index 2d65f86e5d..e8514ba929 100644
+--- a/drivers/clk/samsung/clk-exynos-clkout.c
++++ b/drivers/clk/samsung/clk-exynos-clkout.c
+@@ -19,14 +19,16 @@
+ 
+ #define DRV_NAME			"exynos-clkout"
+ 
+-#define EXYNOS_CLKOUT_NR_CLKS		1
++#define EXYNOS_CLKOUT_NR_CLKS		2
+ #define EXYNOS_CLKOUT_PARENTS		32
+ 
+ #define EXYNOS_PMU_DEBUG_REG		0xa00
++#define EXYNOS9820_CLKOUT1_REG		0xa0c
+ #define EXYNOS_CLKOUT_DISABLE_SHIFT	0
+ #define EXYNOS_CLKOUT_MUX_SHIFT		8
+ #define EXYNOS4_CLKOUT_MUX_MASK		0xf
+ #define EXYNOS5_CLKOUT_MUX_MASK		0x1f
++#define EXYNOS9820_CLKOUT_MUX_MASK	0x3f
+ 
+ struct exynos_clkout {
+ 	struct clk_gate gate;
+@@ -35,11 +37,19 @@ struct exynos_clkout {
+ 	void __iomem *reg;
+ 	struct device_node *np;
+ 	u32 pmu_debug_save;
++	u32 clkout1_save;
++	bool has_clkout1;
+ 	struct clk_hw_onecell_data data;
+ };
+ 
+ struct exynos_clkout_variant {
+ 	u32 mux_mask;
++	/*
++	 * Exynos9820 has a second output, CLKOUT1 (PMU + 0xa0c, same layout:
++	 * mux [13:8], bit 0 = disable). On the Galaxy S10 family it feeds the
++	 * NFC controller ("OSC_NFC" downstream) with TCXO, mux input 0.
++	 */
++	bool has_clkout1;
+ };
+ 
+ static const struct exynos_clkout_variant exynos_clkout_exynos4 = {
+@@ -50,6 +60,11 @@ static const struct exynos_clkout_variant exynos_clkout_exynos5 = {
+ 	.mux_mask	= EXYNOS5_CLKOUT_MUX_MASK,
+ };
+ 
++static const struct exynos_clkout_variant exynos_clkout_exynos9820 = {
++	.mux_mask	= EXYNOS9820_CLKOUT_MUX_MASK,
++	.has_clkout1	= true,
++};
++
+ static const struct of_device_id exynos_clkout_ids[] = {
+ 	{
+ 		.compatible = "samsung,exynos3250-pmu",
+@@ -75,6 +90,9 @@ static const struct of_device_id exynos_clkout_ids[] = {
+ 	}, {
+ 		.compatible = "samsung,exynos5433-pmu",
+ 		.data = &exynos_clkout_exynos5,
++	}, {
++		.compatible = "samsung,exynos9820-pmu",
++		.data = &exynos_clkout_exynos9820,
+ 	}, { }
+ };
+ 
+@@ -82,7 +100,8 @@ static const struct of_device_id exynos_clkout_ids[] = {
+  * Device will be instantiated as child of PMU device without its own
+  * device node.  Therefore match compatibles against parent.
+  */
+-static int exynos_clkout_match_parent_dev(struct device *dev, u32 *mux_mask)
++static int exynos_clkout_match_parent_dev(struct device *dev, u32 *mux_mask,
++					  bool *has_clkout1)
+ {
+ 	const struct exynos_clkout_variant *variant;
+ 	const struct of_device_id *match;
+@@ -105,6 +124,47 @@ static int exynos_clkout_match_parent_dev(struct device *dev, u32 *mux_mask)
+ 	variant = match->data;
+ 
+ 	*mux_mask = variant->mux_mask;
++	*has_clkout1 = variant->has_clkout1;
++
++	return 0;
++}
++
++/*
++ * CLKOUT1 is modelled as a plain gate with the "tcxo" clock of the PMU node
++ * as its parent. The mux is not touched: it must already select TCXO
++ * (input 0), which is its reset value. Without a "tcxo" clock, or with a
++ * different mux setting, CLKOUT1 is not registered (index 1 stays empty).
++ */
++static int exynos_clkout_register_clkout1(struct device *dev,
++					  struct exynos_clkout *clkout)
++{
++	struct clk_hw *hw;
++	const char *parent;
++	struct clk *tcxo;
++	u32 val;
++
++	tcxo = of_clk_get_by_name(clkout->np, "tcxo");
++	if (IS_ERR(tcxo))
++		return 0;
++	parent = __clk_get_name(tcxo);
++	clk_put(tcxo);
++
++	val = readl(clkout->reg + EXYNOS9820_CLKOUT1_REG);
++	if ((val >> EXYNOS_CLKOUT_MUX_SHIFT) & EXYNOS9820_CLKOUT_MUX_MASK) {
++		dev_warn(dev, "CLKOUT1 mux is not TCXO (0x%08x), not registered\n",
++			 val);
++		return 0;
++	}
++
++	hw = clk_hw_register_gate(NULL, "pmu_clkout1", parent, 0,
++				  clkout->reg + EXYNOS9820_CLKOUT1_REG,
++				  EXYNOS_CLKOUT_DISABLE_SHIFT,
++				  CLK_GATE_SET_TO_DISABLE, &clkout->slock);
++	if (IS_ERR(hw))
++		return PTR_ERR(hw);
++
++	clkout->data.hws[1] = hw;
++	clkout->data.num = 2;
+ 
+ 	return 0;
+ }
+@@ -122,7 +182,8 @@ static int exynos_clkout_probe(struct platform_device *pdev)
+ 	if (!clkout)
+ 		return -ENOMEM;
+ 
+-	ret = exynos_clkout_match_parent_dev(&pdev->dev, &mux_mask);
++	ret = exynos_clkout_match_parent_dev(&pdev->dev, &mux_mask,
++					     &clkout->has_clkout1);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -173,7 +234,7 @@ static int exynos_clkout_probe(struct platform_device *pdev)
+ 	clkout->mux.shift = EXYNOS_CLKOUT_MUX_SHIFT;
+ 	clkout->mux.lock = &clkout->slock;
+ 
+-	clkout->data.num = EXYNOS_CLKOUT_NR_CLKS;
++	clkout->data.num = 1;
+ 	clkout->data.hws[0] = clk_hw_register_composite(NULL, "clkout",
+ 				parent_names, parent_count, &clkout->mux.hw,
+ 				&clk_mux_ops, NULL, NULL, &clkout->gate.hw,
+@@ -184,6 +245,12 @@ static int exynos_clkout_probe(struct platform_device *pdev)
+ 		goto err_unmap;
+ 	}
+ 
++	if (clkout->has_clkout1) {
++		ret = exynos_clkout_register_clkout1(&pdev->dev, clkout);
++		if (ret)
++			goto err_clk_unreg;
++	}
++
+ 	ret = of_clk_add_hw_provider(clkout->np, of_clk_hw_onecell_get, &clkout->data);
+ 	if (ret)
+ 		goto err_clk_unreg;
+@@ -191,6 +258,8 @@ static int exynos_clkout_probe(struct platform_device *pdev)
+ 	return 0;
+ 
+ err_clk_unreg:
++	if (clkout->data.num > 1)
++		clk_hw_unregister_gate(clkout->data.hws[1]);
+ 	clk_hw_unregister(clkout->data.hws[0]);
+ err_unmap:
+ 	iounmap(clkout->reg);
+@@ -209,6 +278,8 @@ static void exynos_clkout_remove(struct platform_device *pdev)
+ 	struct exynos_clkout *clkout = platform_get_drvdata(pdev);
+ 
+ 	of_clk_del_provider(clkout->np);
++	if (clkout->data.num > 1)
++		clk_hw_unregister_gate(clkout->data.hws[1]);
+ 	clk_hw_unregister(clkout->data.hws[0]);
+ 	iounmap(clkout->reg);
+ }
+@@ -218,6 +289,8 @@ static int exynos_clkout_suspend(struct device *dev)
+ 	struct exynos_clkout *clkout = dev_get_drvdata(dev);
+ 
+ 	clkout->pmu_debug_save = readl(clkout->reg + EXYNOS_PMU_DEBUG_REG);
++	if (clkout->data.num > 1)
++		clkout->clkout1_save = readl(clkout->reg + EXYNOS9820_CLKOUT1_REG);
+ 
+ 	return 0;
+ }
+@@ -227,6 +300,8 @@ static int exynos_clkout_resume(struct device *dev)
+ 	struct exynos_clkout *clkout = dev_get_drvdata(dev);
+ 
+ 	writel(clkout->pmu_debug_save, clkout->reg + EXYNOS_PMU_DEBUG_REG);
++	if (clkout->data.num > 1)
++		writel(clkout->clkout1_save, clkout->reg + EXYNOS9820_CLKOUT1_REG);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/clk/samsung/clk-exynos9820.c b/drivers/clk/samsung/clk-exynos9820.c
+index c531cb52d6..097872b8da 100644
+--- a/drivers/clk/samsung/clk-exynos9820.c
++++ b/drivers/clk/samsung/clk-exynos9820.c
+@@ -7,8 +7,11 @@
+  */
+ 
+ #include <linux/clk-provider.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/platform_device.h>
+ 
+ #include <dt-bindings/clock/exynos9820.h>
+@@ -781,13 +784,329 @@ static const struct samsung_cmu_info peric0_cmu_info __initconst = {
+ /*
+  * Register offsets for CMU_PERIC1 (0x10800000)
+  */
+-#define PERIC1_CMU_PERIC1_CONTROLLER_OPTION		0x0800
++/* I2C_CAM1 (camera sensor bus of the rear ultra-wide camera) */
++#define PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM1_USER			0x0140
++#define PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM2_USER			0x0160
++#define CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM2				0x1808
++#define CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM2_IPCLKPORT_CLK	0x2010
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM2_IPCLKPORT_IPCLK		0x2044
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM2_IPCLKPORT_PCLK		0x2048
++/* I2C_CAM0 (rear wide sensor), I2C_CAM3 (rear lens actuators and EEPROM) */
++#define PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM0_USER			0x0120
++#define PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM3_USER			0x0180
++#define CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM0				0x1800
++#define CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM3				0x180c
++#define CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM0_IPCLKPORT_CLK	0x2008
++#define CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM3_IPCLKPORT_CLK	0x2014
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM0_IPCLKPORT_IPCLK		0x2034
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM0_IPCLKPORT_PCLK		0x2038
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM3_IPCLKPORT_IPCLK		0x204c
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM3_IPCLKPORT_PCLK		0x2050
++/* USI07_I2C (rear tele and front depth sensors), USI08_I2C (front lens actuator) */
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI07_I2C_IPCLKPORT_IPCLK		0x20b0
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI07_I2C_IPCLKPORT_PCLK		0x20b4
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_I2C_IPCLKPORT_IPCLK		0x20c0
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_I2C_IPCLKPORT_PCLK		0x20c4
++#define CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM1				0x1804
++#define CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM1_IPCLKPORT_CLK	0x200c
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM1_IPCLKPORT_IPCLK		0x203c
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM1_IPCLKPORT_PCLK		0x2040
++#define PLL_CON0_MUX_CLKCMU_PERIC1_BUS_USER				0x0100
++#define PLL_CON0_MUX_CLKCMU_PERIC1_UART_BT_USER				0x01c0
++#define PLL_CON0_MUX_CLKCMU_PERIC1_USI08_USI_USER			0x0220
++#define PLL_CON0_MUX_CLKCMU_PERIC1_USI10_USI_USER			0x0260
++#define PLL_CON0_MUX_CLKCMU_PERIC1_USI16_USI_USER			0x02a0
++#define PLL_CON0_MUX_CLKCMU_PERIC1_USI_I2C_USER				0x02e0
++#define PERIC1_CMU_PERIC1_CONTROLLER_OPTION				0x0800
++#define CLK_CON_DIV_DIV_CLK_PERIC1_UART_BT				0x1814
++#define CLK_CON_DIV_DIV_CLK_PERIC1_USI08_USI				0x1820
++#define CLK_CON_DIV_DIV_CLK_PERIC1_USI10_USI				0x1828
++#define CLK_CON_DIV_DIV_CLK_PERIC1_USI16_USI				0x1830
++#define CLK_CON_DIV_DIV_CLK_PERIC1_USI_I2C				0x1838
++#define CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_UART_BT_IPCLKPORT_CLK	0x2020
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_GPIO_PERIC1_IPCLKPORT_PCLK		0x2030
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI08_USI_IPCLKPORT_CLK	0x2070
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI10_USI_IPCLKPORT_CLK	0x2078
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI16_USI_IPCLKPORT_CLK	0x2080
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI_I2C_IPCLKPORT_CLK	0x2088
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_UART_BT_IPCLKPORT_IPCLK		0x2098
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_UART_BT_IPCLKPORT_PCLK		0x209c
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_USI_IPCLKPORT_IPCLK		0x20c8
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_USI_IPCLKPORT_PCLK		0x20cc
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI10_USI_IPCLKPORT_IPCLK		0x20e8
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI10_USI_IPCLKPORT_PCLK		0x20ec
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI16_USI_IPCLKPORT_IPCLK		0x2108
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI16_USI_IPCLKPORT_PCLK		0x210c
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI17_I2C_IPCLKPORT_IPCLK		0x2110
++#define CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI17_I2C_IPCLKPORT_PCLK		0x2114
+ 
+ static const unsigned long peric1_clk_regs[] __initconst = {
++	PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM1_USER,
++	PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM2_USER,
++	CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM2,
++	CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM2_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM2_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM2_IPCLKPORT_PCLK,
++	PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM0_USER,
++	PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM3_USER,
++	CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM0,
++	CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM3,
++	CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM0_IPCLKPORT_CLK,
++	CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM3_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM0_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM0_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM3_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM3_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI07_I2C_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI07_I2C_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_I2C_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_I2C_IPCLKPORT_PCLK,
++	CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM1,
++	CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM1_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM1_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM1_IPCLKPORT_PCLK,
++	PLL_CON0_MUX_CLKCMU_PERIC1_BUS_USER,
++	PLL_CON0_MUX_CLKCMU_PERIC1_UART_BT_USER,
++	PLL_CON0_MUX_CLKCMU_PERIC1_USI08_USI_USER,
++	PLL_CON0_MUX_CLKCMU_PERIC1_USI10_USI_USER,
++	PLL_CON0_MUX_CLKCMU_PERIC1_USI16_USI_USER,
++	PLL_CON0_MUX_CLKCMU_PERIC1_USI_I2C_USER,
+ 	PERIC1_CMU_PERIC1_CONTROLLER_OPTION,
++	CLK_CON_DIV_DIV_CLK_PERIC1_UART_BT,
++	CLK_CON_DIV_DIV_CLK_PERIC1_USI08_USI,
++	CLK_CON_DIV_DIV_CLK_PERIC1_USI10_USI,
++	CLK_CON_DIV_DIV_CLK_PERIC1_USI16_USI,
++	CLK_CON_DIV_DIV_CLK_PERIC1_USI_I2C,
++	CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_UART_BT_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_GPIO_PERIC1_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI08_USI_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI10_USI_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI16_USI_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI_I2C_IPCLKPORT_CLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_UART_BT_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_UART_BT_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_USI_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_USI_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI10_USI_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI10_USI_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI16_USI_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI16_USI_IPCLKPORT_PCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI17_I2C_IPCLKPORT_IPCLK,
++	CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI17_I2C_IPCLKPORT_PCLK,
++};
++
++/* List of parent clocks for muxes in CMU_PERIC1 */
++PNAME(mout_peric1_i2c_cam1_user_p) = { "oscclk", "dout_cmu_peric1_ip" };
++PNAME(mout_peric1_i2c_cam2_user_p) = { "oscclk", "dout_cmu_peric1_ip" };
++PNAME(mout_peric1_i2c_cam0_user_p) = { "oscclk", "dout_cmu_peric1_ip" };
++PNAME(mout_peric1_i2c_cam3_user_p) = { "oscclk", "dout_cmu_peric1_ip" };
++PNAME(mout_peric1_bus_user_p) = { "oscclk", "dout_cmu_peric1_bus" };
++PNAME(mout_peric1_uart_bt_user_p) = { "oscclk", "dout_cmu_peric1_ip" };
++PNAME(mout_peric1_usi08_usi_user_p) = { "oscclk", "dout_cmu_peric1_ip" };
++PNAME(mout_peric1_usi10_usi_user_p) = { "oscclk", "dout_cmu_peric1_ip" };
++PNAME(mout_peric1_usi16_usi_user_p) = { "oscclk", "dout_cmu_peric1_ip" };
++PNAME(mout_peric1_usi_i2c_user_p) = { "oscclk", "dout_cmu_peric1_ip" };
++
++static const struct samsung_mux_clock peric1_mux_clks[] __initconst = {
++	MUX(CLK_MOUT_PERIC1_I2C_CAM1_USER, "mout_peric1_i2c_cam1_user",
++	    mout_peric1_i2c_cam1_user_p,
++	    PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM1_USER, 4, 1),
++	MUX(CLK_MOUT_PERIC1_I2C_CAM2_USER, "mout_peric1_i2c_cam2_user",
++	    mout_peric1_i2c_cam2_user_p,
++	    PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM2_USER, 4, 1),
++	MUX(CLK_MOUT_PERIC1_I2C_CAM0_USER, "mout_peric1_i2c_cam0_user",
++	    mout_peric1_i2c_cam0_user_p,
++	    PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM0_USER, 4, 1),
++	MUX(CLK_MOUT_PERIC1_I2C_CAM3_USER, "mout_peric1_i2c_cam3_user",
++	    mout_peric1_i2c_cam3_user_p,
++	    PLL_CON0_MUX_CLKCMU_PERIC1_I2C_CAM3_USER, 4, 1),
++	MUX(CLK_MOUT_PERIC1_BUS_USER, "mout_peric1_bus_user",
++	    mout_peric1_bus_user_p, PLL_CON0_MUX_CLKCMU_PERIC1_BUS_USER, 4, 1),
++	MUX(CLK_MOUT_PERIC1_UART_BT_USER, "mout_peric1_uart_bt_user",
++	    mout_peric1_uart_bt_user_p,
++	    PLL_CON0_MUX_CLKCMU_PERIC1_UART_BT_USER, 4, 1),
++	MUX(CLK_MOUT_PERIC1_USI_I2C_USER, "mout_peric1_usi_i2c_user",
++	    mout_peric1_usi_i2c_user_p, PLL_CON0_MUX_CLKCMU_PERIC1_USI_I2C_USER,
++	    4, 1),
++	MUX(CLK_MOUT_PERIC1_USI08_USI_USER, "mout_peric1_usi08_usi_user",
++	    mout_peric1_usi08_usi_user_p,
++	    PLL_CON0_MUX_CLKCMU_PERIC1_USI08_USI_USER, 4, 1),
++	MUX(CLK_MOUT_PERIC1_USI10_USI_USER, "mout_peric1_usi10_usi_user",
++	    mout_peric1_usi10_usi_user_p,
++	    PLL_CON0_MUX_CLKCMU_PERIC1_USI10_USI_USER, 4, 1),
++	MUX(CLK_MOUT_PERIC1_USI16_USI_USER, "mout_peric1_usi16_usi_user",
++	    mout_peric1_usi16_usi_user_p,
++	    PLL_CON0_MUX_CLKCMU_PERIC1_USI16_USI_USER, 4, 1),
++};
++
++static const struct samsung_div_clock peric1_div_clks[] __initconst = {
++	DIV(CLK_DOUT_PERIC1_I2C_CAM1, "dout_peric1_i2c_cam1",
++	    "mout_peric1_i2c_cam1_user", CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM1,
++	    0, 4),
++	DIV(CLK_DOUT_PERIC1_I2C_CAM2, "dout_peric1_i2c_cam2",
++	    "mout_peric1_i2c_cam2_user", CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM2,
++	    0, 4),
++	DIV(CLK_DOUT_PERIC1_I2C_CAM0, "dout_peric1_i2c_cam0",
++	    "mout_peric1_i2c_cam0_user", CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM0,
++	    0, 4),
++	DIV(CLK_DOUT_PERIC1_I2C_CAM3, "dout_peric1_i2c_cam3",
++	    "mout_peric1_i2c_cam3_user", CLK_CON_DIV_DIV_CLK_PERIC1_I2C_CAM3,
++	    0, 4),
++	DIV(CLK_DOUT_PERIC1_UART_BT, "dout_peric1_uart_bt",
++	    "mout_peric1_uart_bt_user", CLK_CON_DIV_DIV_CLK_PERIC1_UART_BT, 0,
++	    4),
++	DIV(CLK_DOUT_PERIC1_USI_I2C, "dout_peric1_usi_i2c",
++	    "mout_peric1_usi_i2c_user", CLK_CON_DIV_DIV_CLK_PERIC1_USI_I2C, 0,
++	    4),
++	DIV(CLK_DOUT_PERIC1_USI08_USI, "dout_peric1_usi08_usi",
++	    "mout_peric1_usi08_usi_user", CLK_CON_DIV_DIV_CLK_PERIC1_USI08_USI,
++	    0, 4),
++	DIV(CLK_DOUT_PERIC1_USI10_USI, "dout_peric1_usi10_usi",
++	    "mout_peric1_usi10_usi_user", CLK_CON_DIV_DIV_CLK_PERIC1_USI10_USI,
++	    0, 4),
++	DIV(CLK_DOUT_PERIC1_USI16_USI, "dout_peric1_usi16_usi",
++	    "mout_peric1_usi16_usi_user", CLK_CON_DIV_DIV_CLK_PERIC1_USI16_USI,
++	    0, 4),
++};
++
++static const struct samsung_gate_clock peric1_gate_clks[] __initconst = {
++	GATE(CLK_GOUT_PERIC1_I2C_CAM1_CLK, "gout_peric1_i2c_cam1_clk",
++	     "dout_peric1_i2c_cam1",
++	     CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM1_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM1_IPCLK, "gout_peric1_i2c_cam1_ipclk",
++	     "dout_peric1_i2c_cam1",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM1_IPCLKPORT_IPCLK, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM1_PCLK, "gout_peric1_i2c_cam1_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM1_IPCLKPORT_PCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM2_CLK, "gout_peric1_i2c_cam2_clk",
++	     "dout_peric1_i2c_cam2",
++	     CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM2_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM2_IPCLK, "gout_peric1_i2c_cam2_ipclk",
++	     "dout_peric1_i2c_cam2",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM2_IPCLKPORT_IPCLK, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM2_PCLK, "gout_peric1_i2c_cam2_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM2_IPCLKPORT_PCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM0_CLK, "gout_peric1_i2c_cam0_clk",
++	     "dout_peric1_i2c_cam0",
++	     CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM0_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM0_IPCLK, "gout_peric1_i2c_cam0_ipclk",
++	     "dout_peric1_i2c_cam0",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM0_IPCLKPORT_IPCLK, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM0_PCLK, "gout_peric1_i2c_cam0_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM0_IPCLKPORT_PCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM3_CLK, "gout_peric1_i2c_cam3_clk",
++	     "dout_peric1_i2c_cam3",
++	     CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_I2C_CAM3_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM3_IPCLK, "gout_peric1_i2c_cam3_ipclk",
++	     "dout_peric1_i2c_cam3",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM3_IPCLKPORT_IPCLK, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_PERIC1_I2C_CAM3_PCLK, "gout_peric1_i2c_cam3_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_I2C_CAM3_IPCLKPORT_PCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_USI07_I2C_IPCLK, "gout_peric1_usi07_i2c_ipclk",
++	     "dout_peric1_usi_i2c",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI07_I2C_IPCLKPORT_IPCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_USI07_I2C_PCLK, "gout_peric1_usi07_i2c_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI07_I2C_IPCLKPORT_PCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_USI08_I2C_IPCLK, "gout_peric1_usi08_i2c_ipclk",
++	     "dout_peric1_usi_i2c",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_I2C_IPCLKPORT_IPCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_USI08_I2C_PCLK, "gout_peric1_usi08_i2c_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_I2C_IPCLKPORT_PCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_UART_BT_CLK, "gout_peric1_uart_bt_clk",
++	     "dout_peric1_uart_bt",
++	     CLK_CON_GAT_CLK_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_UART_BT_IPCLKPORT_CLK,
++	     21, CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_PERIC1_GPIO_PERIC1_PCLK, "gout_peric1_gpio_peric1_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_GPIO_PERIC1_IPCLKPORT_PCLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_PERIC1_UART_BT_IPCLK, "gout_peric1_uart_bt_ipclk",
++	     "dout_peric1_uart_bt",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_UART_BT_IPCLKPORT_IPCLK, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_PERIC1_UART_BT_PCLK, "gout_peric1_uart_bt_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_UART_BT_IPCLKPORT_PCLK, 21, 0, 0),
++	GATE(CLK_GOUT_PERIC1_USI_I2C_CLK, "gout_peric1_usi_i2c_clk",
++	     "dout_peric1_usi_i2c",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI_I2C_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_PERIC1_USI17_I2C_IPCLK, "gout_peric1_usi17_i2c_ipclk",
++	     "dout_peric1_usi_i2c",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI17_I2C_IPCLKPORT_IPCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_USI17_I2C_PCLK, "gout_peric1_usi17_i2c_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI17_I2C_IPCLKPORT_PCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_USI08_USI_CLK, "gout_peric1_usi08_usi_clk",
++	     "dout_peric1_usi08_usi",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI08_USI_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_PERIC1_USI08_USI_IPCLK, "gout_peric1_usi08_usi_ipclk",
++	     "dout_peric1_usi08_usi",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_USI_IPCLKPORT_IPCLK, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_PERIC1_USI08_USI_PCLK, "gout_peric1_usi08_usi_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI08_USI_IPCLKPORT_PCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_USI10_USI_CLK, "gout_peric1_usi10_usi_clk",
++	     "dout_peric1_usi10_usi",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI10_USI_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_PERIC1_USI10_USI_IPCLK, "gout_peric1_usi10_usi_ipclk",
++	     "dout_peric1_usi10_usi",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI10_USI_IPCLKPORT_IPCLK, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_PERIC1_USI10_USI_PCLK, "gout_peric1_usi10_usi_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI10_USI_IPCLKPORT_PCLK, 21, 0,
++	     0),
++	GATE(CLK_GOUT_PERIC1_USI16_USI_CLK, "gout_peric1_usi16_usi_clk",
++	     "dout_peric1_usi16_usi",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_RSTNSYNC_CLK_PERIC1_USI16_USI_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_PERIC1_USI16_USI_IPCLK, "gout_peric1_usi16_usi_ipclk",
++	     "dout_peric1_usi16_usi",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI16_USI_IPCLKPORT_IPCLK, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_PERIC1_USI16_USI_PCLK, "gout_peric1_usi16_usi_pclk",
++	     "mout_peric1_bus_user",
++	     CLK_CON_GAT_GOUT_BLK_PERIC1_UID_USI16_USI_IPCLKPORT_PCLK, 21, 0,
++	     0),
+ };
+ 
+ static const struct samsung_cmu_info peric1_cmu_info __initconst = {
++	.mux_clks		= peric1_mux_clks,
++	.nr_mux_clks		= ARRAY_SIZE(peric1_mux_clks),
++	.div_clks		= peric1_div_clks,
++	.nr_div_clks		= ARRAY_SIZE(peric1_div_clks),
++	.gate_clks		= peric1_gate_clks,
++	.nr_gate_clks		= ARRAY_SIZE(peric1_gate_clks),
++	.nr_clk_ids		= CLK_NR_PERIC1_CAM,
+ 	.clk_regs		= peric1_clk_regs,
+ 	.nr_clk_regs		= ARRAY_SIZE(peric1_clk_regs),
+ 	.clk_name		= "bus",
+@@ -2143,6 +2462,248 @@ static const struct samsung_cmu_info g3d_cmu_info __initconst = {
+ 	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
+ };
+ 
++/*
++ * Register offsets for CMU_AUD (0x18c00000)
++ *
++ * Offsets and the clock tree are from the downstream cal-if
++ * (cmucal-sfr.c / cmucal-node.c). CMU_AUD lives in the AUD power domain.
++ */
++#define PLL_LOCKTIME_PLL_AUD0						0x0000
++#define PLL_CON0_MUX_CLKCMU_AUD_CPU_USER				0x0100
++#define PLL_CON0_PLL_AUD0						0x0120
++#define PLL_CON3_PLL_AUD0						0x012c
++#define AUD_CMU_AUD_CONTROLLER_OPTION					0x0800
++#define CLK_CON_MUX_MUX_CLK_AUD_CPU					0x1000
++#define CLK_CON_MUX_MUX_CLK_AUD_UAIF0					0x100c
++#define CLK_CON_MUX_MUX_CLK_AUD_UAIF1					0x1010
++#define CLK_CON_MUX_MUX_CLK_AUD_UAIF2					0x1014
++#define CLK_CON_MUX_MUX_CLK_AUD_UAIF3					0x1018
++#define CLK_CON_MUX_MUX_HCHGEN_CLK_AUD_CPU				0x101c
++#define CLK_CON_DIV_DIV_CLK_AUD_AUDIF					0x1800
++#define CLK_CON_DIV_DIV_CLK_AUD_BUS					0x1804
++#define CLK_CON_DIV_DIV_CLK_AUD_BUSP					0x1808
++#define CLK_CON_DIV_DIV_CLK_AUD_CNT					0x180c
++#define CLK_CON_DIV_DIV_CLK_AUD_CPU_ACLK				0x1810
++#define CLK_CON_DIV_DIV_CLK_AUD_CPU_PCLKDBG				0x1818
++#define CLK_CON_DIV_DIV_CLK_AUD_DMIC					0x181c
++#define CLK_CON_DIV_DIV_CLK_AUD_MCLK					0x1824
++#define CLK_CON_DIV_DIV_CLK_AUD_PLL					0x1828
++#define CLK_CON_DIV_DIV_CLK_AUD_UAIF0					0x182c
++#define CLK_CON_DIV_DIV_CLK_AUD_UAIF1					0x1830
++#define CLK_CON_DIV_DIV_CLK_AUD_UAIF2					0x1834
++#define CLK_CON_DIV_DIV_CLK_AUD_UAIF3					0x1838
++#define CLK_CON_GAT_CLK_BLK_AUD_UID_DFTMUX_AUD_IPCLKPORT_AUD_CODEC_MCLK	0x2004
++#define CLK_CON_GAT_CLK_BLK_AUD_UID_DMIC_IPCLKPORT_CLK			0x2008
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_ACLK		0x2010
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_ACLK_IRQ		0x2014
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_CNT		0x2018
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_UAIF0		0x2020
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_UAIF1		0x2024
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_UAIF2		0x2028
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_UAIF3		0x202c
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_CCLK_ASB		0x2030
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_CCLK_CA32		0x2034
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_CCLK_DAP		0x2038
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_RSTNSYNC_CLK_AUD_UAIF0_IPCLKPORT_CLK	0x20a4
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_RSTNSYNC_CLK_AUD_UAIF1_IPCLKPORT_CLK	0x20a8
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_RSTNSYNC_CLK_AUD_UAIF2_IPCLKPORT_CLK	0x20ac
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_RSTNSYNC_CLK_AUD_UAIF3_IPCLKPORT_CLK	0x20b0
++#define CLK_CON_GAT_GOUT_BLK_AUD_UID_SMMU_AUD_IPCLKPORT_CLK		0x20b4
++
++static const unsigned long aud_clk_regs[] __initconst = {
++	PLL_LOCKTIME_PLL_AUD0,
++	PLL_CON0_MUX_CLKCMU_AUD_CPU_USER,
++	PLL_CON0_PLL_AUD0,
++	PLL_CON3_PLL_AUD0,
++	AUD_CMU_AUD_CONTROLLER_OPTION,
++	CLK_CON_MUX_MUX_CLK_AUD_CPU,
++	CLK_CON_MUX_MUX_CLK_AUD_UAIF0,
++	CLK_CON_MUX_MUX_CLK_AUD_UAIF1,
++	CLK_CON_MUX_MUX_CLK_AUD_UAIF2,
++	CLK_CON_MUX_MUX_CLK_AUD_UAIF3,
++	CLK_CON_MUX_MUX_HCHGEN_CLK_AUD_CPU,
++	CLK_CON_DIV_DIV_CLK_AUD_AUDIF,
++	CLK_CON_DIV_DIV_CLK_AUD_BUS,
++	CLK_CON_DIV_DIV_CLK_AUD_BUSP,
++	CLK_CON_DIV_DIV_CLK_AUD_CNT,
++	CLK_CON_DIV_DIV_CLK_AUD_CPU_ACLK,
++	CLK_CON_DIV_DIV_CLK_AUD_CPU_PCLKDBG,
++	CLK_CON_DIV_DIV_CLK_AUD_DMIC,
++	CLK_CON_DIV_DIV_CLK_AUD_MCLK,
++	CLK_CON_DIV_DIV_CLK_AUD_PLL,
++	CLK_CON_DIV_DIV_CLK_AUD_UAIF0,
++	CLK_CON_DIV_DIV_CLK_AUD_UAIF1,
++	CLK_CON_DIV_DIV_CLK_AUD_UAIF2,
++	CLK_CON_DIV_DIV_CLK_AUD_UAIF3,
++};
++
++/*
++ * 1179.648 MHz = 24576 x 48 kHz, 1083.8016 MHz = 24576 x 44.1 kHz.
++ * m/p/s/k from the downstream pll_aud0_rate_table (fin = 26 MHz).
++ */
++static const struct samsung_pll_rate_table aud_pll_rates[] __initconst = {
++	PLL_36XX_RATE(26 * MHZ, 1179648040U, 181, 4, 0, 31740),
++	PLL_36XX_RATE(26 * MHZ, 1083801605U, 42, 1, 0, -20665),
++};
++
++static const struct samsung_pll_clock aud_pll_clks[] __initconst = {
++	/* PMS in PLL_CON0, K in PLL_CON3 */
++	PLL(pll_0831x_k3, CLK_FOUT_AUD_PLL, "fout_aud_pll", "oscclk",
++	    PLL_LOCKTIME_PLL_AUD0, PLL_CON0_PLL_AUD0, aud_pll_rates),
++};
++
++PNAME(mout_aud_pll_p)		= { "oscclk", "fout_aud_pll" };
++PNAME(mout_aud_cpu_user_p)	= { "oscclk", "dout_cmu_aud_cpu" };
++PNAME(mout_aud_cpu_p)		= { "dout_aud_pll", "mout_aud_cpu_user" };
++PNAME(mout_aud_cpu_hch_p)	= { "mout_aud_cpu", "oscclk" };
++PNAME(mout_aud_uaif0_p)		= { "dout_aud_uaif0", "ioclk_aud_uaif0" };
++PNAME(mout_aud_uaif1_p)		= { "dout_aud_uaif1", "ioclk_aud_uaif1" };
++PNAME(mout_aud_uaif2_p)		= { "dout_aud_uaif2", "ioclk_aud_uaif2" };
++PNAME(mout_aud_uaif3_p)		= { "dout_aud_uaif3", "ioclk_aud_uaif3" };
++
++static const struct samsung_fixed_rate_clock aud_fixed_clks[] __initconst = {
++	/* external BCLK inputs (UAIF in consumer mode), rate is nominal */
++	FRATE(0, "ioclk_aud_uaif0", NULL, 0, 10000000),
++	FRATE(0, "ioclk_aud_uaif1", NULL, 0, 10000000),
++	FRATE(0, "ioclk_aud_uaif2", NULL, 0, 10000000),
++	FRATE(0, "ioclk_aud_uaif3", NULL, 0, 100000000),
++};
++
++static const struct samsung_mux_clock aud_mux_clks[] __initconst = {
++	MUX(CLK_MOUT_AUD_PLL, "mout_aud_pll", mout_aud_pll_p,
++	    PLL_CON0_PLL_AUD0, 4, 1),
++	MUX(CLK_MOUT_AUD_CPU_USER, "mout_aud_cpu_user", mout_aud_cpu_user_p,
++	    PLL_CON0_MUX_CLKCMU_AUD_CPU_USER, 4, 1),
++	MUX(CLK_MOUT_AUD_CPU, "mout_aud_cpu", mout_aud_cpu_p,
++	    CLK_CON_MUX_MUX_CLK_AUD_CPU, 0, 1),
++	MUX(CLK_MOUT_AUD_CPU_HCH, "mout_aud_cpu_hch", mout_aud_cpu_hch_p,
++	    CLK_CON_MUX_MUX_HCHGEN_CLK_AUD_CPU, 0, 1),
++	MUX_F(CLK_MOUT_AUD_UAIF0, "mout_aud_uaif0", mout_aud_uaif0_p,
++	      CLK_CON_MUX_MUX_CLK_AUD_UAIF0, 0, 1, CLK_SET_RATE_PARENT, 0),
++	MUX_F(CLK_MOUT_AUD_UAIF1, "mout_aud_uaif1", mout_aud_uaif1_p,
++	      CLK_CON_MUX_MUX_CLK_AUD_UAIF1, 0, 1, CLK_SET_RATE_PARENT, 0),
++	MUX_F(CLK_MOUT_AUD_UAIF2, "mout_aud_uaif2", mout_aud_uaif2_p,
++	      CLK_CON_MUX_MUX_CLK_AUD_UAIF2, 0, 1, CLK_SET_RATE_PARENT, 0),
++	MUX_F(CLK_MOUT_AUD_UAIF3, "mout_aud_uaif3", mout_aud_uaif3_p,
++	      CLK_CON_MUX_MUX_CLK_AUD_UAIF3, 0, 1, CLK_SET_RATE_PARENT, 0),
++};
++
++static const struct samsung_div_clock aud_div_clks[] __initconst = {
++	DIV(CLK_DOUT_AUD_PLL, "dout_aud_pll", "mout_aud_pll",
++	    CLK_CON_DIV_DIV_CLK_AUD_PLL, 0, 4),
++	DIV(CLK_DOUT_AUD_AUDIF, "dout_aud_audif", "mout_aud_pll",
++	    CLK_CON_DIV_DIV_CLK_AUD_AUDIF, 0, 9),
++	/*
++	 * AUD bus clock (GPIO_AUD, SysMMU, ABOX SFR). PD_AUD stays powered
++	 * through pinctrl_aud, so the bus must never lose its clock: without
++	 * this, unloading the ABOX driver would turn PLL_AUD0 off and the
++	 * next pinctrl_aud access would hang.
++	 */
++	DIV_F(CLK_DOUT_AUD_BUS, "dout_aud_bus", "mout_aud_pll",
++	      CLK_CON_DIV_DIV_CLK_AUD_BUS, 0, 3, CLK_IS_CRITICAL, 0),
++	DIV(CLK_DOUT_AUD_BUSP, "dout_aud_busp", "dout_aud_bus",
++	    CLK_CON_DIV_DIV_CLK_AUD_BUSP, 0, 2),
++	DIV(CLK_DOUT_AUD_CPU_ACLK, "dout_aud_cpu_aclk", "mout_aud_cpu_hch",
++	    CLK_CON_DIV_DIV_CLK_AUD_CPU_ACLK, 0, 3),
++	DIV(CLK_DOUT_AUD_CPU_PCLKDBG, "dout_aud_cpu_pclkdbg", "mout_aud_cpu_hch",
++	    CLK_CON_DIV_DIV_CLK_AUD_CPU_PCLKDBG, 0, 3),
++	DIV(CLK_DOUT_AUD_CNT, "dout_aud_cnt", "dout_aud_audif",
++	    CLK_CON_DIV_DIV_CLK_AUD_CNT, 0, 9),
++	DIV(CLK_DOUT_AUD_MCLK, "dout_aud_mclk", "dout_aud_audif",
++	    CLK_CON_DIV_DIV_CLK_AUD_MCLK, 0, 2),
++	DIV(CLK_DOUT_AUD_DMIC, "dout_aud_dmic", "dout_aud_audif",
++	    CLK_CON_DIV_DIV_CLK_AUD_DMIC, 0, 2),
++	DIV(CLK_DOUT_AUD_UAIF0, "dout_aud_uaif0", "dout_aud_audif",
++	    CLK_CON_DIV_DIV_CLK_AUD_UAIF0, 0, 9),
++	DIV(CLK_DOUT_AUD_UAIF1, "dout_aud_uaif1", "dout_aud_audif",
++	    CLK_CON_DIV_DIV_CLK_AUD_UAIF1, 0, 9),
++	DIV(CLK_DOUT_AUD_UAIF2, "dout_aud_uaif2", "dout_aud_audif",
++	    CLK_CON_DIV_DIV_CLK_AUD_UAIF2, 0, 9),
++	DIV(CLK_DOUT_AUD_UAIF3, "dout_aud_uaif3", "dout_aud_audif",
++	    CLK_CON_DIV_DIV_CLK_AUD_UAIF3, 0, 9),
++};
++
++/*
++ * Only gates a driver actually uses are listed. Bus/interconnect gates
++ * (LHM/LHS, XIU, TREX, GPIO_AUD, SYSREG_AUD, ...) are left alone so that
++ * clk_disable_unused() cannot touch them.
++ */
++static const struct samsung_gate_clock aud_gate_clks[] __initconst = {
++	GATE(CLK_GOUT_AUD_ABOX_ACLK, "gout_aud_abox_aclk", "dout_aud_bus",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_ACLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_AUD_ACLK_IRQ, "gout_aud_aclk_irq", "dout_aud_bus",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_ACLK_IRQ, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_AUD_CA32_CCLK, "gout_aud_ca32_cclk", "mout_aud_cpu_hch",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_CCLK_CA32, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_AUD_ASB_CCLK, "gout_aud_asb_cclk", "dout_aud_cpu_aclk",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_CCLK_ASB, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_AUD_DAP_CCLK, "gout_aud_dap_cclk", "dout_aud_cpu_pclkdbg",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_CCLK_DAP, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_AUD_CNT_BCLK, "gout_aud_cnt_bclk", "dout_aud_cnt",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_CNT, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_AUD_UAIF0_BCLK, "gout_aud_uaif0_bclk", "mout_aud_uaif0",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_UAIF0, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_AUD_UAIF1_BCLK, "gout_aud_uaif1_bclk", "mout_aud_uaif1",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_UAIF1, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_AUD_UAIF2_BCLK, "gout_aud_uaif2_bclk", "mout_aud_uaif2",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_UAIF2, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_AUD_UAIF3_BCLK, "gout_aud_uaif3_bclk", "mout_aud_uaif3",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_ABOX_IPCLKPORT_BCLK_UAIF3, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_AUD_UAIF0_RSTNSYNC, "gout_aud_uaif0_rstnsync",
++	     "mout_aud_uaif0",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_RSTNSYNC_CLK_AUD_UAIF0_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_AUD_UAIF1_RSTNSYNC, "gout_aud_uaif1_rstnsync",
++	     "mout_aud_uaif1",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_RSTNSYNC_CLK_AUD_UAIF1_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_AUD_UAIF2_RSTNSYNC, "gout_aud_uaif2_rstnsync",
++	     "mout_aud_uaif2",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_RSTNSYNC_CLK_AUD_UAIF2_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_AUD_UAIF3_RSTNSYNC, "gout_aud_uaif3_rstnsync",
++	     "mout_aud_uaif3",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_RSTNSYNC_CLK_AUD_UAIF3_IPCLKPORT_CLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_AUD_SYSMMU_CLK, "gout_aud_sysmmu_clk", "dout_aud_bus",
++	     CLK_CON_GAT_GOUT_BLK_AUD_UID_SMMU_AUD_IPCLKPORT_CLK, 21,
++	     CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_GOUT_AUD_CODEC_MCLK, "gout_aud_codec_mclk", "dout_aud_mclk",
++	     CLK_CON_GAT_CLK_BLK_AUD_UID_DFTMUX_AUD_IPCLKPORT_AUD_CODEC_MCLK,
++	     21, 0, 0),
++	GATE(CLK_GOUT_AUD_DMIC_CLK, "gout_aud_dmic_clk", "dout_aud_dmic",
++	     CLK_CON_GAT_CLK_BLK_AUD_UID_DMIC_IPCLKPORT_CLK, 21, 0, 0),
++};
++
++static const struct samsung_cmu_info aud_cmu_info __initconst = {
++	.pll_clks		= aud_pll_clks,
++	.nr_pll_clks		= ARRAY_SIZE(aud_pll_clks),
++	.mux_clks		= aud_mux_clks,
++	.nr_mux_clks		= ARRAY_SIZE(aud_mux_clks),
++	.div_clks		= aud_div_clks,
++	.nr_div_clks		= ARRAY_SIZE(aud_div_clks),
++	.gate_clks		= aud_gate_clks,
++	.nr_gate_clks		= ARRAY_SIZE(aud_gate_clks),
++	.fixed_clks		= aud_fixed_clks,
++	.nr_fixed_clks		= ARRAY_SIZE(aud_fixed_clks),
++	.nr_clk_ids		= CLK_NR_AUD,
++	.clk_regs		= aud_clk_regs,
++	.nr_clk_regs		= ARRAY_SIZE(aud_clk_regs),
++	.auto_clock_gate	= true,
++	.gate_dbg_offset	= EXYNOS9820_GATE_DBG_OFFSET,
++	.option_offset		= AUD_CMU_AUD_CONTROLLER_OPTION,
++};
++
+ /*
+  * Register offsets for CMU_DPU (0x19000000)
+  */
+@@ -4012,12 +4573,51 @@ static const struct samsung_cmu_info cpucl2_cmu_info __initconst = {
+ 	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
+ };
+ 
++/*
++ * A CMU inside a switchable power domain (CMU_AUD in PD_AUD) is probed at
++ * core_initcall, before genpd can be used, and its registers hang the bus
++ * while the domain is off. If the bootloader left the domain off, switch
++ * it on the way the PMU sequence does (CONFIGURATION = 1, wait for
++ * STATUS); the domain node is given as "samsung,power-domain" (not
++ * "power-domains", which would make this __init probe defer).
++ */
++static int __init exynos9820_cmu_power_on(struct device *dev)
++{
++	struct device_node *pd_np;
++	void __iomem *pd;
++	u32 val;
++	int ret = 0;
++
++	pd_np = of_parse_phandle(dev->of_node, "samsung,power-domain", 0);
++	if (!pd_np)
++		return 0;
++
++	pd = of_iomap(pd_np, 0);
++	of_node_put(pd_np);
++	if (!pd)
++		return -ENOMEM;
++
++	if (!(readl(pd + 0x4) & 0x1)) {
++		dev_info(dev, "power domain is off, switching it on\n");
++		writel(0x1, pd);
++		ret = readl_poll_timeout_atomic(pd + 0x4, val, val & 0x1, 1,
++						10000);
++		if (ret)
++			dev_err(dev, "power domain did not come up (%#x)\n", val);
++	}
++	iounmap(pd);
++
++	return ret;
++}
++
+ static int __init exynos9820_cmu_probe(struct platform_device *pdev)
+ {
+ 	const struct samsung_cmu_info *info;
+ 	struct device *dev = &pdev->dev;
+ 
+ 	info = of_device_get_match_data(dev);
++	if (exynos9820_cmu_power_on(dev))
++		return -ENODEV;	/* registers not accessible */
+ 	exynos_arm64_register_cmu(dev, dev->of_node, info);
+ 
+ 	return 0;
+@@ -4048,6 +4648,9 @@ static const struct of_device_id exynos9820_cmu_of_match[] = {
+ 	}, {
+ 		.compatible = "samsung,exynos9820-cmu-g3d",
+ 		.data = &g3d_cmu_info,
++	}, {
++		.compatible = "samsung,exynos9820-cmu-aud",
++		.data = &aud_cmu_info,
+ 	}, {
+ 		.compatible = "samsung,exynos9820-cmu-dpu",
+ 		.data = &dpu_cmu_info,
+diff --git a/drivers/clk/samsung/clk-pll.c b/drivers/clk/samsung/clk-pll.c
+index 0dd918c93b..567414dd89 100644
+--- a/drivers/clk/samsung/clk-pll.c
++++ b/drivers/clk/samsung/clk-pll.c
+@@ -542,6 +542,16 @@ static const struct clk_ops samsung_pll0822x_clk_min_ops = {
+ #define PLL0831X_LOCK_STAT_SHIFT	(29)
+ #define PLL0831X_ENABLE_SHIFT		(31)
+ 
++/*
++ * PMS sit in the register given as con_reg. K is two registers further
++ * (PLL_CON5 next to PLL_CON3) on Exynos850/gs101, but three registers
++ * further on Exynos9820 (PLL_CON0 holds PMS, PLL_CON3 holds K): pll_0831x_k3.
++ */
++static void __iomem *samsung_pll0831x_k_reg(struct samsung_clk_pll *pll)
++{
++	return pll->con_reg + (pll->type == pll_0831x_k3 ? 0xc : 0x8);
++}
++
+ static unsigned long samsung_pll0831x_recalc_rate(struct clk_hw *hw,
+ 						  unsigned long parent_rate)
+ {
+@@ -551,7 +561,7 @@ static unsigned long samsung_pll0831x_recalc_rate(struct clk_hw *hw,
+ 	u64 fvco = parent_rate;
+ 
+ 	pll_con3 = readl_relaxed(pll->con_reg);
+-	pll_con5 = readl_relaxed(pll->con_reg + 8);
++	pll_con5 = readl_relaxed(samsung_pll0831x_k_reg(pll));
+ 	mdiv = (pll_con3 >> PLL0831X_MDIV_SHIFT) & PLL0831X_MDIV_MASK;
+ 	pdiv = (pll_con3 >> PLL0831X_PDIV_SHIFT) & PLL0831X_PDIV_MASK;
+ 	sdiv = (pll_con3 >> PLL0831X_SDIV_SHIFT) & PLL0831X_SDIV_MASK;
+@@ -580,7 +590,7 @@ static int samsung_pll0831x_set_rate(struct clk_hw *hw, unsigned long drate,
+ 	}
+ 
+ 	pll_con3 = readl_relaxed(pll->con_reg);
+-	pll_con5 = readl_relaxed(pll->con_reg + 8);
++	pll_con5 = readl_relaxed(samsung_pll0831x_k_reg(pll));
+ 
+ 	/* Change PLL PMSK values */
+ 	pll_con3 &= ~((PLL0831X_MDIV_MASK << PLL0831X_MDIV_SHIFT) |
+@@ -601,7 +611,7 @@ static int samsung_pll0831x_set_rate(struct clk_hw *hw, unsigned long drate,
+ 
+ 	/* Write PMSK values */
+ 	writel_relaxed(pll_con3, pll->con_reg);
+-	writel_relaxed(pll_con5, pll->con_reg + 8);
++	writel_relaxed(pll_con5, samsung_pll0831x_k_reg(pll));
+ 
+ 	/* Wait for PLL lock if the PLL is enabled */
+ 	if (pll_con3 & BIT(pll->enable_offs))
+@@ -1684,6 +1694,7 @@ static void __init _samsung_clk_register_pll(struct samsung_clk_provider *ctx,
+ 			init.ops = &samsung_pll36xx_clk_ops;
+ 		break;
+ 	case pll_0831x:
++	case pll_0831x_k3:
+ 		pll->enable_offs = PLL0831X_ENABLE_SHIFT;
+ 		pll->lock_offs = PLL0831X_LOCK_STAT_SHIFT;
+ 		if (!pll->rate_count)
+diff --git a/drivers/clk/samsung/clk-pll.h b/drivers/clk/samsung/clk-pll.h
+index fd1aadf69c..f8dcee5e0a 100644
+--- a/drivers/clk/samsung/clk-pll.h
++++ b/drivers/clk/samsung/clk-pll.h
+@@ -40,6 +40,7 @@ enum samsung_pll_type {
+ 	pll_0818x,
+ 	pll_0822x,
+ 	pll_0831x,
++	pll_0831x_k3,
+ 	pll_142xx,
+ 	pll_0516x,
+ 	pll_0517x,
+diff --git a/include/dt-bindings/clock/exynos9820.h b/include/dt-bindings/clock/exynos9820.h
+index 2d8cf72d5e..a98c002c5a 100644
+--- a/include/dt-bindings/clock/exynos9820.h
++++ b/include/dt-bindings/clock/exynos9820.h
+@@ -128,6 +128,62 @@
+ #define CLK_GOUT_PERIC0_XIU_P_PERIC0_ACLK	90
+ #define CLK_NR_PERIC0				91
+ 
++/* CMU_PERIC1 */
++/* camera I2C: IDs from 40 on, clear of the UART/USI ones below */
++#define CLK_MOUT_PERIC1_I2C_CAM1_USER		40
++#define CLK_DOUT_PERIC1_I2C_CAM1		41
++#define CLK_GOUT_PERIC1_I2C_CAM1_CLK		42
++#define CLK_GOUT_PERIC1_I2C_CAM1_IPCLK		43
++#define CLK_GOUT_PERIC1_I2C_CAM1_PCLK		44
++#define CLK_MOUT_PERIC1_I2C_CAM2_USER		45
++#define CLK_DOUT_PERIC1_I2C_CAM2		46
++#define CLK_GOUT_PERIC1_I2C_CAM2_CLK		47
++#define CLK_GOUT_PERIC1_I2C_CAM2_IPCLK		48
++#define CLK_GOUT_PERIC1_I2C_CAM2_PCLK		49
++#define CLK_MOUT_PERIC1_I2C_CAM0_USER		50
++#define CLK_DOUT_PERIC1_I2C_CAM0		51
++#define CLK_GOUT_PERIC1_I2C_CAM0_CLK		52
++#define CLK_GOUT_PERIC1_I2C_CAM0_IPCLK		53
++#define CLK_GOUT_PERIC1_I2C_CAM0_PCLK		54
++#define CLK_MOUT_PERIC1_I2C_CAM3_USER		55
++#define CLK_DOUT_PERIC1_I2C_CAM3		56
++#define CLK_GOUT_PERIC1_I2C_CAM3_CLK		57
++#define CLK_GOUT_PERIC1_I2C_CAM3_IPCLK		58
++#define CLK_GOUT_PERIC1_I2C_CAM3_PCLK		59
++#define CLK_GOUT_PERIC1_USI07_I2C_IPCLK		60
++#define CLK_GOUT_PERIC1_USI07_I2C_PCLK		61
++#define CLK_GOUT_PERIC1_USI08_I2C_IPCLK		62
++#define CLK_GOUT_PERIC1_USI08_I2C_PCLK		63
++#define CLK_NR_PERIC1_CAM			64
++#define CLK_MOUT_PERIC1_BUS_USER		1
++#define CLK_MOUT_PERIC1_UART_BT_USER		2
++#define CLK_DOUT_PERIC1_UART_BT			3
++#define CLK_GOUT_PERIC1_UART_BT_CLK		4
++#define CLK_GOUT_PERIC1_UART_BT_IPCLK		5
++#define CLK_GOUT_PERIC1_UART_BT_PCLK		6
++#define CLK_GOUT_PERIC1_GPIO_PERIC1_PCLK	7
++#define CLK_MOUT_PERIC1_USI_I2C_USER		8
++#define CLK_DOUT_PERIC1_USI_I2C			9
++#define CLK_GOUT_PERIC1_USI_I2C_CLK		10
++#define CLK_GOUT_PERIC1_USI17_I2C_IPCLK		11
++#define CLK_GOUT_PERIC1_USI17_I2C_PCLK		12
++#define CLK_MOUT_PERIC1_USI10_USI_USER		13
++#define CLK_DOUT_PERIC1_USI10_USI		14
++#define CLK_GOUT_PERIC1_USI10_USI_CLK		15
++#define CLK_GOUT_PERIC1_USI10_USI_IPCLK		16
++#define CLK_GOUT_PERIC1_USI10_USI_PCLK		17
++#define CLK_MOUT_PERIC1_USI16_USI_USER		18
++#define CLK_DOUT_PERIC1_USI16_USI		19
++#define CLK_GOUT_PERIC1_USI16_USI_CLK		20
++#define CLK_GOUT_PERIC1_USI16_USI_IPCLK		21
++#define CLK_GOUT_PERIC1_USI16_USI_PCLK		22
++#define CLK_MOUT_PERIC1_USI08_USI_USER		23
++#define CLK_DOUT_PERIC1_USI08_USI		24
++#define CLK_GOUT_PERIC1_USI08_USI_CLK		25
++#define CLK_GOUT_PERIC1_USI08_USI_IPCLK		26
++#define CLK_GOUT_PERIC1_USI08_USI_PCLK		27
++#define CLK_NR_PERIC1				28
++
+ /* CMU_FSYS0A */
+ #define CLK_MOUT_FSYS0A_BUS_USER				1
+ #define CLK_MOUT_FSYS0A_USB31DRD_USER				2
+@@ -506,6 +562,48 @@
+ #define CLK_GOUT_BUSC_XIU_D_BUSC_ACLK				93
+ #define CLK_NR_BUSC						94
+ 
++/* CMU_AUD */
++#define CLK_FOUT_AUD_PLL			1
++#define CLK_MOUT_AUD_PLL			2
++#define CLK_MOUT_AUD_CPU_USER			3
++#define CLK_DOUT_AUD_PLL			4
++#define CLK_MOUT_AUD_CPU			5
++#define CLK_MOUT_AUD_CPU_HCH			6
++#define CLK_DOUT_AUD_AUDIF			7
++#define CLK_DOUT_AUD_BUS			8
++#define CLK_DOUT_AUD_BUSP			9
++#define CLK_DOUT_AUD_CPU_ACLK			10
++#define CLK_DOUT_AUD_CPU_PCLKDBG		11
++#define CLK_DOUT_AUD_CNT			12
++#define CLK_DOUT_AUD_MCLK			13
++#define CLK_DOUT_AUD_DMIC			14
++#define CLK_DOUT_AUD_UAIF0			15
++#define CLK_DOUT_AUD_UAIF1			16
++#define CLK_DOUT_AUD_UAIF2			17
++#define CLK_DOUT_AUD_UAIF3			18
++#define CLK_MOUT_AUD_UAIF0			19
++#define CLK_MOUT_AUD_UAIF1			20
++#define CLK_MOUT_AUD_UAIF2			21
++#define CLK_MOUT_AUD_UAIF3			22
++#define CLK_GOUT_AUD_ABOX_ACLK			23
++#define CLK_GOUT_AUD_CA32_CCLK			24
++#define CLK_GOUT_AUD_ASB_CCLK			25
++#define CLK_GOUT_AUD_DAP_CCLK			26
++#define CLK_GOUT_AUD_CNT_BCLK			27
++#define CLK_GOUT_AUD_UAIF0_BCLK			28
++#define CLK_GOUT_AUD_UAIF1_BCLK			29
++#define CLK_GOUT_AUD_UAIF2_BCLK			30
++#define CLK_GOUT_AUD_UAIF3_BCLK			31
++#define CLK_GOUT_AUD_SYSMMU_CLK			32
++#define CLK_GOUT_AUD_ACLK_IRQ			33
++#define CLK_GOUT_AUD_CODEC_MCLK			34
++#define CLK_GOUT_AUD_DMIC_CLK			35
++#define CLK_GOUT_AUD_UAIF0_RSTNSYNC		36
++#define CLK_GOUT_AUD_UAIF1_RSTNSYNC		37
++#define CLK_GOUT_AUD_UAIF2_RSTNSYNC		38
++#define CLK_GOUT_AUD_UAIF3_RSTNSYNC		39
++#define CLK_NR_AUD				40
++
+ /* CMU_TOP */
+ #define CLK_FOUT_APLL_SHARED0		1
+ #define CLK_FOUT_APLL_SHARED1		2

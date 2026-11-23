@@ -1,0 +1,51 @@
+From fc34aec6b454440177b019325c2596e15b7677d2 Mon Sep 17 00:00:00 2001
+From: chiffathefox <chiffathefoxx@gmail.com>
+Date: Fri, 28 Aug 2026 23:09:10 +0300
+Subject: [PATCH 41/46] clk: exynos9820: add an empty PERIC1 block
+
+(cherry picked from commit b380fa655e9c76d079a41fd60b170defc2586abe)
+---
+ drivers/clk/samsung/clk-exynos9820.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/drivers/clk/samsung/clk-exynos9820.c b/drivers/clk/samsung/clk-exynos9820.c
+index 4f7069b0a9..a9a82d19e6 100644
+--- a/drivers/clk/samsung/clk-exynos9820.c
++++ b/drivers/clk/samsung/clk-exynos9820.c
+@@ -778,6 +778,26 @@ static const struct samsung_cmu_info peric0_cmu_info __initconst = {
+ 	.memclk_offset		= EXYNOS9820_MEMCLK_OFFSET,
+ };
+ 
++/*
++ * Register offsets for CMU_PERIC1 (0x10800000)
++ */
++#define PERIC1_CMU_PERIC1_CONTROLLER_OPTION		0x0800
++
++static const unsigned long peric1_clk_regs[] __initconst = {
++	PERIC1_CMU_PERIC1_CONTROLLER_OPTION,
++};
++
++static const struct samsung_cmu_info peric1_cmu_info __initconst = {
++	.clk_regs		= peric1_clk_regs,
++	.nr_clk_regs		= ARRAY_SIZE(peric1_clk_regs),
++	.clk_name		= "bus",
++	.auto_clock_gate	= true,
++	.gate_dbg_offset	= EXYNOS9820_GATE_DBG_OFFSET,
++	.option_offset		= PERIC1_CMU_PERIC1_CONTROLLER_OPTION,
++	.drcg_offset		= EXYNOS9820_DRCG_EN_OFFSET,
++	.memclk_offset		= EXYNOS9820_MEMCLK_OFFSET,
++};
++
+ /*
+  * Register offsets for CMU_FSYS0A (0x10a00000)
+  */
+@@ -2996,6 +3016,9 @@ static const struct of_device_id exynos9820_cmu_of_match[] = {
+ 	}, {
+ 		.compatible = "samsung,exynos9820-cmu-peric0",
+ 		.data = &peric0_cmu_info,
++	}, {
++		.compatible = "samsung,exynos9820-cmu-peric1",
++		.data = &peric1_cmu_info,
+ 	}, {
+ 		.compatible = "samsung,exynos9820-cmu-fsys0a",
+ 		.data = &fsys0a_cmu_info,

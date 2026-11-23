@@ -1,0 +1,36 @@
+From 8be217e11f6d3782f4a81f4365f80580b519fce9 Mon Sep 17 00:00:00 2001
+From: chiffathefox <chiffathefoxx@gmail.com>
+Date: Wed, 15 Jul 2026 02:42:17 +0300
+Subject: [PATCH 21/46] clk: samsung: acpm: add clk_ops to driver data
+
+Provide ability to customize clock operations for each driver. ACPM
+firmware doesn't behave nicely on all SoCs. For instance, FREQ_GET is
+not supported on exynos9820 and always returns 0kHz no matter what the
+frequency is set to.
+
+(cherry picked from commit 8e3359f850fc4b109917e216345f0ac937a94a5f)
+---
+ drivers/clk/samsung/clk-acpm.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/clk/samsung/clk-acpm.c b/drivers/clk/samsung/clk-acpm.c
+index abba1dfb10..34a12ea0b6 100644
+--- a/drivers/clk/samsung/clk-acpm.c
++++ b/drivers/clk/samsung/clk-acpm.c
+@@ -30,6 +30,7 @@ struct acpm_clk_variant {
+ 
+ struct acpm_clk_driver_data {
+ 	const struct acpm_clk_variant *clks;
++	const struct clk_ops *clk_ops;
+ 	unsigned int nr_clks;
+ 	unsigned int mbox_chan_id;
+ 	/* For SoCs where ACPM firmware doesn't implement get_rate call */
+@@ -149,7 +150,7 @@ static int acpm_clk_register(struct device *dev, struct acpm_clk *aclk,
+ 	struct clk_parent_data pdata = {};
+ 
+ 	init.name = name;
+-	init.ops = &acpm_clk_ops;
++	init.ops = drv_data->clk_ops ?: &acpm_clk_ops;
+ 	aclk->hw.init = &init;
+ 
+ 	/* If get_rate is set, the SoC relies on parent topology */

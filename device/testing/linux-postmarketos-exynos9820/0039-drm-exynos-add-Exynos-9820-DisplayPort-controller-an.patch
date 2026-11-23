@@ -1,0 +1,2626 @@
+From edd3a48463d29f3f20d3d8748d3f591bcc26e267 Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] drm/exynos: add Exynos 9820 DisplayPort controller and DECON2
+ KMS drivers
+
+External display over USB-C DisplayPort alternate mode on the Exynos
+9820, with the bindings of both devices:
+
+ - exynos9820_dp: DisplayPort transmitter as a DRM bridge. AUX
+   channel, link training with rate fallback on top of the combo PHY's
+   DP mode, SST video timing from the display mode, HPD handling as a
+   Type-C mux/orientation switch, lane direction from the USB/DP
+   select GPIO or the Type-C orientation.
+ - exynos9820_decon2: KMS driver for DECON2, the display controller of
+   the DP output. Cold init modelled on the vendor decon/dpp code
+   (DECON0's takeover driver is not touched): one full-screen primary
+   plane on window 4 / IDMA GF1 with XRGB/ARGB/XBGR/ABGR8888, shadow
+   updates latched at frame start, vblank from the frame start
+   interrupt. The window registers live in DECON0's register block,
+   which is mapped without claiming it; the probe refuses if DECON0
+   uses the same window, channel or SRAM banks. Separate DRM device
+   with a bridge connector (EDID/HPD from the DP bridge), mode limits
+   max_width/max_height/max_clock_khz (default 1920x1200, 165 MHz),
+   optional fbdev. The driver only binds with enable=1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../samsung/samsung,exynos9820-decon2.yaml    |   90 ++
+ .../samsung/samsung,exynos9820-dp.yaml        |  110 ++
+ drivers/gpu/drm/Makefile                      |    2 +
+ drivers/gpu/drm/exynos/Kconfig                |   41 +
+ drivers/gpu/drm/exynos/exynos9820_decon2.c    | 1124 ++++++++++++++++
+ drivers/gpu/drm/exynos/exynos9820_dp.c        | 1172 +++++++++++++++++
+ 6 files changed, 2539 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/display/samsung/samsung,exynos9820-decon2.yaml
+ create mode 100644 Documentation/devicetree/bindings/display/samsung/samsung,exynos9820-dp.yaml
+ create mode 100644 drivers/gpu/drm/exynos/exynos9820_decon2.c
+ create mode 100644 drivers/gpu/drm/exynos/exynos9820_dp.c
+
+diff --git a/Documentation/devicetree/bindings/display/samsung/samsung,exynos9820-decon2.yaml b/Documentation/devicetree/bindings/display/samsung/samsung,exynos9820-decon2.yaml
+new file mode 100644
+index 0000000000..7be731bea1
+--- /dev/null
++++ b/Documentation/devicetree/bindings/display/samsung/samsung,exynos9820-decon2.yaml
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/display/samsung/samsung,exynos9820-decon2.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Samsung Exynos 9820 DECON2 display controller (DisplayPort)
++
++maintainers:
++  - StachowiakDawid <dawidos234@gmail.com>
++
++description: |
++  DECON2 is the display controller of the external DisplayPort output of the
++  Exynos 9820. It runs in video mode and is fed by one DPU DMA channel (IDMA
++  GF1) through its DPP; the DisplayPort link controller generates the video
++  timing and pulls the pixels. The blender window registers and the DP
++  connection select live in DECON0's register block, which is shared with
++  the DECON0 node and therefore only mapped, not claimed. Port 0 links to the
++  DisplayPort controller.
++
++properties:
++  compatible:
++    const: samsung,exynos9820-decon2
++
++  reg:
++    items:
++      - description: DECON2 registers
++      - description: DECON0 registers (shared window and DP connection registers)
++      - description: DPU DMA channel GF1 (IDMA)
++      - description: DPP GF1
++
++  reg-names:
++    items:
++      - const: decon
++      - const: decon0
++      - const: dma
++      - const: dpp
++
++  interrupts:
++    minItems: 1
++    items:
++      - description: frame start
++      - description: frame done
++      - description: extra (errors)
++
++  interrupt-names:
++    minItems: 1
++    items:
++      - const: frame_start
++      - const: frame_done
++      - const: extra
++
++  clocks:
++    minItems: 1
++    maxItems: 16
++
++  port:
++    $ref: /schemas/graph.yaml#/properties/port
++    description: Output to the DisplayPort link controller.
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - interrupt-names
++  - port
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++
++    display-controller@19050000 {
++        compatible = "samsung,exynos9820-decon2";
++        reg = <0x19050000 0x10000>, <0x19030000 0x2000>,
++              <0x19072000 0x1000>, <0x19022000 0x1000>;
++        reg-names = "decon", "decon0", "dma", "dpp";
++        interrupts = <GIC_SPI 195 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 196 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 197 IRQ_TYPE_LEVEL_HIGH>;
++        interrupt-names = "frame_start", "frame_done", "extra";
++
++        port {
++            endpoint {
++                remote-endpoint = <&dp_in>;
++            };
++        };
++    };
+diff --git a/Documentation/devicetree/bindings/display/samsung/samsung,exynos9820-dp.yaml b/Documentation/devicetree/bindings/display/samsung/samsung,exynos9820-dp.yaml
+new file mode 100644
+index 0000000000..59d4279014
+--- /dev/null
++++ b/Documentation/devicetree/bindings/display/samsung/samsung,exynos9820-dp.yaml
+@@ -0,0 +1,110 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/display/samsung/samsung,exynos9820-dp.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Samsung Exynos9820 DisplayPort link controller
++
++maintainers:
++  - Dawid Stachowiak <dawidos234@gmail.com>
++
++description:
++  DisplayPort 1.4 SST link controller of the Exynos9820, used for DisplayPort
++  alternate mode over USB-C. The main link goes through the USB/DP combo PHY,
++  the AUX channel through an analog switch onto the connector's SBU pins. The
++  controller acts as the TypeC mode and orientation switch of that SBU path.
++  Video comes from DECON2 (samsung,exynos9820-decon2) over the OF graph.
++
++allOf:
++  - $ref: /schemas/usb/usb-switch.yaml#
++
++properties:
++  compatible:
++    const: samsung,exynos9820-dp
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  clocks: true
++
++  phys:
++    maxItems: 1
++
++  phy-names:
++    const: dp
++
++  aux-enable-gpios:
++    maxItems: 1
++    description: Output enable of the AUX/SBU analog switch.
++
++  sbu-select-gpios:
++    maxItems: 1
++    description: Selects which SBU line pair carries AUX (cable orientation).
++
++  usb-dir-gpios:
++    maxItems: 1
++    description:
++      Input telling the cable orientation (CC1/CC2), the same line the USB/DP
++      combo PHY uses to pick its lane pairs (downstream dp,usb_con_sel). Used
++      for the AUX switch and the PCS lane map; without it the TypeC
++      orientation switch state is used.
++
++  ports:
++    $ref: /schemas/graph.yaml#/properties/ports
++    properties:
++      port@0:
++        $ref: /schemas/graph.yaml#/properties/port
++        description: Video input from DECON2.
++
++      port@1:
++        $ref: /schemas/graph.yaml#/properties/port
++        description: USB-C connector SBU port (TypeC mode/orientation switch).
++
++required:
++  - compatible
++  - reg
++  - phys
++  - phy-names
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++
++    displayport@130b0000 {
++        compatible = "samsung,exynos9820-dp";
++        reg = <0x130b0000 0x10000>;
++        interrupts = <GIC_SPI 248 IRQ_TYPE_LEVEL_HIGH>;
++        phys = <&usbdrd_phy 2>;
++        phy-names = "dp";
++        aux-enable-gpios = <&gpg1 6 GPIO_ACTIVE_LOW>;
++        sbu-select-gpios = <&gpg4 0 GPIO_ACTIVE_HIGH>;
++        usb-dir-gpios = <&gpg0 4 GPIO_ACTIVE_HIGH>;
++        mode-switch;
++        orientation-switch;
++
++        ports {
++            #address-cells = <1>;
++            #size-cells = <0>;
++
++            port@0 {
++                reg = <0>;
++                endpoint {
++                    remote-endpoint = <&decon2_out>;
++                };
++            };
++
++            port@1 {
++                reg = <1>;
++                endpoint {
++                    remote-endpoint = <&usbc_sbu_ep>;
++                };
++            };
++        };
++    };
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index 604d6d3654..91bbc5ee85 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -190,6 +190,8 @@ obj-$(CONFIG_DRM_NOUVEAU) +=nouveau/
+ obj-$(CONFIG_DRM_EXYNOS) +=exynos/
+ obj-$(CONFIG_DRM_EXYNOS9820_DSIM_CMD) += exynos/exynos9820_dsim_cmd.o
+ obj-$(CONFIG_DRM_EXYNOS9820_DECON) += exynos/exynos9820_decon.o
++obj-$(CONFIG_DRM_EXYNOS9820_DP) += exynos/exynos9820_dp.o
++obj-$(CONFIG_DRM_EXYNOS9820_DECON2) += exynos/exynos9820_decon2.o
+ obj-$(CONFIG_DRM_ROCKCHIP) +=rockchip/
+ obj-$(CONFIG_DRM_GMA500) += gma500/
+ obj-$(CONFIG_DRM_UDL) += udl/
+diff --git a/drivers/gpu/drm/exynos/Kconfig b/drivers/gpu/drm/exynos/Kconfig
+index f33cc77114..2e7e3b50ee 100644
+--- a/drivers/gpu/drm/exynos/Kconfig
++++ b/drivers/gpu/drm/exynos/Kconfig
+@@ -38,6 +38,47 @@ config DRM_EXYNOS9820_DECON
+ 
+ 	  If unsure, say N.
+ 
++config DRM_EXYNOS9820_DP
++	tristate "Exynos 9820 DisplayPort controller (USB-C DP alt mode, experimental)"
++	depends on OF && DRM && COMMON_CLK
++	depends on ARCH_EXYNOS || COMPILE_TEST
++	depends on TYPEC
++	select DRM_DISPLAY_HELPER
++	select DRM_DISPLAY_DP_HELPER
++	select DRM_KMS_HELPER
++	select GENERIC_PHY
++	help
++	  DisplayPort SST link controller of the Exynos 9820 (0x130b0000),
++	  used for DisplayPort alternate mode over USB-C together with the
++	  USB/DP combo PHY (phy-exynos5-usbdrd) and a TypeC port driver that
++	  enters DP alt mode (max77705-usbc altmode=1). Provides the AUX
++	  channel, EDID, link training, a BIST test pattern and the DRM
++	  bridge that DECON2 (DRM_EXYNOS9820_DECON2) feeds.
++
++	  If M is selected the module will be called exynos9820_dp.
++
++	  If unsure, say N.
++
++config DRM_EXYNOS9820_DECON2
++	tristate "Exynos 9820 DECON2 KMS driver (DisplayPort output, experimental)"
++	depends on OF && DRM && COMMON_CLK && MMU
++	depends on ARCH_EXYNOS || COMPILE_TEST
++	select DRM_KMS_HELPER
++	select DRM_BRIDGE_CONNECTOR
++	select DRM_DISPLAY_HELPER
++	select DRM_GEM_DMA_HELPER
++	select DRM_CLIENT_SELECTION
++	help
++	  KMS driver for DECON2 of the Exynos 9820, the display controller
++	  of the external (DisplayPort) output: video mode, one full-screen
++	  plane (window 4 <- DPU DMA GF1), the DP link controller
++	  (DRM_EXYNOS9820_DP) as its bridge. It registers a second DRM
++	  device; the probe does nothing unless exynos9820_decon2.enable=1.
++
++	  If M is selected the module will be called exynos9820_decon2.
++
++	  If unsure, say N.
++
+ config DRM_EXYNOS9820_DSIM_CMD
+ 	tristate "Exynos 9820 DSIM command-only host (bootloader handover)"
+ 	depends on OF && DRM && COMMON_CLK
+diff --git a/drivers/gpu/drm/exynos/exynos9820_decon2.c b/drivers/gpu/drm/exynos/exynos9820_decon2.c
+new file mode 100644
+index 0000000000..bc5ab328bf
+--- /dev/null
++++ b/drivers/gpu/drm/exynos/exynos9820_decon2.c
+@@ -0,0 +1,1124 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Exynos 9820 DECON2 KMS driver: the external display (DisplayPort) path.
++ *
++ * Status: FIRST IMPLEMENTATION, UNTESTED ON HARDWARE.
++ *
++ * DECON2 (0x19050000) runs in video mode with DP as its output interface
++ * (out_type DP): the DP link controller (exynos9820_dp, the bridge after this
++ * CRTC) is the video timing master and pulls pixels from DECON2 over the
++ * "LH P-channel"; DECON2 itself has no timing registers, only the frame size.
++ * One plane: blender window 4 fed by DPU DMA channel 2 (IDMA GF1 at
++ * 0x19072000) and DPP GF1 (0x19022000), downstream's default_win = 4,
++ * default_ch = 2 for decon_t.
++ *
++ * Bring-up is a cold init, unlike DECON0 (exynos9820_decon adopts S-Boot's
++ * running pipeline). The sequences follow downstream dpu20/cal_9820:
++ *  - CRTC enable  = decon_reg_init(id 2, out_type DP): clock gating and
++ *    QACTIVE off, DECON0 CLOCK_CONTROL_0 TE_QACTIVE_PLL on, SRAM1-3 shared
++ *    into DECON2 (12K FIFO), video mode, blender/scaled/outfifo size, RGB
++ *    order, DATA_PATH_CONTROL_2 = DECON2_NOCOMP_OUTFIFO0_DPIF, 8 bpc,
++ *    per-frame off, DP_CONNECTION_CONTROL (in DECON0's block) = DECON2->DP0,
++ *    interrupts (decon_reg_set_int);
++ *  - encoder enable (after the DP bridge pre_enable trained the link, set
++ *    the SST1 timing, VIDEO_EN and the LH P-channel) = decon_set_black_window
++ *    + decon_reg_start(): window 4 shows a black colour map, DECON_EN |
++ *    DECON_EN_F, GLOBAL shadow update, wait for RUN_STATUS;
++ *  - plane update = dpp_reg_configure_params() + decon_reg_set_window_control
++ *    + window shadow update, latched by the hardware at the next frame start;
++ *  - encoder disable = decon_reg_stop(): per-frame off + GLOBAL update, wait
++ *    until not running, else instant off; the DP bridge post_disable then
++ *    drops the LH P-channel and VIDEO_EN;
++ *  - CRTC disable = interrupts off, DECON2 + IDMA/DPP software reset.
++ *
++ * Shared resources (downstream writes them through DECON0's register block
++ * with "decon_write(0, ...)"): the blender window registers (WIN_CONTROL_0..
++ * WIN_START_TIME_CONTROL of window 4 at DECON0 + 0x1000 + 4 * 0x30) and
++ * DP_CONNECTION_CONTROL (DECON0 + 0x270). They are mapped without claiming
++ * the region (DECON0's driver owns it). Probe refuses if DECON0 (S-Boot)
++ * uses window 4, channel 2 or the SRAM banks DECON2 needs.
++ *
++ * There is no IOMMU in front (the DPU SYSMMUs are left in bypass, as for
++ * DECON0), so buffers must be physically contiguous below 4 GiB (CMA).
++ *
++ * Safety: probe does nothing unless exynos9820_decon2.enable=1 (default 0),
++ * and the DT node is disabled by default. The DPU clocks are referenced at
++ * probe and never released: they are shared with DECON0's live scanout and
++ * the clock core would gate them on the last disable.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/scatterlist.h>
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_bridge_connector.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_fbdev_dma.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_of.h>
++#include <drm/drm_print.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_simple_kms_helper.h>
++#include <drm/drm_vblank.h>
++#include <drm/clients/drm_client_setup.h>
++
++/* DECON registers (regs-decon.h), DECON2 block */
++#define GLOBAL_CONTROL				0x0000
++#define  GLOBAL_CONTROL_SRESET			BIT(28)
++#define  GLOBAL_CONTROL_TEN_BPC_MODE		BIT(20)
++#define  GLOBAL_CONTROL_OPERATION_MODE_CMD	BIT(8)
++#define  GLOBAL_CONTROL_IDLE_STATUS		BIT(5)
++#define  GLOBAL_CONTROL_RUN_STATUS		BIT(4)
++#define  GLOBAL_CONTROL_DECON_EN		BIT(1)
++#define  GLOBAL_CONTROL_DECON_EN_F		BIT(0)
++#define SRAM_SHARE_ENABLE			0x0030
++#define  SRAM0_SHARE_ENABLE			BIT(12)
++#define  SRAM1_SHARE_ENABLE			BIT(16)
++#define  SRAM2_SHARE_ENABLE			BIT(20)
++#define  SRAM3_SHARE_ENABLE			BIT(24)
++#define INTERRUPT_ENABLE			0x0040
++#define  DPU_FRAME_DONE_INT_EN			BIT(13)
++#define  DPU_FRAME_START_INT_EN			BIT(12)
++#define  DPU_EXTRA_INT_EN			BIT(4)
++#define  DPU_INT_EN				BIT(0)
++#define  INTERRUPT_ENABLE_MASK			0x3011
++#define EXTRA_INTERRUPT_ENABLE			0x0044
++#define  DPU_RESOURCE_CONFLICT_INT_EN		BIT(8)
++#define  DPU_TIME_OUT_INT_EN			BIT(4)
++#define INTERRUPT_PENDING			0x004c
++#define  DPU_FRAME_DONE_INT_PEND		BIT(13)
++#define  DPU_FRAME_START_INT_PEND		BIT(12)
++#define  DPU_EXTRA_INT_PEND			BIT(4)
++#define EXTRA_INTERRUPT_PENDING			0x0050
++#define  DPU_RESOURCE_CONFLICT_INT_PEND		BIT(8)
++#define  DPU_TIME_OUT_INT_PEND			BIT(4)
++#define SHADOW_REG_UPDATE_REQ			0x0060
++#define  SHADOW_REG_UPDATE_REQ_GLOBAL		BIT(31)
++#define  SHADOW_REG_UPDATE_REQ_WIN(w)		BIT(w)
++#define HW_SW_TRIG_CONTROL			0x0070
++#define  HW_TRIG_EN				BIT(0)
++#define SCALED_SIZE_CONTROL_0			0x00a0
++#define CLOCK_CONTROL_0				0x00f0
++#define  CLOCK_CONTROL_0_CG_MASK		0x11111
++#define  CLOCK_CONTROL_0_QACTIVE_MASK		(BIT(24) | BIT(28))
++#define  CLOCK_CONTROL_0_TE_QACTIVE_PLL_ON	BIT(28)
++#define OUTFIFO_SIZE_CONTROL_0			0x0120
++#define OUTFIFO_TH_CONTROL_0			0x012c
++#define  OUTFIFO_TH_MASK			GENMASK(2, 0)
++#define  OUTFIFO_TH_1H				5
++#define OUTFIFO_DATA_ORDER_CONTROL		0x0130
++#define  OUTFIFO_PIXEL_ORDER_SWAP		GENMASK(6, 4)
++#define  DECON_RGB				0
++#define BLENDER_BG_IMAGE_SIZE_0			0x0200
++#define BLENDER_BG_IMAGE_COLOR_0		0x0208
++#define BLENDER_BG_IMAGE_COLOR_1		0x020c
++#define DATA_PATH_CONTROL_0			0x0214
++#define  WIN_MAPCOLOR_EN_F(w)			BIT(4 * (w) + 1)
++#define  WIN_EN_F(w)				BIT(4 * (w))
++#define DATA_PATH_CONTROL_1			0x0218
++#define  WIN_CHMAP_MASK(w)			(0x7 << (4 * (w)))
++#define DATA_PATH_CONTROL_2			0x0230
++#define  SCALER_PATH_MASK			GENMASK(25, 24)
++#define  COMP_OUTIF_PATH_MASK			GENMASK(7, 0)
++#define  DECON2_NOCOMP_OUTFIFO0_DPIF		0x008
++#define DP_CONNECTION_CONTROL			0x0270	/* DECON0 block */
++#define  DP_CONNECTION_SEL_DP0			GENMASK(2, 0)
++#define FRAME_COUNT				0x02a0
++/* blender windows (DECON0 block on the 9820, see the header comment) */
++#define WIN_CONTROL_0(w)			(0x1000 + (w) * 0x30)
++#define  WIN_ALPHA1				GENMASK(31, 24)
++#define  WIN_ALPHA0				GENMASK(23, 16)
++#define  WIN_FUNC				GENMASK(11, 8)
++#define  PD_FUNC_COPY				1
++#define  WIN_ALPHA_MULT_SRC_SEL			GENMASK(1, 0)
++#define  ALPHA_MULT_SRC_SEL_AF			2
++#define WIN_START_POSITION(w)			(0x1008 + (w) * 0x30)
++#define WIN_END_POSITION(w)			(0x100c + (w) * 0x30)
++#define  WIN_PTR_Y				GENMASK(29, 16)
++#define  WIN_PTR_X				GENMASK(13, 0)
++#define WIN_COLORMAP_0(w)			(0x1010 + (w) * 0x30)
++#define WIN_COLORMAP_1(w)			(0x1014 + (w) * 0x30)
++#define WIN_START_TIME_CONTROL(w)		(0x1018 + (w) * 0x30)
++
++#define DECON_SIZE(w, h)	(((u32)(h) << 16) | (w))
++
++/* IDMA (regs-dpp.h), one 4K block per channel */
++#define IDMA_ENABLE				0x0000
++#define  IDMA_SRESET				BIT(24)
++#define  IDMA_SRAM_CLOCK_GATE_EN		BIT(9)
++#define IDMA_IRQ				0x0004
++#define  IDMA_ALL_IRQ_CLEAR			(0x3fb << 16)
++#define  IDMA_ALL_IRQ_MASK			(0x3fb << 1)
++#define  IDMA_IRQ_ENABLE			BIT(0)
++#define IDMA_IN_CON				0x0008
++#define  IDMA_IMG_FORMAT			GENMASK(16, 11)
++#define  IDMA_ROTATION				GENMASK(10, 8)
++#define  IDMA_AFBC_EN				BIT(7)
++#define  IDMA_BLOCK_EN				BIT(3)
++#define IDMA_OUT_CON				0x000c
++#define  IDMA_OUT_FRAME_ALPHA			GENMASK(31, 24)
++#define IDMA_SRC_SIZE				0x0010
++#define  IDMA_SRC_HEIGHT			GENMASK(29, 16)
++#define  IDMA_SRC_WIDTH				GENMASK(15, 0)
++#define IDMA_SRC_OFFSET				0x0014
++#define  IDMA_SRC_OFFSET_Y			GENMASK(28, 16)
++#define  IDMA_SRC_OFFSET_X			GENMASK(12, 0)
++#define IDMA_IMG_SIZE				0x0018
++#define  IDMA_IMG_HEIGHT			GENMASK(28, 16)
++#define  IDMA_IMG_WIDTH				GENMASK(12, 0)
++#define IDMA_IN_BASE_ADDR_Y			0x0040
++#define IDMA_IN_BASE_ADDR_C			0x0044
++#define IDMA_DYNAMIC_GATING_EN			0x0058
++#define  IDMA_DG_EN_ALL				GENMASK(26, 0)
++#define IDMA_SHADOW_OFFSET			0x0800
++
++#define IDMA_IMG_FORMAT_XRGB8888		4
++#define IDMA_IMG_FORMAT_XBGR8888		5
++
++/* DPP (regs-dpp.h) */
++#define DPP_ENABLE				0x0000
++#define  DPP_SRSET				BIT(24)
++#define  DPP_ALL_CLOCK_GATE_EN_MASK		GENMASK(10, 8)
++#define DPP_IRQ					0x0004
++#define  DPP_ALL_IRQ_CLEAR			(0x21 << 16)
++#define  DPP_ALL_IRQ_MASK			(0x21 << 1)
++#define  DPP_IRQ_ENABLE				BIT(0)
++#define DPP_IN_CON				0x0008
++#define  DPP_ALPHA_SEL				BIT(3)
++#define  DPP_IMG_FORMAT				GENMASK(2, 0)
++#define  DPP_IMG_FORMAT_ARGB8888		0
++#define DPP_IMG_SIZE				0x0018
++#define  DPP_IMG_HEIGHT				GENMASK(28, 16)
++#define  DPP_IMG_WIDTH				GENMASK(12, 0)
++#define DPP_DYNAMIC_GATING_EN			0x0a54
++#define  DPP_DG_EN_ALL				GENMASK(6, 0)
++#define DPP_LINECNT_CON				0x0d00
++#define  DPP_LC_MODE				BIT(1)
++#define  DPP_LC_ENABLE				BIT(0)
++
++#define DECON2_WIN		4	/* downstream decon_t default_win */
++#define DECON2_CH		2	/* default_ch: GF1 */
++
++static bool enable;
++module_param(enable, bool, 0644);
++MODULE_PARM_DESC(enable, "Drive DECON2 for DisplayPort output (default: false, the probe does nothing)");
++
++static bool fbdev;
++module_param(fbdev, bool, 0444);
++MODULE_PARM_DESC(fbdev, "Register fbdev emulation on the DP card (default: false)");
++
++static unsigned int max_width = 1920;
++module_param(max_width, uint, 0644);
++MODULE_PARM_DESC(max_width, "Largest mode width offered (default 1920, hardware limit 4096)");
++
++static unsigned int max_height = 1200;
++module_param(max_height, uint, 0644);
++MODULE_PARM_DESC(max_height, "Largest mode height offered (default 1200)");
++
++static unsigned int max_clock_khz = 165000;
++module_param(max_clock_khz, uint, 0644);
++MODULE_PARM_DESC(max_clock_khz, "Largest pixel clock offered in kHz (default 165000: up to 1080p60/1920x1200@60 RB)");
++
++struct decon2_format {
++	u32 drm;
++	u32 hw;
++};
++
++/* alpha formats fetched as X: a single opaque plane over the background */
++static const struct decon2_format decon2_formats[] = {
++	{ DRM_FORMAT_XRGB8888, IDMA_IMG_FORMAT_XRGB8888 },
++	{ DRM_FORMAT_ARGB8888, IDMA_IMG_FORMAT_XRGB8888 },
++	{ DRM_FORMAT_XBGR8888, IDMA_IMG_FORMAT_XBGR8888 },
++	{ DRM_FORMAT_ABGR8888, IDMA_IMG_FORMAT_XBGR8888 },
++};
++
++static const u32 decon2_plane_formats[] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_ABGR8888,
++};
++
++struct decon2 {
++	struct drm_device drm;
++	struct drm_plane plane;
++	struct drm_crtc crtc;
++	struct drm_encoder *encoder;
++	struct drm_bridge *bridge;
++	struct drm_connector *connector;
++
++	void __iomem *regs;		/* DECON2 */
++	void __iomem *decon0;		/* DECON0 block: windows, DP_CONNECTION */
++	void __iomem *idma;		/* IDMA GF1 (channel 2) */
++	void __iomem *dpp;		/* DPP GF1 */
++	struct clk_bulk_data *clks;
++	int nclks;
++	int irq, irq_done, irq_extra;
++	atomic_t irq_count;
++
++	unsigned int width, height, vrefresh;
++	bool hw_on;			/* CRTC enabled: initialised, IRQs on */
++	bool running;			/* DECON2 started */
++	bool vblank_enabled;
++	struct drm_pending_vblank_event *event;	/* under drm.event_lock */
++};
++
++#define to_decon2(d) container_of(d, struct decon2, drm)
++
++static u32 d2_read(struct decon2 *d, u32 reg)
++{
++	return readl(d->regs + reg);
++}
++
++static void d2_write(struct decon2 *d, u32 reg, u32 val)
++{
++	writel(val, d->regs + reg);
++}
++
++static void d2_mask(struct decon2 *d, u32 reg, u32 val, u32 mask)
++{
++	writel((readl(d->regs + reg) & ~mask) | (val & mask), d->regs + reg);
++}
++
++static void d0_mask(struct decon2 *d, u32 reg, u32 val, u32 mask)
++{
++	writel((readl(d->decon0 + reg) & ~mask) | (val & mask), d->decon0 + reg);
++}
++
++/* window register block: DECON0's, as downstream */
++static void __iomem *d2_win(struct decon2 *d, u32 reg)
++{
++	return d->decon0 + reg;
++}
++
++static void idma_mask(struct decon2 *d, u32 reg, u32 val, u32 mask)
++{
++	writel((readl(d->idma + reg) & ~mask) | (val & mask), d->idma + reg);
++}
++
++static void dpp_mask(struct decon2 *d, u32 reg, u32 val, u32 mask)
++{
++	writel((readl(d->dpp + reg) & ~mask) | (val & mask), d->dpp + reg);
++}
++
++static void decon2_update_req(struct decon2 *d, u32 mask)
++{
++	d2_mask(d, SHADOW_REG_UPDATE_REQ, mask, mask);
++}
++
++/* ------------------------------------------------------------------ */
++/* IRQ / vblank                                                        */
++
++static void decon2_complete_flip(struct decon2 *d)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&d->drm.event_lock, flags);
++	if (d->event && !(d2_read(d, SHADOW_REG_UPDATE_REQ) &
++			  (SHADOW_REG_UPDATE_REQ_GLOBAL |
++			   SHADOW_REG_UPDATE_REQ_WIN(DECON2_WIN)))) {
++		drm_crtc_send_vblank_event(&d->crtc, d->event);
++		d->event = NULL;
++		drm_crtc_vblank_put(&d->crtc);
++	}
++	spin_unlock_irqrestore(&d->drm.event_lock, flags);
++}
++
++static irqreturn_t decon2_irq(int irq, void *arg)
++{
++	struct decon2 *d = arg;
++	u32 pend = d2_read(d, INTERRUPT_PENDING);
++
++	pend &= DPU_FRAME_START_INT_PEND | DPU_FRAME_DONE_INT_PEND |
++		DPU_EXTRA_INT_PEND;
++	if (!pend)
++		return IRQ_NONE;
++	d2_write(d, INTERRUPT_PENDING, pend);	/* write 1 to clear */
++
++	if (pend & DPU_EXTRA_INT_PEND) {
++		u32 ext = d2_read(d, EXTRA_INTERRUPT_PENDING);
++
++		d2_write(d, EXTRA_INTERRUPT_PENDING, ext);
++		if (ext & DPU_RESOURCE_CONFLICT_INT_PEND)
++			dev_warn_ratelimited(d->drm.dev, "DECON2 resource conflict\n");
++		if (ext & DPU_TIME_OUT_INT_PEND)
++			dev_warn_ratelimited(d->drm.dev, "DECON2 timeout\n");
++	}
++
++	if (pend & DPU_FRAME_START_INT_PEND) {
++		atomic_inc(&d->irq_count);
++		if (READ_ONCE(d->vblank_enabled))
++			drm_crtc_handle_vblank(&d->crtc);
++	}
++	if (pend & (DPU_FRAME_START_INT_PEND | DPU_FRAME_DONE_INT_PEND))
++		decon2_complete_flip(d);
++
++	return IRQ_HANDLED;
++}
++
++static int decon2_enable_vblank(struct drm_crtc *crtc)
++{
++	WRITE_ONCE(to_decon2(crtc->dev)->vblank_enabled, true);
++	return 0;
++}
++
++static void decon2_disable_vblank(struct drm_crtc *crtc)
++{
++	WRITE_ONCE(to_decon2(crtc->dev)->vblank_enabled, false);
++}
++
++/* decon_reg_set_int() */
++static void decon2_set_int(struct decon2 *d, bool on)
++{
++	d2_mask(d, INTERRUPT_PENDING, ~0u,
++		DPU_FRAME_DONE_INT_PEND | DPU_FRAME_START_INT_PEND);
++	d2_mask(d, EXTRA_INTERRUPT_PENDING, ~0u,
++		DPU_RESOURCE_CONFLICT_INT_PEND | DPU_TIME_OUT_INT_PEND);
++	if (on) {
++		d2_mask(d, INTERRUPT_ENABLE, DPU_FRAME_DONE_INT_EN |
++			DPU_FRAME_START_INT_EN | DPU_EXTRA_INT_EN | DPU_INT_EN,
++			INTERRUPT_ENABLE_MASK);
++		d2_write(d, EXTRA_INTERRUPT_ENABLE,
++			 DPU_RESOURCE_CONFLICT_INT_EN | DPU_TIME_OUT_INT_EN);
++	} else {
++		d2_mask(d, INTERRUPT_ENABLE, 0, INTERRUPT_ENABLE_MASK);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* hardware sequences                                                  */
++
++static void decon2_log(struct decon2 *d, const char *what)
++{
++	dev_info(d->drm.dev,
++		 "%s: GC %08x DP0 %08x SRAM %08x/%08x PATH0 %08x PATH1 %08x PATH2 %08x BG %08x FRAME %u REQ %08x PEND %08x irqs %d; IDMA EN %08x IRQ %08x IN_CON %08x base %08x/%08x\n",
++		 what, d2_read(d, GLOBAL_CONTROL),
++		 readl(d->decon0 + DP_CONNECTION_CONTROL),
++		 readl(d->decon0 + SRAM_SHARE_ENABLE), d2_read(d, SRAM_SHARE_ENABLE),
++		 d2_read(d, DATA_PATH_CONTROL_0), d2_read(d, DATA_PATH_CONTROL_1),
++		 d2_read(d, DATA_PATH_CONTROL_2), d2_read(d, BLENDER_BG_IMAGE_SIZE_0),
++		 d2_read(d, FRAME_COUNT), d2_read(d, SHADOW_REG_UPDATE_REQ),
++		 d2_read(d, INTERRUPT_PENDING), atomic_read(&d->irq_count),
++		 readl(d->idma + IDMA_ENABLE), readl(d->idma + IDMA_IRQ),
++		 readl(d->idma + IDMA_IN_CON), readl(d->idma + IDMA_IN_BASE_ADDR_Y),
++		 readl(d->idma + IDMA_SHADOW_OFFSET + IDMA_IN_BASE_ADDR_Y));
++}
++
++static int decon2_reset(struct decon2 *d)
++{
++	u32 val;
++
++	d2_mask(d, GLOBAL_CONTROL, GLOBAL_CONTROL_SRESET, GLOBAL_CONTROL_SRESET);
++	if (readl_poll_timeout(d->regs + GLOBAL_CONTROL, val,
++			       !(val & GLOBAL_CONTROL_SRESET), 10, 20000)) {
++		dev_err(d->drm.dev, "DECON2 reset timeout (%08x)\n", val);
++		return -EBUSY;
++	}
++	return 0;
++}
++
++/* dpp_reg_init(IDMA | DPP) for GF1 */
++static void decon2_dpp_init(struct decon2 *d)
++{
++	idma_mask(d, IDMA_IRQ, 0, IDMA_ALL_IRQ_MASK);
++	idma_mask(d, IDMA_IRQ, IDMA_IRQ_ENABLE, IDMA_IRQ_ENABLE);
++	idma_mask(d, IDMA_ENABLE, 0, IDMA_SRAM_CLOCK_GATE_EN);
++	/* QoS LUTs are DPU_DMA common (shared with DECON0): left as S-Boot set them */
++	idma_mask(d, IDMA_DYNAMIC_GATING_EN, 0, IDMA_DG_EN_ALL);
++	idma_mask(d, IDMA_OUT_CON, FIELD_PREP(IDMA_OUT_FRAME_ALPHA, 0xff),
++		  IDMA_OUT_FRAME_ALPHA);
++
++	dpp_mask(d, DPP_IRQ, 0, DPP_ALL_IRQ_MASK);
++	dpp_mask(d, DPP_IRQ, DPP_IRQ_ENABLE, DPP_IRQ_ENABLE);
++	dpp_mask(d, DPP_ENABLE, 0, DPP_ALL_CLOCK_GATE_EN_MASK);
++	dpp_mask(d, DPP_DYNAMIC_GATING_EN, 0, DPP_DG_EN_ALL);
++	dpp_mask(d, DPP_LINECNT_CON, DPP_LC_ENABLE, DPP_LC_MODE | DPP_LC_ENABLE);
++}
++
++/* dpp_reg_deinit(reset = true) for GF1 */
++static void decon2_dpp_deinit(struct decon2 *d)
++{
++	u32 val;
++
++	idma_mask(d, IDMA_IRQ, IDMA_ALL_IRQ_CLEAR, IDMA_ALL_IRQ_CLEAR);
++	idma_mask(d, IDMA_IRQ, IDMA_ALL_IRQ_MASK, IDMA_ALL_IRQ_MASK);
++	dpp_mask(d, DPP_IRQ, DPP_ALL_IRQ_CLEAR, DPP_ALL_IRQ_CLEAR);
++	dpp_mask(d, DPP_IRQ, DPP_ALL_IRQ_MASK, DPP_ALL_IRQ_MASK);
++
++	idma_mask(d, IDMA_ENABLE, IDMA_SRESET, IDMA_SRESET);
++	dpp_mask(d, DPP_ENABLE, DPP_SRSET, DPP_SRSET);
++	if (readl_poll_timeout(d->idma + IDMA_ENABLE, val, !(val & IDMA_SRESET),
++			       10, 100000))
++		dev_warn(d->drm.dev, "IDMA GF1 reset timeout\n");
++	if (readl_poll_timeout(d->dpp + DPP_ENABLE, val, !(val & DPP_SRSET),
++			       10, 100000))
++		dev_warn(d->drm.dev, "DPP GF1 reset timeout\n");
++}
++
++/* decon_reg_set_window_control() for a black colour-map window */
++static void decon2_black_window(struct decon2 *d)
++{
++	unsigned int w = DECON2_WIN;
++
++	writel(FIELD_PREP(WIN_FUNC, PD_FUNC_COPY) |
++	       FIELD_PREP(WIN_ALPHA_MULT_SRC_SEL, ALPHA_MULT_SRC_SEL_AF),
++	       d2_win(d, WIN_CONTROL_0(w)));
++	writel(0, d2_win(d, WIN_START_POSITION(w)));
++	writel(FIELD_PREP(WIN_PTR_Y, d->height - 1) |
++	       FIELD_PREP(WIN_PTR_X, d->width - 1), d2_win(d, WIN_END_POSITION(w)));
++	writel(0, d2_win(d, WIN_START_TIME_CONTROL(w)));
++	/* colour map: A[23:16] R[9:0] / G[25:16] B[9:0], black, opaque */
++	writel(0xff << 16, d2_win(d, WIN_COLORMAP_0(w)));
++	writel(0, d2_win(d, WIN_COLORMAP_1(w)));
++
++	d2_mask(d, DATA_PATH_CONTROL_1, DECON2_CH << (4 * w), WIN_CHMAP_MASK(w));
++	d2_mask(d, DATA_PATH_CONTROL_0, WIN_EN_F(w) | WIN_MAPCOLOR_EN_F(w),
++		WIN_EN_F(w) | WIN_MAPCOLOR_EN_F(w));
++}
++
++/* decon_reg_init(id 2, out_type DP, video mode, no DSC) */
++static int decon2_hw_init(struct decon2 *d)
++{
++	int ret;
++
++	ret = decon2_reset(d);
++	if (ret)
++		return ret;
++
++	/* decon_reg_set_clkgate_mode(0): no auto clock gating, QACTIVE dynamic */
++	d2_mask(d, CLOCK_CONTROL_0, 0,
++		CLOCK_CONTROL_0_CG_MASK | CLOCK_CONTROL_0_QACTIVE_MASK);
++	/* decon_reg_set_te_qactive_pll_mode(1): writes DECON0 (id 0) */
++	d0_mask(d, CLOCK_CONTROL_0, CLOCK_CONTROL_0_TE_QACTIVE_PLL_ON,
++		CLOCK_CONTROL_0_TE_QACTIVE_PLL_ON);
++	/* DECON_FIFO_12K for id 2 */
++	d2_write(d, SRAM_SHARE_ENABLE,
++		 SRAM1_SHARE_ENABLE | SRAM2_SHARE_ENABLE | SRAM3_SHARE_ENABLE);
++	d2_mask(d, GLOBAL_CONTROL, 0, GLOBAL_CONTROL_OPERATION_MODE_CMD);
++	d2_write(d, BLENDER_BG_IMAGE_SIZE_0, DECON_SIZE(d->width, d->height));
++	d2_write(d, BLENDER_BG_IMAGE_COLOR_0, 0xff << 16);	/* opaque black */
++	d2_write(d, BLENDER_BG_IMAGE_COLOR_1, 0);
++	d2_write(d, SCALED_SIZE_CONTROL_0, DECON_SIZE(d->width, d->height));
++	/* decon_reg_configure_trigger(HW): meaningless in video mode, as downstream */
++	d2_mask(d, HW_SW_TRIG_CONTROL, HW_TRIG_EN, HW_TRIG_EN);
++
++	/* decon_reg_configure_lcd() */
++	d2_mask(d, OUTFIFO_DATA_ORDER_CONTROL,
++		FIELD_PREP(OUTFIFO_PIXEL_ORDER_SWAP, DECON_RGB),
++		OUTFIFO_PIXEL_ORDER_SWAP);
++	d2_mask(d, DATA_PATH_CONTROL_2, DECON2_NOCOMP_OUTFIFO0_DPIF,
++		SCALER_PATH_MASK | COMP_OUTIF_PATH_MASK);
++	d2_write(d, OUTFIFO_SIZE_CONTROL_0, DECON_SIZE(d->width, d->height));
++	d2_mask(d, OUTFIFO_TH_CONTROL_0, OUTFIFO_TH_1H, OUTFIFO_TH_MASK);
++	d2_mask(d, GLOBAL_CONTROL, 0, GLOBAL_CONTROL_TEN_BPC_MODE);	/* 8 bpc */
++	d2_mask(d, GLOBAL_CONTROL, 0, GLOBAL_CONTROL_DECON_EN_F);	/* per-frame off */
++
++	decon2_set_int(d, false);
++	/* decon_reg_set_interface(): DECON2 -> DP0, in DECON0's block */
++	d0_mask(d, DP_CONNECTION_CONTROL, FIELD_PREP(DP_CONNECTION_SEL_DP0, 2),
++		DP_CONNECTION_SEL_DP0);
++
++	decon2_dpp_init(d);
++	return 0;
++}
++
++/* decon_reg_start() (the DP LH P-channel is already up, bridge pre_enable) */
++static int decon2_start(struct decon2 *d)
++{
++	u32 val;
++	int ret;
++
++	decon2_black_window(d);
++	decon2_update_req(d, SHADOW_REG_UPDATE_REQ_WIN(DECON2_WIN));
++
++	d2_mask(d, GLOBAL_CONTROL, GLOBAL_CONTROL_DECON_EN | GLOBAL_CONTROL_DECON_EN_F,
++		GLOBAL_CONTROL_DECON_EN | GLOBAL_CONTROL_DECON_EN_F);
++	decon2_update_req(d, SHADOW_REG_UPDATE_REQ_GLOBAL);
++	ret = readl_poll_timeout(d->regs + GLOBAL_CONTROL, val,
++				 val & GLOBAL_CONTROL_RUN_STATUS, 10, 20000);
++	if (ret)
++		dev_err(d->drm.dev,
++			"DECON2 not running (GC %08x): DP stream/LH P-channel not pulling pixels?\n",
++			val);
++	d->running = !ret;
++	return ret;
++}
++
++/* decon_reg_stop(): per-frame off, else instant off */
++static void decon2_stop(struct decon2 *d)
++{
++	unsigned int ms = (d->vrefresh ? 1000 / d->vrefresh : 17) * 12 / 10 + 5;
++	u32 val;
++
++	d0_mask(d, CLOCK_CONTROL_0, 0, CLOCK_CONTROL_0_TE_QACTIVE_PLL_ON);
++
++	d2_mask(d, GLOBAL_CONTROL, 0, GLOBAL_CONTROL_DECON_EN_F);
++	decon2_update_req(d, SHADOW_REG_UPDATE_REQ_GLOBAL);
++	if (readl_poll_timeout(d->regs + GLOBAL_CONTROL, val,
++			       !(val & GLOBAL_CONTROL_RUN_STATUS), 100, ms * 1000)) {
++		dev_warn(d->drm.dev, "per-frame stop timeout (GC %08x), instant off\n", val);
++		d2_mask(d, GLOBAL_CONTROL, 0,
++			GLOBAL_CONTROL_DECON_EN | GLOBAL_CONTROL_DECON_EN_F);
++		decon2_update_req(d, SHADOW_REG_UPDATE_REQ_GLOBAL);
++		if (readl_poll_timeout(d->regs + GLOBAL_CONTROL, val,
++				       !(val & GLOBAL_CONTROL_RUN_STATUS), 100,
++				       ms * 1000))
++			dev_err(d->drm.dev, "DECON2 does not stop (GC %08x)\n", val);
++	}
++	d->running = false;
++}
++
++/* ------------------------------------------------------------------ */
++/* plane                                                               */
++
++static const struct decon2_format *decon2_find_format(u32 fourcc)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(decon2_formats); i++)
++		if (decon2_formats[i].drm == fourcc)
++			return &decon2_formats[i];
++	return NULL;
++}
++
++static int decon2_plane_atomic_check(struct drm_plane *plane,
++				     struct drm_atomic_commit *state)
++{
++	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_framebuffer *fb = ps->fb;
++	struct drm_gem_dma_object *obj;
++	struct drm_crtc_state *cs;
++	int ret;
++
++	if (!ps->crtc)
++		return 0;
++	cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
++	if (WARN_ON(!cs))
++		return -EINVAL;
++
++	ret = drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING,
++						  DRM_PLANE_NO_SCALING,
++						  false, true);
++	if (ret || !ps->visible)
++		return ret;
++
++	/* one full-screen window, no positioning (panning via src x/y is fine) */
++	if (ps->dst.x1 || ps->dst.y1 ||
++	    drm_rect_width(&ps->dst) != cs->mode.hdisplay ||
++	    drm_rect_height(&ps->dst) != cs->mode.vdisplay)
++		return -EINVAL;
++
++	if (fb->pitches[0] % fb->format->cpp[0] ||
++	    fb->pitches[0] / fb->format->cpp[0] > FIELD_MAX(IDMA_SRC_WIDTH) ||
++	    fb->height > FIELD_MAX(IDMA_SRC_HEIGHT) ||
++	    (ps->src.x1 >> 16) > FIELD_MAX(IDMA_SRC_OFFSET_X) ||
++	    (ps->src.y1 >> 16) > FIELD_MAX(IDMA_SRC_OFFSET_Y))
++		return -EINVAL;
++
++	obj = drm_fb_dma_get_gem_obj(fb, 0);
++	if (obj->dma_addr + fb->offsets[0] + (u64)fb->pitches[0] * fb->height > SZ_4G)
++		return -EINVAL;	/* 32-bit IDMA address, no IOMMU */
++	return 0;
++}
++
++/* dpp_reg_configure_params() + decon_reg_set_window_control() */
++static void decon2_plane_atomic_update(struct drm_plane *plane,
++				       struct drm_atomic_commit *state)
++{
++	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
++	struct decon2 *d = to_decon2(plane->dev);
++	struct drm_framebuffer *fb = ps->fb;
++	const struct decon2_format *fmt;
++	struct drm_gem_dma_object *obj;
++	unsigned int w = DECON2_WIN;
++	u32 x, y, iw, ih;
++	dma_addr_t addr;
++
++	if (!d->hw_on)
++		return;
++	if (!fb || !ps->visible) {
++		/* no buffer: back to the black colour map, nothing is fetched */
++		d2_mask(d, DATA_PATH_CONTROL_0, WIN_MAPCOLOR_EN_F(w),
++			WIN_MAPCOLOR_EN_F(w));
++		return;
++	}
++	fmt = decon2_find_format(fb->format->format);
++	if (WARN_ON(!fmt))
++		return;
++
++	obj = drm_fb_dma_get_gem_obj(fb, 0);
++	addr = obj->dma_addr + fb->offsets[0];
++	x = ps->src.x1 >> 16;
++	y = ps->src.y1 >> 16;
++	iw = drm_rect_width(&ps->src) >> 16;
++	ih = drm_rect_height(&ps->src) >> 16;
++
++	idma_mask(d, IDMA_IN_CON, FIELD_PREP(IDMA_IMG_FORMAT, fmt->hw),
++		  IDMA_IMG_FORMAT | IDMA_ROTATION | IDMA_AFBC_EN | IDMA_BLOCK_EN);
++	writel(FIELD_PREP(IDMA_SRC_OFFSET_Y, y) | FIELD_PREP(IDMA_SRC_OFFSET_X, x),
++	       d->idma + IDMA_SRC_OFFSET);
++	writel(FIELD_PREP(IDMA_SRC_HEIGHT, fb->height) |
++	       FIELD_PREP(IDMA_SRC_WIDTH, fb->pitches[0] / fb->format->cpp[0]),
++	       d->idma + IDMA_SRC_SIZE);
++	writel(FIELD_PREP(IDMA_IMG_HEIGHT, ih) | FIELD_PREP(IDMA_IMG_WIDTH, iw),
++	       d->idma + IDMA_IMG_SIZE);
++	writel(lower_32_bits(addr), d->idma + IDMA_IN_BASE_ADDR_Y);
++	writel(lower_32_bits(addr), d->idma + IDMA_IN_BASE_ADDR_C);
++
++	dpp_mask(d, DPP_IN_CON, FIELD_PREP(DPP_IMG_FORMAT, DPP_IMG_FORMAT_ARGB8888),
++		 DPP_ALPHA_SEL | DPP_IMG_FORMAT);	/* per-frame alpha */
++	writel(FIELD_PREP(DPP_IMG_HEIGHT, ih) | FIELD_PREP(DPP_IMG_WIDTH, iw),
++	       d->dpp + DPP_IMG_SIZE);
++
++	/* window: fetch from the channel instead of the colour map */
++	d2_mask(d, DATA_PATH_CONTROL_1, DECON2_CH << (4 * w), WIN_CHMAP_MASK(w));
++	d2_mask(d, DATA_PATH_CONTROL_0, WIN_EN_F(w),
++		WIN_EN_F(w) | WIN_MAPCOLOR_EN_F(w));
++}
++
++static const struct drm_plane_helper_funcs decon2_plane_helper_funcs = {
++	.atomic_check = decon2_plane_atomic_check,
++	.atomic_update = decon2_plane_atomic_update,
++};
++
++static const struct drm_plane_funcs decon2_plane_funcs = {
++	.update_plane = drm_atomic_helper_update_plane,
++	.disable_plane = drm_atomic_helper_disable_plane,
++	.destroy = drm_plane_cleanup,
++	.atomic_create_state = drm_atomic_helper_plane_create_state,
++	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
++};
++
++/* ------------------------------------------------------------------ */
++/* CRTC / encoder                                                      */
++
++static enum drm_mode_status decon2_crtc_mode_valid(struct drm_crtc *crtc,
++						   const struct drm_display_mode *mode)
++{
++	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
++		return MODE_NO_INTERLACE;
++	if (mode->hdisplay > min(max_width, 4096u) || mode->hdisplay < 16)
++		return MODE_BAD_HVALUE;
++	if (mode->vdisplay > min(max_height, 4096u) || mode->vdisplay < 16)
++		return MODE_BAD_VVALUE;
++	if (max_clock_khz && mode->clock > max_clock_khz)
++		return MODE_CLOCK_HIGH;
++	return MODE_OK;
++}
++
++/* Commit order (commit_tail_rpm): CRTC enable -> bridge pre_enable (DP
++ * stream + LH) -> encoder enable (DECON2 start) -> planes; disable:
++ * encoder disable (DECON2 stop) -> bridge post_disable (LH off) -> CRTC. */
++static void decon2_crtc_atomic_enable(struct drm_crtc *crtc,
++				      struct drm_atomic_commit *state)
++{
++	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
++	struct decon2 *d = to_decon2(crtc->dev);
++
++	d->width = cs->adjusted_mode.hdisplay;
++	d->height = cs->adjusted_mode.vdisplay;
++	d->vrefresh = drm_mode_vrefresh(&cs->adjusted_mode);
++	if (decon2_hw_init(d))
++		return;
++	d->hw_on = true;
++	decon2_set_int(d, true);
++	drm_crtc_vblank_on(crtc);
++	decon2_log(d, "init");
++}
++
++static void decon2_crtc_atomic_disable(struct drm_crtc *crtc,
++				       struct drm_atomic_commit *state)
++{
++	struct decon2 *d = to_decon2(crtc->dev);
++	unsigned long flags;
++
++	drm_crtc_vblank_off(crtc);
++	if (d->hw_on) {
++		decon2_set_int(d, false);
++		d2_mask(d, DATA_PATH_CONTROL_0, 0,
++			WIN_EN_F(DECON2_WIN) | WIN_MAPCOLOR_EN_F(DECON2_WIN));
++		decon2_dpp_deinit(d);
++		if (!d->running)
++			decon2_reset(d);
++		d->hw_on = false;
++	}
++
++	spin_lock_irqsave(&d->drm.event_lock, flags);
++	if (d->event) {
++		drm_crtc_send_vblank_event(crtc, d->event);
++		d->event = NULL;
++		drm_crtc_vblank_put(crtc);
++	}
++	if (crtc->state->event && !crtc->state->active) {
++		drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		crtc->state->event = NULL;
++	}
++	spin_unlock_irqrestore(&d->drm.event_lock, flags);
++}
++
++static void decon2_crtc_atomic_flush(struct drm_crtc *crtc,
++				     struct drm_atomic_commit *state)
++{
++	struct decon2 *d = to_decon2(crtc->dev);
++	struct drm_pending_vblank_event *event = crtc->state->event;
++	unsigned long flags;
++
++	if (!crtc->state->active || !d->hw_on)
++		return;
++
++	/* latched by the hardware at the next frame start */
++	decon2_update_req(d, SHADOW_REG_UPDATE_REQ_WIN(DECON2_WIN));
++	if (!event)
++		return;
++	crtc->state->event = NULL;
++
++	spin_lock_irqsave(&d->drm.event_lock, flags);
++	if (d->running && drm_crtc_vblank_get(crtc) == 0) {
++		WARN_ON(d->event);
++		d->event = event;
++	} else {
++		drm_crtc_send_vblank_event(crtc, event);
++	}
++	spin_unlock_irqrestore(&d->drm.event_lock, flags);
++}
++
++static void decon2_encoder_atomic_enable(struct drm_encoder *encoder,
++					 struct drm_atomic_commit *state)
++{
++	struct decon2 *d = to_decon2(encoder->dev);
++	u32 frame;
++
++	if (!d->hw_on)
++		return;
++	decon2_start(d);
++	frame = d2_read(d, FRAME_COUNT);
++	msleep(50);
++	dev_info(d->drm.dev, "started %ux%u@%u: %u frames, %d frame-start irqs in 50 ms\n",
++		 d->width, d->height, d->vrefresh, d2_read(d, FRAME_COUNT) - frame,
++		 atomic_read(&d->irq_count));
++	decon2_log(d, "start");
++}
++
++static void decon2_encoder_atomic_disable(struct drm_encoder *encoder,
++					  struct drm_atomic_commit *state)
++{
++	struct decon2 *d = to_decon2(encoder->dev);
++
++	if (d->running)
++		decon2_stop(d);
++	decon2_log(d, "stop");
++}
++
++static const struct drm_encoder_helper_funcs decon2_encoder_helper_funcs = {
++	.atomic_enable = decon2_encoder_atomic_enable,
++	.atomic_disable = decon2_encoder_atomic_disable,
++};
++
++static const struct drm_crtc_helper_funcs decon2_crtc_helper_funcs = {
++	.mode_valid = decon2_crtc_mode_valid,
++	.atomic_enable = decon2_crtc_atomic_enable,
++	.atomic_disable = decon2_crtc_atomic_disable,
++	.atomic_flush = decon2_crtc_atomic_flush,
++};
++
++static const struct drm_crtc_funcs decon2_crtc_funcs = {
++	.destroy = drm_crtc_cleanup,
++	.set_config = drm_atomic_helper_set_config,
++	.page_flip = drm_atomic_helper_page_flip,
++	.atomic_create_state = drm_atomic_helper_crtc_create_state,
++	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
++	.enable_vblank = decon2_enable_vblank,
++	.disable_vblank = decon2_disable_vblank,
++};
++
++/* ------------------------------------------------------------------ */
++/* driver                                                              */
++
++static const struct drm_mode_config_funcs decon2_mode_config_funcs = {
++	.fb_create = drm_gem_fb_create,
++	.atomic_check = drm_atomic_helper_check,
++	.atomic_commit = drm_atomic_helper_commit,
++};
++
++static const struct drm_mode_config_helper_funcs decon2_mode_config_helpers = {
++	.atomic_commit_tail = drm_atomic_helper_commit_tail_rpm,
++};
++
++/* as exynos9820_decon: only buffers the IDMA can read in place */
++static struct drm_gem_object *
++decon2_prime_import_sg_table(struct drm_device *dev,
++			     struct dma_buf_attachment *attach,
++			     struct sg_table *sgt)
++{
++	struct scatterlist *sg;
++	unsigned int i;
++
++	for_each_sgtable_dma_sg(sgt, sg, i) {
++		dma_addr_t addr = sg_dma_address(sg);
++
++		if (!sg_page(sg) || addr != sg_phys(sg) ||
++		    addr + sg_dma_len(sg) > SZ_4G)
++			return ERR_PTR(-EINVAL);
++	}
++	return drm_gem_dma_prime_import_sg_table(dev, attach, sgt);
++}
++
++DEFINE_DRM_GEM_DMA_FOPS(decon2_fops);
++
++static const struct drm_driver decon2_driver = {
++	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.fops = &decon2_fops,
++	.dumb_create = drm_gem_dma_dumb_create,
++	.gem_prime_import_sg_table = decon2_prime_import_sg_table,
++	DRM_FBDEV_DMA_DRIVER_OPS,
++	/* "exynos" so that Mesa's kmsro pairs it with panfrost, as DECON0 */
++	.name = "exynos",
++	.desc = "Exynos 9820 DECON2 (DisplayPort)",
++	.major = 0,
++	.minor = 1,
++};
++
++static void __iomem *decon2_map(struct platform_device *pdev, const char *name)
++{
++	struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++
++	if (!res)
++		return IOMEM_ERR_PTR(-EINVAL);
++	/* shared with DECON0's node/driver: map without claiming the region */
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res)) ?:
++	       IOMEM_ERR_PTR(-ENOMEM);
++}
++
++/*
++ * DECON0 belongs to S-Boot / exynos9820_decon: make sure it does not use what
++ * DECON2 is about to take (window 4, channel 2, SRAM banks 1-3).
++ */
++static int decon2_check_decon0(struct decon2 *d)
++{
++	struct device *dev = d->drm.dev;
++	u32 path0 = readl(d->decon0 + DATA_PATH_CONTROL_0);
++	u32 path1 = readl(d->decon0 + DATA_PATH_CONTROL_1);
++	u32 sram = readl(d->decon0 + SRAM_SHARE_ENABLE);
++	unsigned int w;
++
++	dev_info(dev, "DECON0: GC %08x PATH0 %08x PATH1 %08x SRAM %08x DP_CONNECTION %08x; DECON2 GC %08x SRAM %08x\n",
++		 readl(d->decon0 + GLOBAL_CONTROL), path0, path1, sram,
++		 readl(d->decon0 + DP_CONNECTION_CONTROL), d2_read(d, GLOBAL_CONTROL),
++		 d2_read(d, SRAM_SHARE_ENABLE));
++
++	if (path0 & (WIN_EN_F(DECON2_WIN) | WIN_MAPCOLOR_EN_F(DECON2_WIN))) {
++		dev_err(dev, "DECON0 uses window %u\n", DECON2_WIN);
++		return -EBUSY;
++	}
++	for (w = 0; w < 6; w++)
++		if ((path0 & WIN_EN_F(w)) &&
++		    ((path1 & WIN_CHMAP_MASK(w)) >> (4 * w)) == DECON2_CH) {
++			dev_err(dev, "DECON0 window %u fetches from channel %u\n",
++				w, DECON2_CH);
++			return -EBUSY;
++		}
++	if (sram & (SRAM1_SHARE_ENABLE | SRAM2_SHARE_ENABLE | SRAM3_SHARE_ENABLE)) {
++		dev_err(dev, "DECON0 shares SRAM banks DECON2 needs (%08x)\n", sram);
++		return -EBUSY;
++	}
++	if (d2_read(d, GLOBAL_CONTROL) & GLOBAL_CONTROL_RUN_STATUS)
++		dev_warn(dev, "DECON2 already running at probe\n");
++	return 0;
++}
++
++static int decon2_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct drm_device *drm;
++	struct decon2 *d;
++	int ret;
++
++	if (!enable) {
++		dev_info(dev, "disabled (exynos9820_decon2.enable=0)\n");
++		return -ENODEV;
++	}
++
++	d = devm_drm_dev_alloc(dev, &decon2_driver, struct decon2, drm);
++	if (IS_ERR(d))
++		return PTR_ERR(d);
++	drm = &d->drm;
++	platform_set_drvdata(pdev, d);
++
++	d->regs = devm_platform_ioremap_resource_byname(pdev, "decon");
++	if (IS_ERR(d->regs))
++		return PTR_ERR(d->regs);
++	d->decon0 = decon2_map(pdev, "decon0");
++	if (IS_ERR(d->decon0))
++		return PTR_ERR(d->decon0);
++	d->idma = decon2_map(pdev, "dma");
++	if (IS_ERR(d->idma))
++		return PTR_ERR(d->idma);
++	d->dpp = decon2_map(pdev, "dpp");
++	if (IS_ERR(d->dpp))
++		return PTR_ERR(d->dpp);
++
++	d->irq = platform_get_irq_byname(pdev, "frame_start");
++	if (d->irq < 0)
++		return d->irq;
++	d->irq_done = platform_get_irq_byname_optional(pdev, "frame_done");
++	d->irq_extra = platform_get_irq_byname_optional(pdev, "extra");
++
++	/* the DP controller (bridge) first: it defers until exynos9820_dp is up */
++	d->bridge = devm_drm_of_get_bridge(dev, dev->of_node, 0, 0);
++	if (IS_ERR(d->bridge))
++		return dev_err_probe(dev, PTR_ERR(d->bridge),
++				     "no DP bridge on port 0\n");
++
++	/* never released, see the header comment */
++	d->nclks = devm_clk_bulk_get_all(dev, &d->clks);
++	if (d->nclks < 0)
++		return dev_err_probe(dev, d->nclks, "failed to get clocks\n");
++	ret = clk_bulk_prepare_enable(d->nclks, d->clks);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to enable clocks\n");
++
++	ret = decon2_check_decon0(d);
++	if (ret)
++		return ret;
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	ret = drmm_mode_config_init(drm);
++	if (ret)
++		return ret;
++	drm->mode_config.min_width = 16;
++	drm->mode_config.min_height = 16;
++	drm->mode_config.max_width = 4096;
++	drm->mode_config.max_height = 4096;
++	drm->mode_config.preferred_depth = 24;
++	drm->mode_config.funcs = &decon2_mode_config_funcs;
++	drm->mode_config.helper_private = &decon2_mode_config_helpers;
++
++	ret = drm_universal_plane_init(drm, &d->plane, 1, &decon2_plane_funcs,
++				       decon2_plane_formats,
++				       ARRAY_SIZE(decon2_plane_formats), NULL,
++				       DRM_PLANE_TYPE_PRIMARY, NULL);
++	if (ret)
++		return ret;
++	drm_plane_helper_add(&d->plane, &decon2_plane_helper_funcs);
++
++	ret = drm_crtc_init_with_planes(drm, &d->crtc, &d->plane, NULL,
++					&decon2_crtc_funcs, "decon2");
++	if (ret)
++		return ret;
++	drm_crtc_helper_add(&d->crtc, &decon2_crtc_helper_funcs);
++
++	d->encoder = drmm_plain_encoder_alloc(drm, NULL, DRM_MODE_ENCODER_TMDS, NULL);
++	if (IS_ERR(d->encoder))
++		return PTR_ERR(d->encoder);
++	d->encoder->possible_crtcs = drm_crtc_mask(&d->crtc);
++	drm_encoder_helper_add(d->encoder, &decon2_encoder_helper_funcs);
++
++	ret = drm_bridge_attach(d->encoder, d->bridge, NULL,
++				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
++	if (ret)
++		return ret;
++	d->connector = drm_bridge_connector_init(drm, d->encoder);
++	if (IS_ERR(d->connector))
++		return PTR_ERR(d->connector);
++
++	ret = drm_vblank_init(drm, 1);
++	if (ret)
++		return ret;
++	drm_mode_config_reset(drm);
++
++	decon2_set_int(d, false);
++	ret = devm_request_irq(dev, d->irq, decon2_irq, 0, "decon2-frame-start", d);
++	if (ret)
++		return ret;
++	if (d->irq_done > 0) {
++		ret = devm_request_irq(dev, d->irq_done, decon2_irq, 0,
++				       "decon2-frame-done", d);
++		if (ret)
++			return ret;
++	}
++	if (d->irq_extra > 0) {
++		ret = devm_request_irq(dev, d->irq_extra, decon2_irq, 0,
++				       "decon2-extra", d);
++		if (ret)
++			return ret;
++	}
++
++	ret = drm_dev_register(drm, 0);
++	if (ret)
++		return ret;
++	drm_kms_helper_poll_init(drm);
++
++	if (fbdev)
++		drm_client_setup(drm, NULL);
++
++	dev_info(dev, "DECON2 for DisplayPort registered (untested driver; modes up to %ux%u, %u kHz)\n",
++		 max_width, max_height, max_clock_khz);
++	return 0;
++}
++
++static void decon2_remove(struct platform_device *pdev)
++{
++	struct decon2 *d = platform_get_drvdata(pdev);
++
++	drm_dev_unregister(&d->drm);
++	drm_kms_helper_poll_fini(&d->drm);
++	drm_atomic_helper_shutdown(&d->drm);
++	decon2_set_int(d, false);
++}
++
++static void decon2_shutdown(struct platform_device *pdev)
++{
++	drm_atomic_helper_shutdown(&((struct decon2 *)platform_get_drvdata(pdev))->drm);
++}
++
++static int decon2_suspend(struct device *dev)
++{
++	return drm_mode_config_helper_suspend(&((struct decon2 *)dev_get_drvdata(dev))->drm);
++}
++
++static int decon2_resume(struct device *dev)
++{
++	return drm_mode_config_helper_resume(&((struct decon2 *)dev_get_drvdata(dev))->drm);
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(decon2_pm_ops, decon2_suspend, decon2_resume);
++
++static const struct of_device_id decon2_of_match[] = {
++	{ .compatible = "samsung,exynos9820-decon2" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, decon2_of_match);
++
++static struct platform_driver decon2_platform_driver = {
++	.probe = decon2_probe,
++	.remove = decon2_remove,
++	.shutdown = decon2_shutdown,
++	.driver = {
++		.name = "exynos9820-decon2",
++		.of_match_table = decon2_of_match,
++		.pm = pm_sleep_ptr(&decon2_pm_ops),
++	},
++};
++module_platform_driver(decon2_platform_driver);
++
++MODULE_DESCRIPTION("Exynos 9820 DECON2 KMS driver (DisplayPort output)");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/exynos/exynos9820_dp.c b/drivers/gpu/drm/exynos/exynos9820_dp.c
+new file mode 100644
+index 0000000000..41f6ec9a5d
+--- /dev/null
++++ b/drivers/gpu/drm/exynos/exynos9820_dp.c
+@@ -0,0 +1,1172 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Exynos 9820 DisplayPort 1.4 link controller (SST1), DP alt mode over USB-C.
++ *
++ * Status: FIRST IMPLEMENTATION, UNTESTED ON HARDWARE.
++ *
++ * What is here:
++ *  - AUX channel as a drm_dp_aux (native + I2C-over-AUX, so EDID works);
++ *  - link training (TPS1 clock recovery, TPS2/TPS3 channel equalisation,
++ *    rate fallback 5.4 -> 2.7 -> 1.62 Gb/s) on top of the combo PHY's DP
++ *    mode (phy-exynos5-usbdrd, phy_configure(opts.dp));
++ *  - SST1 video timing/MVID/NVID/active-symbol setup from a drm_display_mode;
++ *  - USB-C side: the controller is a typec mode-switch + orientation-switch
++ *    on the connector's SBU port: it drives the AUX/SBU analog switch
++ *    (downstream dp,aux_sw_oe / dp,sbu_sw_sel), learns the lane count from
++ *    the pin assignment and HPD/IRQ_HPD from the DP status VDO that
++ *    max77705-usbc forwards (altmode=1);
++ *  - a drm_bridge (DETECT | EDID) with the DP node as connector fwnode, so
++ *    drm_connector_oob_hotplug_event() from max77705-usbc reaches it once a
++ *    CRTC drives the bridge.
++ *
++ *  - video from DECON2 (exynos9820_decon2, the CRTC in front of this
++ *    bridge): atomic_pre_enable trains the link, programs the SST1 timing
++ *    (DP is the timing master) and VIDEO_EN, then powers the LH P-channel
++ *    from DECON2 (displayport_reg_lh_p_ch_power(1)); DECON2 starts in its
++ *    encoder enable right after, as downstream decon_reg_start() does.
++ *    atomic_post_disable runs after DECON2 stopped: LH off, VIDEO_EN off.
++ *
++ * What is NOT here (TODO):
++ *  - audio, HDCP, MST, DSC, FEC, PSR, link CTS automation, re-training on
++ *    IRQ_HPD (the link status is read and logged, userspace gets a hotplug
++ *    event and can re-modeset);
++ *  - the DP_LINK interrupt (SPI 248): HPD comes from the TypeC firmware, so
++ *    only error interrupts would be useful; masked for now;
++ *  - clocks: downstream only uses GATE_DPU_DPU via its CAL; mainline has no
++ *    ID for it. Whatever "clocks" the DT gives are enabled.
++ *
++ * Register layout and sequences from the downstream SM-G97x kernel,
++ * drivers/video/fbdev/exynos/dpu20/{displayport_drv.c,
++ * cal_9820/displayport_reg.c, cal_9820/regs-displayport.h}.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/iopoll.h>
++#include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/phy/phy-dp.h>
++#include <linux/platform_device.h>
++#include <linux/usb/typec.h>
++#include <linux/usb/typec_dp.h>
++#include <linux/usb/typec_mux.h>
++#include <linux/workqueue.h>
++
++#include <drm/display/drm_dp_helper.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_state_helper.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_edid.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_print.h>
++#include <drm/drm_probe_helper.h>
++
++/* SYSTEM */
++#define SYSTEM_SW_RESET_CONTROL			0x0004
++#define  SW_RESET				BIT(0)
++#define SYSTEM_CLK_CONTROL			0x0008
++#define SYSTEM_MAIN_LINK_LANE_COUNT		0x0010
++#define SYSTEM_SW_FUNCTION_ENABLE		0x0014
++#define  SW_FUNC_EN				BIT(0)
++#define SYSTEM_COMMON_FUNCTION_ENABLE		0x0018
++#define  PCS_FUNC_EN				BIT(1)
++#define  AUX_FUNC_EN				BIT(0)
++#define SYSTEM_SST1_FUNCTION_ENABLE		0x001c
++#define  SST1_LH_PWR_ON_STATUS			BIT(5)
++#define  SST1_LH_PWR_ON				BIT(4)
++#define  SST1_VIDEO_FUNC_EN			BIT(0)
++#define SYSTEM_HPD_CONTROL			0x0028
++#define  HPD_STATUS				BIT(8)
++#define SYSTEM_PLL_LOCK_CONTROL			0x002c
++#define  PLL_LOCK_STATUS			BIT(4)
++#define SYSTEM_IRQ_COMMON_STATUS		0x0108
++#define SYSTEM_IRQ_COMMON_STATUS_MASK		0x010c
++#define SYSTEM_DEBUG				0x0200
++#define SYSTEM_DEBUG_LH_PCH			0x0204
++
++/* AUX */
++#define AUX_CONTROL				0x1000
++#define  AUX_REPLY_TIMER_MODE			GENMASK(13, 12)
++#define  AUX_TIMEOUT_1800US			3
++#define AUX_TRANSACTION_START			0x1004
++#define  AUX_TRAN_START				BIT(0)
++#define AUX_BUFFER_CLEAR			0x1008
++#define  AUX_BUF_CLR				BIT(0)
++#define AUX_ADDR_ONLY_COMMAND			0x100c
++#define  ADDR_ONLY_CMD				BIT(0)
++#define AUX_REQUEST_CONTROL			0x1010
++#define  REQ_COMM				GENMASK(31, 28)
++#define  REQ_ADDR				GENMASK(27, 8)
++#define  REQ_LENGTH				GENMASK(5, 0)
++#define AUX_COMMAND_CONTROL			0x1014
++#define  DEFER_CTRL_EN				BIT(8)
++#define AUX_MONITOR_1				0x1018
++#define  AUX_CMD_STATUS				GENMASK(11, 8)
++#define AUX_MONITOR_2				0x101c
++#define AUX_TX_DATA_SET0			0x1030
++#define AUX_RX_DATA_SET0			0x1040
++#define AUX_DATA_BUF_COUNT			16
++
++/* PCS */
++#define PCS_CONTROL				0x3000
++#define  LINK_TRAINING_PATTERN_SET		GENMASK(5, 4)
++#define  SCRAMBLE_BYPASS			BIT(0)
++#define PCS_LANE_CONTROL			0x3004
++#define  LANE_MAP(n)				(0x3 << (4 * (n)))
++#define PCS_TEST_PATTERN_CONTROL		0x3008
++#define  LINK_QUALITY_PATTERN_SET		GENMASK(2, 0)
++
++/* SST1 */
++#define SST1_MAIN_CONTROL			0x5000
++#define  MVID_MODE				BIT(11)
++#define  VIDEO_MODE				BIT(6)
++#define  ENHANCED_MODE				BIT(5)
++#define SST1_INTERRUPT_STATUS_SET0		0x5024
++#define SST1_INTERRUPT_STATUS_SET1		0x5028
++#define SST1_INTERRUPT_MASK_SET0		0x502c
++#define SST1_MVID_MASTER_MODE			0x5044
++#define SST1_NVID_MASTER_MODE			0x5048
++#define SST1_MVID_SFR_CONFIGURE			0x504c
++#define SST1_NVID_SFR_CONFIGURE			0x5050
++#define SST1_ACTIVE_SYMBOL_INTEGER_FEC_OFF	0x5080
++#define SST1_ACTIVE_SYMBOL_FRACTION_FEC_OFF	0x5084
++#define SST1_ACTIVE_SYMBOL_THRESHOLD_FEC_OFF	0x5088
++#define SST1_ACTIVE_SYMBOL_THRESHOLD_SEL_FEC_OFF 0x508c
++#define SST1_ACTIVE_SYMBOL_INTEGER_FEC_ON	0x5090
++#define SST1_ACTIVE_SYMBOL_FRACTION_FEC_ON	0x5094
++#define SST1_ACTIVE_SYMBOL_THRESHOLD_FEC_ON	0x5098
++#define SST1_ACTIVE_SYMBOL_THRESHOLD_SEL_FEC_ON	0x509c
++#define SST1_ACTIVE_SYMBOL_MODE_CONTROL		0x5104
++#define SST1_VIDEO_CONTROL			0x5400
++#define  STRM_VALID_FORCE			BIT(9)
++#define  STRM_VALID_CTRL			BIT(8)
++#define  DYNAMIC_RANGE_MODE			BIT(7)
++#define  BPC					GENMASK(6, 4)
++#define  BPC_8					1
++#define  COLOR_FORMAT				GENMASK(3, 2)
++#define  VSYNC_POLARITY				BIT(1)
++#define  HSYNC_POLARITY				BIT(0)
++#define SST1_VIDEO_ENABLE			0x5404
++#define  VIDEO_EN				BIT(0)
++#define SST1_VIDEO_MASTER_TIMING_GEN		0x5408
++#define  VIDEO_MASTER_TIME_GEN			BIT(0)
++#define SST1_VIDEO_HORIZONTAL_TOTAL_PIXELS	0x5414
++#define SST1_VIDEO_VERTICAL_TOTAL_PIXELS	0x5418
++#define SST1_VIDEO_HORIZONTAL_FRONT_PORCH	0x541c
++#define SST1_VIDEO_HORIZONTAL_BACK_PORCH	0x5420
++#define SST1_VIDEO_HORIZONTAL_ACTIVE		0x5424
++#define SST1_VIDEO_VERTICAL_FRONT_PORCH		0x5428
++#define SST1_VIDEO_VERTICAL_BACK_PORCH		0x542c
++#define SST1_VIDEO_VERTICAL_ACTIVE		0x5430
++#define SST1_VIDEO_BIST_CONTROL			0x5450
++#define  CTS_BIST_EN				BIT(17)
++#define  BIST_EN				BIT(3)
++#define  BIST_TYPE				GENMASK(1, 0)
++#define SST1_VIDEO_DEBUG_FSM_STATE		0x5460
++#define SST1_VIDEO_DEBUG_MAPI			0x5464
++#define SST2_INTERRUPT_STATUS_SET0		0x6024
++#define SST2_INTERRUPT_STATUS_SET1		0x6028
++
++static const u8 dp_lane_map[2][4] = {
++	{ 0, 1, 3, 2 },		/* CC1 */
++	{ 3, 2, 0, 1 },		/* CC2 (downstream dp_sw_sel) */
++};
++
++struct exynos_dp {
++	struct device *dev;
++	void __iomem *regs;
++	struct phy *phy;
++	struct clk_bulk_data *clks;
++	int nclks;
++
++	struct gpio_desc *aux_en;	/* AUX/SBU switch output enable */
++	struct gpio_desc *sbu_sel;	/* AUX/SBU switch: CC1/CC2 */
++	struct gpio_desc *usb_dir;	/* gpg0-4, shared with the PHY: CC1/CC2 */
++
++	struct typec_mux_dev *mux;
++	struct typec_switch_dev *sw;
++
++	struct drm_dp_aux aux;
++	struct drm_bridge bridge;
++
++	struct mutex lock;		/* below, and hardware state */
++	struct work_struct hpd_work;
++	struct work_struct report_work;	/* DRM notifications, see exynos_dp_report() */
++	enum drm_connector_status report_st;	/* wanted by hpd_work */
++	bool link_lost;
++	enum typec_orientation orientation;
++	unsigned int max_lanes;		/* from the pin assignment, 0 = no DP */
++	bool hpd;
++	bool irq_hpd;
++	bool aux_on;
++	bool powered;
++	bool trained;
++	bool streaming;
++	bool lh_on;
++	bool flip;			/* latched at power on */
++	enum drm_connector_status reported;	/* last drm_bridge_hpd_notify() */
++	u8 dpcd[DP_RECEIVER_CAP_SIZE];
++	unsigned int rate;		/* Mb/s */
++	unsigned int lanes;
++	const struct drm_edid *edid;
++};
++
++static inline struct exynos_dp *bridge_to_dp(struct drm_bridge *b)
++{
++	return container_of(b, struct exynos_dp, bridge);
++}
++
++static u32 dp_read(struct exynos_dp *dp, u32 reg)
++{
++	return readl(dp->regs + reg);
++}
++
++static void dp_write(struct exynos_dp *dp, u32 reg, u32 val)
++{
++	writel(val, dp->regs + reg);
++}
++
++/* downstream displayport_write_mask(): val is shifted into the field */
++static void dp_write_field(struct exynos_dp *dp, u32 reg, u32 mask, u32 val)
++{
++	u32 old = dp_read(dp, reg);
++
++	dp_write(dp, reg, (old & ~mask) | ((val << __ffs(mask)) & mask));
++}
++
++/*
++ * Downstream displayport_aux_sel(): dp_sw_sel = !gpio(dp,usb_con_sel), the
++ * same gpg0-4 line the combo PHY uses for its USB3/DP lane pairs (the PHY's
++ * flip is !ss_port = !gpg0-4, so both agree). Without the gpio, fall back to
++ * the TypeC orientation reported through the orientation switch.
++ */
++static bool dp_read_flip(struct exynos_dp *dp)
++{
++	if (dp->usb_dir) {
++		int val = gpiod_get_value_cansleep(dp->usb_dir);
++
++		if (val >= 0)
++			return !val;
++	}
++	return dp->orientation == TYPEC_ORIENTATION_REVERSE;
++}
++
++static bool dp_flip(struct exynos_dp *dp)
++{
++	return dp->flip;
++}
++
++/* ------------------------------------------------------------------ */
++/* AUX                                                                 */
++
++static ssize_t exynos_dp_aux_xfer_one(struct exynos_dp *dp,
++				      struct drm_dp_aux_msg *msg,
++				      unsigned int off, size_t len)
++{
++	u8 *buf = msg->buffer;
++	u32 val, m1, m2;
++	unsigned int i;
++	bool read = msg->request & DP_AUX_I2C_READ;	/* also NATIVE_READ */
++	int ret;
++
++	dp_write(dp, AUX_BUFFER_CLEAR, AUX_BUF_CLR);
++	dp_write_field(dp, AUX_COMMAND_CONTROL, DEFER_CTRL_EN, 1);
++	dp_write_field(dp, AUX_CONTROL, AUX_REPLY_TIMER_MODE, AUX_TIMEOUT_1800US);
++	dp_write_field(dp, AUX_ADDR_ONLY_COMMAND, ADDR_ONLY_CMD, len ? 0 : 1);
++
++	/* request code = DP AUX request (I2C 0x0/0x1, MOT 0x4, native 0x8/0x9) */
++	val = FIELD_PREP(REQ_COMM, msg->request & 0xf) |
++	      FIELD_PREP(REQ_ADDR, msg->address) |
++	      FIELD_PREP(REQ_LENGTH, len ? len - 1 : 0);
++	dp_write(dp, AUX_REQUEST_CONTROL, val);
++
++	if (!read && len) {
++		for (i = 0; i < AUX_DATA_BUF_COUNT; i += 4) {
++			u32 w = 0;
++			unsigned int j;
++
++			for (j = 0; j < 4 && i + j < len; j++)
++				w |= buf[off + i + j] << (8 * j);
++			dp_write(dp, AUX_TX_DATA_SET0 + i, w);
++		}
++	}
++
++	dp_write(dp, AUX_TRANSACTION_START, AUX_TRAN_START);
++	ret = readl_poll_timeout(dp->regs + AUX_TRANSACTION_START, val,
++				 !(val & AUX_TRAN_START), 10, 50000);
++	if (ret)
++		return -ETIMEDOUT;
++
++	m1 = dp_read(dp, AUX_MONITOR_1);
++	m2 = dp_read(dp, AUX_MONITOR_2);
++	dp_write_field(dp, AUX_ADDR_ONLY_COMMAND, ADDR_ONLY_CMD, 0);
++	if ((m1 & AUX_CMD_STATUS) || m2) {
++		dev_dbg(dp->dev, "AUX %x@%05x: MONITOR_1 %08x MONITOR_2 %08x\n",
++			msg->request, msg->address, m1, m2);
++		return -EIO;
++	}
++
++	if (read) {
++		for (i = 0; i < len; i++) {
++			if (!(i % 4))
++				val = dp_read(dp, AUX_RX_DATA_SET0 + i);
++			buf[off + i] = val >> (8 * (i % 4));
++		}
++	}
++
++	return len;
++}
++
++static ssize_t exynos_dp_aux_transfer(struct drm_dp_aux *aux,
++				      struct drm_dp_aux_msg *msg)
++{
++	struct exynos_dp *dp = container_of(aux, struct exynos_dp, aux);
++	size_t done = 0;
++	ssize_t ret;
++
++	if (msg->size > AUX_DATA_BUF_COUNT)
++		return -E2BIG;	/* the helpers split into 16-byte chunks */
++
++	mutex_lock(&dp->lock);
++	if (!dp->powered) {
++		mutex_unlock(&dp->lock);
++		return -ENODEV;
++	}
++	ret = exynos_dp_aux_xfer_one(dp, msg, 0, msg->size);
++	mutex_unlock(&dp->lock);
++
++	if (ret < 0)
++		return ret;
++	done = ret;
++
++	/* errors (NACK/DEFER timeout) are reported as -EIO above */
++	msg->reply = (msg->request & DP_AUX_NATIVE_WRITE) ?
++		     DP_AUX_NATIVE_REPLY_ACK : DP_AUX_I2C_REPLY_ACK;
++	return done;
++}
++
++/* ------------------------------------------------------------------ */
++/* controller / PHY power                                              */
++
++static void exynos_dp_aux_switch(struct exynos_dp *dp, bool on)
++{
++	if (on == dp->aux_on)
++		return;
++	/* downstream displayport_aux_sel() + displayport_aux_onoff() */
++	if (on) {
++		dp->flip = dp_read_flip(dp);
++		gpiod_set_value_cansleep(dp->sbu_sel, !dp_flip(dp));
++		gpiod_set_value_cansleep(dp->aux_en, 1);
++		msleep(100);
++	} else {
++		gpiod_set_value_cansleep(dp->aux_en, 0);
++	}
++	dp->aux_on = on;
++}
++
++static void exynos_dp_set_lane_map(struct exynos_dp *dp)
++{
++	const u8 *map = dp_lane_map[dp_flip(dp)];
++	u32 val = 0;
++	int i;
++
++	for (i = 0; i < 4; i++)
++		val |= map[i] << (4 * i);
++	dp_write(dp, PCS_LANE_CONTROL, val);
++}
++
++static int exynos_dp_wait_pll(struct exynos_dp *dp)
++{
++	u32 val;
++	int ret;
++
++	ret = readl_poll_timeout(dp->regs + SYSTEM_PLL_LOCK_CONTROL, val,
++				 val & PLL_LOCK_STATUS, 1, 300);
++	if (ret)
++		dev_err(dp->dev, "PHY PLL not locked (%08x)\n", val);
++	return ret;
++}
++
++/* displayport_reg_lh_p_ch_power(): the LH P-channel from DECON2 */
++static int exynos_dp_lh_power(struct exynos_dp *dp, bool on)
++{
++	u32 val;
++	int ret;
++
++	dp_write_field(dp, SYSTEM_SST1_FUNCTION_ENABLE, SST1_LH_PWR_ON, on);
++	ret = readl_poll_timeout(dp->regs + SYSTEM_SST1_FUNCTION_ENABLE, val,
++				 !!(val & SST1_LH_PWR_ON_STATUS) == on, 1, 20000);
++	if (ret)
++		dev_err(dp->dev,
++			"LH P-channel power %s timeout: SST1_FUNC %08x CLK %08x PLL %08x DEBUG %08x LH_PCH %08x VIDEO_CONTROL %08x FSM %08x MAPI %08x\n",
++			on ? "on" : "off", val, dp_read(dp, SYSTEM_CLK_CONTROL),
++			dp_read(dp, SYSTEM_PLL_LOCK_CONTROL),
++			dp_read(dp, SYSTEM_DEBUG), dp_read(dp, SYSTEM_DEBUG_LH_PCH),
++			dp_read(dp, SST1_VIDEO_CONTROL),
++			dp_read(dp, SST1_VIDEO_DEBUG_FSM_STATE),
++			dp_read(dp, SST1_VIDEO_DEBUG_MAPI));
++	dp->lh_on = on && !ret;
++	return ret;
++}
++
++/* displayport_reg_set_video_bist_mode(0) + displayport_reg_stop() */
++static void exynos_dp_video_stop(struct exynos_dp *dp)
++{
++	dp_write_field(dp, SST1_VIDEO_ENABLE, VIDEO_EN, 0);
++	dp_write_field(dp, SST1_VIDEO_CONTROL, STRM_VALID_FORCE | STRM_VALID_CTRL, 0);
++	dp_write_field(dp, SST1_VIDEO_BIST_CONTROL, BIST_EN, 0);
++	dp->streaming = false;
++}
++
++/* displayport_hpd_changed(1): sw reset + displayport_reg_init() */
++static int exynos_dp_power_on(struct exynos_dp *dp)
++{
++	u32 val;
++	int ret;
++
++	if (dp->powered)
++		return 0;
++
++	ret = clk_bulk_prepare_enable(dp->nclks, dp->clks);
++	if (ret)
++		return ret;
++
++	dp_write_field(dp, SYSTEM_SW_RESET_CONTROL, SW_RESET, 1);
++	if (readl_poll_timeout(dp->regs + SYSTEM_SW_RESET_CONTROL, val,
++			       !(val & SW_RESET), 1, 100))
++		dev_warn(dp->dev, "sw reset timeout\n");
++
++	ret = phy_set_mode(dp->phy, PHY_MODE_DP);
++	if (!ret)
++		ret = phy_power_on(dp->phy);
++	if (ret) {
++		clk_bulk_disable_unprepare(dp->nclks, dp->clks);
++		return ret;
++	}
++	exynos_dp_wait_pll(dp);
++
++	dp_write_field(dp, SYSTEM_COMMON_FUNCTION_ENABLE, PCS_FUNC_EN, 1);
++	dp_write_field(dp, SYSTEM_COMMON_FUNCTION_ENABLE, AUX_FUNC_EN, 1);
++	dp_write_field(dp, SYSTEM_SST1_FUNCTION_ENABLE, SST1_VIDEO_FUNC_EN, 1);
++	dp_write_field(dp, SYSTEM_SW_FUNCTION_ENABLE, SW_FUNC_EN, 1);
++
++	/* HPD comes from the TypeC firmware: keep every interrupt masked */
++	dp_write(dp, SYSTEM_IRQ_COMMON_STATUS, ~0);
++	dp_write(dp, SST1_INTERRUPT_STATUS_SET0, ~0);
++	dp_write(dp, SST1_INTERRUPT_STATUS_SET1, ~0);
++	dp_write(dp, SST2_INTERRUPT_STATUS_SET0, ~0);
++	dp_write(dp, SST2_INTERRUPT_STATUS_SET1, ~0);
++	dp_write(dp, SYSTEM_IRQ_COMMON_STATUS_MASK, 0);
++	dp_write(dp, SST1_INTERRUPT_MASK_SET0, 0);
++
++	exynos_dp_set_lane_map(dp);
++	dp->powered = true;
++	usleep_range(10000, 11000);
++
++	dev_info(dp->dev, "controller on (HPD_CONTROL %08x)\n",
++		 dp_read(dp, SYSTEM_HPD_CONTROL));
++	return 0;
++}
++
++static void exynos_dp_power_off(struct exynos_dp *dp)
++{
++	if (!dp->powered)
++		return;
++
++	if (dp->lh_on)
++		exynos_dp_lh_power(dp, false);
++	exynos_dp_video_stop(dp);
++	dp_write_field(dp, SYSTEM_SW_FUNCTION_ENABLE, SW_FUNC_EN, 0);
++	phy_power_off(dp->phy);
++	clk_bulk_disable_unprepare(dp->nclks, dp->clks);
++	dp->powered = false;
++	dp->trained = false;
++}
++
++/* ------------------------------------------------------------------ */
++/* link training                                                       */
++
++static void exynos_dp_set_pattern(struct exynos_dp *dp, u8 pattern)
++{
++	dp_write_field(dp, PCS_TEST_PATTERN_CONTROL, LINK_QUALITY_PATTERN_SET, 0);
++	dp_write_field(dp, PCS_CONTROL, LINK_TRAINING_PATTERN_SET, pattern);
++	dp_write_field(dp, PCS_CONTROL, SCRAMBLE_BYPASS, pattern ? 1 : 0);
++}
++
++static int exynos_dp_set_drive(struct exynos_dp *dp, const u8 vs[4],
++			       const u8 pe[4])
++{
++	union phy_configure_opts opts = { };
++	u8 set[4];
++	int i;
++
++	for (i = 0; i < dp->lanes; i++) {
++		opts.dp.voltage[i] = vs[i];
++		opts.dp.pre[i] = pe[i];
++		set[i] = (vs[i] << DP_TRAIN_VOLTAGE_SWING_SHIFT) |
++			 (pe[i] << DP_TRAIN_PRE_EMPHASIS_SHIFT);
++		if (vs[i] == 3)
++			set[i] |= DP_TRAIN_MAX_SWING_REACHED;
++		if (pe[i] == 3)
++			set[i] |= DP_TRAIN_MAX_PRE_EMPHASIS_REACHED;
++	}
++	opts.dp.lanes = dp->lanes;
++	opts.dp.set_voltages = 1;
++	phy_configure(dp->phy, &opts);
++
++	return drm_dp_dpcd_write_data(&dp->aux, DP_TRAINING_LANE0_SET, set,
++				      dp->lanes);
++}
++
++static void exynos_dp_get_adjust(struct exynos_dp *dp,
++				 const u8 status[DP_LINK_STATUS_SIZE],
++				 u8 vs[4], u8 pe[4])
++{
++	int i;
++
++	for (i = 0; i < dp->lanes; i++) {
++		vs[i] = drm_dp_get_adjust_request_voltage(status, i) >>
++			DP_TRAIN_VOLTAGE_SWING_SHIFT;
++		pe[i] = drm_dp_get_adjust_request_pre_emphasis(status, i) >>
++			DP_TRAIN_PRE_EMPHASIS_SHIFT;
++	}
++}
++
++static int exynos_dp_train_at(struct exynos_dp *dp, unsigned int rate,
++			      unsigned int lanes)
++{
++	union phy_configure_opts opts = { };
++	u8 status[DP_LINK_STATUS_SIZE];
++	u8 vs[4] = { }, pe[4] = { }, last_vs = 0xff, val[2];
++	bool tps3 = drm_dp_tps3_supported(dp->dpcd);
++	bool enhanced = drm_dp_enhanced_frame_cap(dp->dpcd);
++	int i, tries, ret;
++
++	dp->rate = rate;
++	dp->lanes = lanes;
++
++	/* downstream full_link_training: PHY reset, BW, mode, lane count */
++	dp_write(dp, SYSTEM_MAIN_LINK_LANE_COUNT, lanes);
++	dp_write_field(dp, SST1_MAIN_CONTROL, ENHANCED_MODE, enhanced);
++	opts.dp.link_rate = rate;
++	opts.dp.lanes = lanes;
++	opts.dp.set_rate = 1;
++	opts.dp.set_lanes = 1;
++	ret = phy_configure(dp->phy, &opts);
++	if (ret)
++		return ret;
++
++	val[0] = drm_dp_link_rate_to_bw_code(rate * 100);
++	val[1] = lanes | (enhanced ? DP_LANE_COUNT_ENHANCED_FRAME_EN : 0);
++	ret = drm_dp_dpcd_write_data(&dp->aux, DP_LINK_BW_SET, val, 2);
++	if (ret)
++		return ret;
++
++	ret = exynos_dp_wait_pll(dp);
++	if (ret)
++		return ret;
++
++	/* clock recovery */
++	exynos_dp_set_pattern(dp, DP_TRAINING_PATTERN_1);
++	ret = drm_dp_dpcd_write_byte(&dp->aux, DP_TRAINING_PATTERN_SET,
++				     DP_TRAINING_PATTERN_1 |
++				     DP_LINK_SCRAMBLING_DISABLE);
++	if (ret)
++		return ret;
++
++	for (tries = 0; tries < 16; tries++) {
++		ret = exynos_dp_set_drive(dp, vs, pe);
++		if (ret)
++			return ret;
++		drm_dp_link_train_clock_recovery_delay(&dp->aux, dp->dpcd);
++		ret = drm_dp_dpcd_read_link_status(&dp->aux, status);
++		if (ret)
++			return ret;
++		if (drm_dp_clock_recovery_ok(status, lanes))
++			break;
++		exynos_dp_get_adjust(dp, status, vs, pe);
++		if (vs[0] == last_vs && vs[0] == 3)
++			return -EAGAIN;	/* max swing without CR: lower the rate */
++		last_vs = vs[0];
++	}
++	if (tries == 16)
++		return -EAGAIN;
++
++	/* channel equalisation */
++	exynos_dp_set_pattern(dp, tps3 ? DP_TRAINING_PATTERN_3 :
++					 DP_TRAINING_PATTERN_2);
++	ret = drm_dp_dpcd_write_byte(&dp->aux, DP_TRAINING_PATTERN_SET,
++				     (tps3 ? DP_TRAINING_PATTERN_3 :
++					     DP_TRAINING_PATTERN_2) |
++				     DP_LINK_SCRAMBLING_DISABLE);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < 6; i++) {
++		drm_dp_link_train_channel_eq_delay(&dp->aux, dp->dpcd);
++		ret = drm_dp_dpcd_read_link_status(&dp->aux, status);
++		if (ret)
++			return ret;
++		if (!drm_dp_clock_recovery_ok(status, lanes))
++			return -EAGAIN;
++		if (drm_dp_channel_eq_ok(status, lanes))
++			break;
++		exynos_dp_get_adjust(dp, status, vs, pe);
++		ret = exynos_dp_set_drive(dp, vs, pe);
++		if (ret)
++			return ret;
++	}
++	if (i == 6)
++		return -EAGAIN;
++
++	exynos_dp_set_pattern(dp, DP_TRAINING_PATTERN_DISABLE);
++	return drm_dp_dpcd_write_byte(&dp->aux, DP_TRAINING_PATTERN_SET,
++				      DP_TRAINING_PATTERN_DISABLE);
++}
++
++static int exynos_dp_link_train(struct exynos_dp *dp)
++{
++	static const unsigned int rates[] = { 5400, 2700, 1620 };
++	unsigned int max_rate = drm_dp_max_link_rate(dp->dpcd) / 100;
++	unsigned int lanes = drm_dp_max_lane_count(dp->dpcd);
++	int i, ret = -EINVAL;
++
++	if (dp->max_lanes)
++		lanes = min(lanes, dp->max_lanes);
++	if (lanes == 3)
++		lanes = 2;
++
++	for (i = 0; i < ARRAY_SIZE(rates); i++) {
++		if (rates[i] > max_rate)
++			continue;
++		ret = exynos_dp_train_at(dp, rates[i], lanes);
++		dev_info(dp->dev, "link training %u Mb/s x%u: %d\n",
++			 rates[i], lanes, ret);
++		if (!ret) {
++			dp->trained = true;
++			return 0;
++		}
++		drm_dp_dpcd_write_byte(&dp->aux, DP_TRAINING_PATTERN_SET,
++				       DP_TRAINING_PATTERN_DISABLE);
++		if (ret != -EAGAIN)
++			break;
++	}
++
++	exynos_dp_set_pattern(dp, DP_TRAINING_PATTERN_DISABLE);
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* video                                                               */
++
++/* displayport_reg_set_video_configuration() for a drm_display_mode */
++static void exynos_dp_set_video(struct exynos_dp *dp,
++				const struct drm_display_mode *m)
++{
++	u64 stream_khz = m->clock, ls_khz = dp->rate * 100, tu, tu_on;
++	u32 integer, fraction, thr, int_on, frac_on, thr_on;
++	const u64 one = 10000000000ULL;		/* fixed point 1e10 */
++	u32 bpp = 24;
++
++	dp_write_field(dp, SST1_VIDEO_CONTROL, DYNAMIC_RANGE_MODE, 0); /* VESA */
++	dp_write_field(dp, SST1_VIDEO_CONTROL, BPC, BPC_8);
++	dp_write_field(dp, SST1_VIDEO_CONTROL, COLOR_FORMAT, 0);	/* RGB */
++
++	dp_write(dp, SST1_VIDEO_VERTICAL_TOTAL_PIXELS, m->vtotal);
++	dp_write(dp, SST1_VIDEO_HORIZONTAL_TOTAL_PIXELS, m->htotal);
++	dp_write(dp, SST1_VIDEO_VERTICAL_ACTIVE, m->vdisplay);
++	dp_write(dp, SST1_VIDEO_VERTICAL_FRONT_PORCH, m->vsync_start - m->vdisplay);
++	dp_write(dp, SST1_VIDEO_VERTICAL_BACK_PORCH, m->vtotal - m->vsync_end);
++	dp_write(dp, SST1_VIDEO_HORIZONTAL_ACTIVE, m->hdisplay);
++	dp_write(dp, SST1_VIDEO_HORIZONTAL_FRONT_PORCH, m->hsync_start - m->hdisplay);
++	dp_write(dp, SST1_VIDEO_HORIZONTAL_BACK_PORCH, m->htotal - m->hsync_end);
++	/* downstream: SYNC_POSITIVE = 0, SYNC_NEGATIVE = 1 */
++	dp_write_field(dp, SST1_VIDEO_CONTROL, VSYNC_POLARITY,
++		       !!(m->flags & DRM_MODE_FLAG_NVSYNC));
++	dp_write_field(dp, SST1_VIDEO_CONTROL, HSYNC_POLARITY,
++		       !!(m->flags & DRM_MODE_FLAG_NHSYNC));
++
++	/* displayport_reg_set_video_clock(): M/N in kHz, M halved (2 ppc) */
++	dp_write(dp, SST1_MVID_MASTER_MODE, (u32)stream_khz >> 1);
++	dp_write(dp, SST1_NVID_MASTER_MODE, (u32)ls_khz);
++	dp_write_field(dp, SST1_MAIN_CONTROL, MVID_MODE, 1);
++	dp_write(dp, SST1_MVID_SFR_CONFIGURE, (u32)stream_khz);
++	dp_write(dp, SST1_NVID_SFR_CONFIGURE, (u32)ls_khz);
++
++	/* displayport_reg_set_active_symbol() */
++	dp_write(dp, SST1_ACTIVE_SYMBOL_MODE_CONTROL, 1);
++	dp_write(dp, SST1_ACTIVE_SYMBOL_THRESHOLD_SEL_FEC_OFF, 1);
++	dp_write(dp, SST1_ACTIVE_SYMBOL_THRESHOLD_SEL_FEC_ON, 1);
++	tu = div64_u64(stream_khz * bpp * 32 * one, (u64)dp->lanes * ls_khz * 8);
++	tu_on = div64_u64(tu * 1000, 976);
++	integer = div64_u64(tu, one);
++	fraction = div64_u64(tu - integer * one, 10);
++	int_on = div64_u64(tu_on, one);
++	frac_on = div64_u64(tu_on - int_on * one, 10);
++	thr = integer <= 2 ? 7 : integer <= 5 ? 8 : 9;
++	thr_on = int_on <= 2 ? 7 : int_on <= 5 ? 8 : 9;
++	dp_write(dp, SST1_ACTIVE_SYMBOL_INTEGER_FEC_OFF, integer & 0x3f);
++	dp_write(dp, SST1_ACTIVE_SYMBOL_FRACTION_FEC_OFF, fraction & 0x3fffffff);
++	dp_write(dp, SST1_ACTIVE_SYMBOL_THRESHOLD_FEC_OFF, thr);
++	dp_write(dp, SST1_ACTIVE_SYMBOL_INTEGER_FEC_ON, int_on & 0x3f);
++	dp_write(dp, SST1_ACTIVE_SYMBOL_FRACTION_FEC_ON, frac_on & 0x3fffffff);
++	dp_write(dp, SST1_ACTIVE_SYMBOL_THRESHOLD_FEC_ON, thr_on);
++	dev_dbg(dp->dev, "active symbol %u.%u (thr %u), FEC on %u.%u (thr %u)\n",
++		integer, fraction, thr, int_on, frac_on, thr_on);
++
++	dp_write_field(dp, SST1_VIDEO_MASTER_TIMING_GEN, VIDEO_MASTER_TIME_GEN, 1);
++	dp_write_field(dp, SST1_MAIN_CONTROL, VIDEO_MODE, 0);
++}
++
++/* ------------------------------------------------------------------ */
++/* HPD / TypeC                                                         */
++
++/*
++ * Wait for a pending HPD work (DPCD read after a plug), unless we are that
++ * work. Callers may hold DRM locks (edid_read under mode_config.mutex):
++ * hpd_work itself must therefore never take a DRM lock, all DRM
++ * notifications go through report_work.
++ */
++static void exynos_dp_sync(struct exynos_dp *dp)
++{
++	if (current_work() != &dp->hpd_work)
++		flush_work(&dp->hpd_work);
++}
++
++/*
++ * DRM notifications run from their own work, never from hpd_work: the
++ * connector probe (DRM_IOCTL_MODE_GETCONNECTOR -> get_modes -> edid_read)
++ * holds mode_config.mutex and flushes hpd_work, while drm_bridge_hpd_notify()
++ * -> drm_bridge_connector_hpd_cb() takes mode_config.mutex. Calling it from
++ * hpd_work deadlocked phoc on a dock replug (phoc in flush_work, hpd_work in
++ * drm_bridge_connector_hpd_cb).
++ */
++static void exynos_dp_report_work(struct work_struct *work)
++{
++	struct exynos_dp *dp = container_of(work, struct exynos_dp, report_work);
++	enum drm_connector_status st = READ_ONCE(dp->report_st);
++
++	if (!dp->bridge.dev)
++		return;
++	if (st != dp->reported) {
++		dp->reported = st;
++		/* the bridge connector's hpd_cb also sends the hotplug uevent */
++		drm_bridge_hpd_notify(&dp->bridge, st);
++	}
++	if (xchg(&dp->link_lost, false))
++		drm_kms_helper_hotplug_event(dp->bridge.dev);
++}
++
++/* Tell the DRM connector (bridge connector, OP_HPD) about a real change */
++static void exynos_dp_report(struct exynos_dp *dp, bool connected)
++{
++	WRITE_ONCE(dp->report_st, connected ? connector_status_connected :
++					      connector_status_disconnected);
++	schedule_work(&dp->report_work);
++}
++
++/* IRQ_HPD with a running link: is it still trained? (displayport_hpd_irq_work) */
++static void exynos_dp_check_link(struct exynos_dp *dp)
++{
++	u8 status[DP_LINK_STATUS_SIZE];
++	int ret;
++
++	ret = drm_dp_dpcd_read_link_status(&dp->aux, status);
++	if (ret) {
++		dev_warn(dp->dev, "IRQ_HPD: link status read failed: %d\n", ret);
++		return;
++	}
++	if (drm_dp_channel_eq_ok(status, dp->lanes)) {
++		dev_info(dp->dev, "IRQ_HPD: link ok (%*ph)\n", DP_LINK_STATUS_SIZE, status);
++		return;
++	}
++	/* no re-training under a running DECON2 (downstream refuses too) */
++	dev_warn(dp->dev, "IRQ_HPD: link lost (%*ph), needs a modeset\n",
++		 DP_LINK_STATUS_SIZE, status);
++	dp->trained = false;
++	WRITE_ONCE(dp->link_lost, true);
++	schedule_work(&dp->report_work);	/* not from hpd_work, see above */
++}
++
++static void exynos_dp_hpd_work(struct work_struct *work)
++{
++	struct exynos_dp *dp = container_of(work, struct exynos_dp, hpd_work);
++	bool irq_hpd;
++	int ret;
++
++	mutex_lock(&dp->lock);
++	exynos_dp_aux_switch(dp, dp->max_lanes > 0);
++
++	if (!dp->hpd || !dp->max_lanes) {
++		if (dp->powered)
++			dev_info(dp->dev, "HPD low, link off\n");
++		exynos_dp_power_off(dp);
++		memset(dp->dpcd, 0, sizeof(dp->dpcd));
++		dp->irq_hpd = false;
++		mutex_unlock(&dp->lock);
++		exynos_dp_report(dp, false);
++		return;
++	}
++
++	if (!dp->powered) {
++		ret = exynos_dp_power_on(dp);
++		if (ret) {
++			dev_err(dp->dev, "power on failed: %d\n", ret);
++			mutex_unlock(&dp->lock);
++			return;
++		}
++		dp->irq_hpd = false;	/* a fresh plug reads everything anyway */
++	}
++	irq_hpd = dp->irq_hpd;
++	dp->irq_hpd = false;
++	mutex_unlock(&dp->lock);
++
++	/* AUX transfers take dp->lock themselves */
++	if (irq_hpd && dp->dpcd[DP_DPCD_REV]) {
++		if (dp->trained && dp->streaming)
++			exynos_dp_check_link(dp);
++		return;
++	}
++
++	ret = drm_dp_read_dpcd_caps(&dp->aux, dp->dpcd);
++	if (ret) {
++		dev_err(dp->dev, "DPCD read failed: %d (AUX: SBU switch / orientation?)\n",
++			ret);
++		memset(dp->dpcd, 0, sizeof(dp->dpcd));
++		return;
++	}
++	dev_info(dp->dev, "sink DPCD %*ph: rev %x, %u Mb/s x%u, %s\n",
++		 8, dp->dpcd, dp->dpcd[DP_DPCD_REV],
++		 drm_dp_max_link_rate(dp->dpcd) / 100,
++		 drm_dp_max_lane_count(dp->dpcd),
++		 dp->flip ? "CC2" : "CC1");
++	exynos_dp_report(dp, true);
++}
++
++static int exynos_dp_mux_set(struct typec_mux_dev *mux,
++			     struct typec_mux_state *state)
++{
++	struct exynos_dp *dp = typec_mux_get_drvdata(mux);
++	struct typec_displayport_data *data = state->data;
++	unsigned int lanes = 0;
++	bool hpd = false, irq = false;
++
++	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
++		if (state->mode == TYPEC_DP_STATE_C ||
++		    state->mode == TYPEC_DP_STATE_E)
++			lanes = 4;
++		else if (state->mode == TYPEC_DP_STATE_D)
++			lanes = 2;
++		if (data) {
++			hpd = data->status & DP_STATUS_HPD_STATE;
++			irq = data->status & DP_STATUS_IRQ_HPD;
++		}
++	}
++
++	mutex_lock(&dp->lock);
++	if (lanes != dp->max_lanes || hpd != dp->hpd)
++		dev_info(dp->dev, "alt mode: %u lanes, HPD %d\n", lanes, hpd);
++	dp->max_lanes = lanes;
++	dp->hpd = hpd;
++	dp->irq_hpd |= irq;
++	mutex_unlock(&dp->lock);
++
++	schedule_work(&dp->hpd_work);
++	return 0;
++}
++
++static int exynos_dp_switch_set(struct typec_switch_dev *sw,
++				enum typec_orientation orientation)
++{
++	struct exynos_dp *dp = typec_switch_get_drvdata(sw);
++
++	mutex_lock(&dp->lock);
++	dp->orientation = orientation;
++	mutex_unlock(&dp->lock);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* DRM bridge (needs a DECON2 CRTC upstream of it, see TODO)           */
++
++static int exynos_dp_bridge_attach(struct drm_bridge *bridge,
++				   struct drm_encoder *encoder,
++				   enum drm_bridge_attach_flags flags)
++{
++	struct exynos_dp *dp = bridge_to_dp(bridge);
++
++	if (!(flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR))
++		return -EINVAL;
++
++	dp->aux.drm_dev = bridge->dev;
++	return drm_dp_aux_register(&dp->aux);
++}
++
++static void exynos_dp_bridge_detach(struct drm_bridge *bridge)
++{
++	drm_dp_aux_unregister(&bridge_to_dp(bridge)->aux);
++}
++
++static enum drm_connector_status
++exynos_dp_bridge_detect(struct drm_bridge *bridge,
++			struct drm_connector *connector)
++{
++	struct exynos_dp *dp = bridge_to_dp(bridge);
++
++	return dp->hpd && dp->max_lanes ? connector_status_connected :
++					  connector_status_disconnected;
++}
++
++static const struct drm_edid *
++exynos_dp_bridge_edid_read(struct drm_bridge *bridge,
++			   struct drm_connector *connector)
++{
++	struct exynos_dp *dp = bridge_to_dp(bridge);
++
++	exynos_dp_sync(dp);
++	return drm_edid_read_ddc(connector, &dp->aux.ddc);
++}
++
++static void exynos_dp_bridge_hpd_notify(struct drm_bridge *bridge,
++					struct drm_connector *connector,
++					enum drm_connector_status status)
++{
++	/*
++	 * Called back from drm_bridge_hpd_notify() / oob hotplug events: the
++	 * TypeC mux callback already carries the HPD state, nothing to do.
++	 */
++}
++
++static unsigned int exynos_dp_max_rate(struct exynos_dp *dp)
++{
++	unsigned int rate = dp->dpcd[DP_DPCD_REV] ?
++			    drm_dp_max_link_rate(dp->dpcd) / 100 : 5400;
++
++	return min(rate, 5400u);	/* HBR2: the PHY has no HBR3 table */
++}
++
++static unsigned int exynos_dp_max_lanes(struct exynos_dp *dp)
++{
++	unsigned int lanes = dp->max_lanes ?: 4;
++
++	if (dp->dpcd[DP_DPCD_REV])
++		lanes = min_t(unsigned int, lanes, drm_dp_max_lane_count(dp->dpcd));
++	return lanes == 3 ? 2 : lanes;
++}
++
++static enum drm_mode_status
++exynos_dp_bridge_mode_valid(struct drm_bridge *bridge,
++			    const struct drm_display_info *info,
++			    const struct drm_display_mode *mode)
++{
++	struct exynos_dp *dp = bridge_to_dp(bridge);
++	u64 need = (u64)mode->clock * 24;		/* kbit/s, RGB 8 bpc */
++	u64 have = (u64)exynos_dp_max_rate(dp) * 1000 *
++		   exynos_dp_max_lanes(dp) * 8 / 10;	/* 8b/10b */
++
++	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
++		return MODE_NO_INTERLACE;
++	if (need > have)
++		return MODE_CLOCK_HIGH;
++	return MODE_OK;
++}
++
++/*
++ * Before DECON2 starts (it starts in its encoder enable, which runs after
++ * the bridge pre_enable): downstream displayport_enable() (via s_stream at
++ * _decon_enable) + the DP half of decon_reg_start(): train the link if
++ * needed, timing/MVID/active symbols, VIDEO_EN, then the LH P-channel.
++ */
++static void exynos_dp_bridge_atomic_pre_enable(struct drm_bridge *bridge,
++					       struct drm_atomic_commit *state)
++{
++	struct exynos_dp *dp = bridge_to_dp(bridge);
++	struct drm_connector *connector;
++	struct drm_crtc_state *cs;
++	struct drm_crtc *crtc;
++
++	connector = drm_atomic_get_new_connector_for_encoder(state,
++							     bridge->encoder);
++	if (!connector)
++		return;
++	crtc = drm_atomic_get_new_connector_state(state, connector)->crtc;
++	cs = drm_atomic_get_new_crtc_state(state, crtc);
++
++	exynos_dp_sync(dp);
++	if (!dp->powered) {
++		dev_err(dp->dev, "enable without a powered link (HPD %d, lanes %u)\n",
++			dp->hpd, dp->max_lanes);
++		return;
++	}
++
++	if (!dp->trained && exynos_dp_link_train(dp)) {
++		dev_err(dp->dev, "link training failed, no picture\n");
++		return;
++	}
++
++	mutex_lock(&dp->lock);
++	exynos_dp_set_video(dp, &cs->adjusted_mode);
++	dp_write_field(dp, SST1_VIDEO_ENABLE, VIDEO_EN, 1);
++	dp->streaming = true;
++	exynos_dp_lh_power(dp, true);
++	dev_info(dp->dev, "stream " DRM_MODE_FMT " on %u Mb/s x%u, LH %d, FSM %08x\n",
++		 DRM_MODE_ARG(&cs->adjusted_mode), dp->rate, dp->lanes, dp->lh_on,
++		 dp_read(dp, SST1_VIDEO_DEBUG_FSM_STATE));
++	mutex_unlock(&dp->lock);
++}
++
++/* After DECON2 stopped (encoder disable): the DP half of decon_reg_stop() */
++static void exynos_dp_bridge_atomic_post_disable(struct drm_bridge *bridge,
++						 struct drm_atomic_commit *state)
++{
++	struct exynos_dp *dp = bridge_to_dp(bridge);
++
++	mutex_lock(&dp->lock);
++	if (dp->powered) {
++		if (dp->lh_on)
++			exynos_dp_lh_power(dp, false);
++		exynos_dp_video_stop(dp);
++	}
++	mutex_unlock(&dp->lock);
++}
++
++static const struct drm_bridge_funcs exynos_dp_bridge_funcs = {
++	.attach = exynos_dp_bridge_attach,
++	.detach = exynos_dp_bridge_detach,
++	.detect = exynos_dp_bridge_detect,
++	.edid_read = exynos_dp_bridge_edid_read,
++	.hpd_notify = exynos_dp_bridge_hpd_notify,
++	.mode_valid = exynos_dp_bridge_mode_valid,
++	.atomic_pre_enable = exynos_dp_bridge_atomic_pre_enable,
++	.atomic_post_disable = exynos_dp_bridge_atomic_post_disable,
++	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
++	.atomic_create_state = drm_atomic_helper_bridge_create_state,
++};
++
++/* ------------------------------------------------------------------ */
++
++static void exynos_dp_typec_unregister(void *data)
++{
++	struct exynos_dp *dp = data;
++
++	typec_mux_unregister(dp->mux);
++	typec_switch_unregister(dp->sw);
++}
++
++static int exynos_dp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct typec_switch_desc sw_desc = { };
++	struct typec_mux_desc mux_desc = { };
++	struct exynos_dp *dp;
++	int ret;
++
++	dp = devm_drm_bridge_alloc(dev, struct exynos_dp, bridge,
++				   &exynos_dp_bridge_funcs);
++	if (IS_ERR(dp))
++		return PTR_ERR(dp);
++	dp->dev = dev;
++	platform_set_drvdata(pdev, dp);
++	mutex_init(&dp->lock);
++	INIT_WORK(&dp->hpd_work, exynos_dp_hpd_work);
++	INIT_WORK(&dp->report_work, exynos_dp_report_work);
++
++	dp->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(dp->regs))
++		return PTR_ERR(dp->regs);
++
++	dp->nclks = devm_clk_bulk_get_all(dev, &dp->clks);
++	if (dp->nclks < 0)
++		return dev_err_probe(dev, dp->nclks, "failed to get clocks\n");
++
++	dp->phy = devm_phy_get(dev, "dp");
++	if (IS_ERR(dp->phy))
++		return dev_err_probe(dev, PTR_ERR(dp->phy), "failed to get DP PHY\n");
++
++	dp->aux_en = devm_gpiod_get_optional(dev, "aux-enable", GPIOD_OUT_LOW);
++	if (IS_ERR(dp->aux_en))
++		return dev_err_probe(dev, PTR_ERR(dp->aux_en), "aux-enable gpio\n");
++	dp->sbu_sel = devm_gpiod_get_optional(dev, "sbu-select", GPIOD_OUT_LOW);
++	if (IS_ERR(dp->sbu_sel))
++		return dev_err_probe(dev, PTR_ERR(dp->sbu_sel), "sbu-select gpio\n");
++	/* the combo PHY owns this input too (samsung,usbdp-port-gpios) */
++	dp->usb_dir = devm_gpiod_get_optional(dev, "usb-dir",
++					      GPIOD_IN | GPIOD_FLAGS_BIT_NONEXCLUSIVE);
++	if (IS_ERR(dp->usb_dir))
++		return dev_err_probe(dev, PTR_ERR(dp->usb_dir), "usb-dir gpio\n");
++	dp->reported = connector_status_disconnected;
++	dp->report_st = connector_status_disconnected;
++
++	dp->aux.name = "Exynos9820 DP AUX";
++	dp->aux.dev = dev;
++	dp->aux.transfer = exynos_dp_aux_transfer;
++	drm_dp_aux_init(&dp->aux);
++
++	sw_desc.drvdata = dp;
++	sw_desc.fwnode = dev_fwnode(dev);
++	sw_desc.set = exynos_dp_switch_set;
++	dp->sw = typec_switch_register(dev, &sw_desc);
++	if (IS_ERR(dp->sw))
++		return dev_err_probe(dev, PTR_ERR(dp->sw), "typec switch\n");
++
++	mux_desc.drvdata = dp;
++	mux_desc.fwnode = dev_fwnode(dev);
++	mux_desc.set = exynos_dp_mux_set;
++	dp->mux = typec_mux_register(dev, &mux_desc);
++	if (IS_ERR(dp->mux)) {
++		typec_switch_unregister(dp->sw);
++		return dev_err_probe(dev, PTR_ERR(dp->mux), "typec mux\n");
++	}
++	ret = devm_add_action_or_reset(dev, exynos_dp_typec_unregister, dp);
++	if (ret)
++		return ret;
++
++	dp->bridge.of_node = dev->of_node;
++	dp->bridge.type = DRM_MODE_CONNECTOR_DisplayPort;
++	dp->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID |
++			 DRM_BRIDGE_OP_HPD;
++	ret = devm_drm_bridge_add(dev, &dp->bridge);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "DP controller registered (untested driver; flip from %s)\n",
++		 dp->usb_dir ? "usb-dir gpio" : "TypeC orientation");
++	return 0;
++}
++
++static void exynos_dp_remove(struct platform_device *pdev)
++{
++	struct exynos_dp *dp = platform_get_drvdata(pdev);
++
++	cancel_work_sync(&dp->hpd_work);
++	cancel_work_sync(&dp->report_work);
++	mutex_lock(&dp->lock);
++	exynos_dp_power_off(dp);
++	exynos_dp_aux_switch(dp, false);
++	mutex_unlock(&dp->lock);
++}
++
++static const struct of_device_id exynos_dp_of_match[] = {
++	{ .compatible = "samsung,exynos9820-dp" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, exynos_dp_of_match);
++
++static struct platform_driver exynos_dp_driver = {
++	.probe = exynos_dp_probe,
++	.remove = exynos_dp_remove,
++	.driver = {
++		.name = "exynos9820-dp",
++		.of_match_table = exynos_dp_of_match,
++	},
++};
++module_platform_driver(exynos_dp_driver);
++
++MODULE_DESCRIPTION("Exynos 9820 DisplayPort link controller (DP alt mode)");
++MODULE_LICENSE("GPL");

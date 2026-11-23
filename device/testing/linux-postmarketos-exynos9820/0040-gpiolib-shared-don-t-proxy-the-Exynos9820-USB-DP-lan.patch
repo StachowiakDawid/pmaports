@@ -1,0 +1,40 @@
+From db42caf51cbf3679e58448d7132142a4ddb8423a Mon Sep 17 00:00:00 2001
+From: StachowiakDawid <dawidos234@gmail.com>
+Date: Mon, 23 Nov 2026 18:38:09 +0100
+Subject: [PATCH] gpiolib: shared: don't proxy the Exynos9820 USB/DP lane
+ select GPIO
+
+On arm64, GPIOs named by several DT nodes are handed out through
+gpio-shared-proxy. The proxy needs the chip's get_direction(), which
+the Samsung pinctrl GPIO chip does not implement, so every request
+through it fails with -EOPNOTSUPP and the DisplayPort controller
+failed to probe on its usb-dir GPIO. That pin is only read, by the
+combo PHY and by DP (non-exclusive request). Skip
+samsung,usbdp-port-gpios while scanning for shared GPIOs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ drivers/gpio/gpiolib-shared.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/gpio/gpiolib-shared.c b/drivers/gpio/gpiolib-shared.c
+index edb04a5bb9..79f68dd9fa 100644
+--- a/drivers/gpio/gpiolib-shared.c
++++ b/drivers/gpio/gpiolib-shared.c
+@@ -188,6 +188,15 @@ static int gpio_shared_of_traverse(struct device_node *curr)
+ 		    strcmp(prop->name, "gpio") != 0)
+ 			continue;
+ 
++		/*
++		 * Exynos9820 USB/DP combo PHY: the lane select input is also read
++		 * by the DisplayPort controller, which requests it non-exclusively.
++		 * Both only read it; keep the direct (unproxied) access, the
++		 * Samsung GPIO chip has no get_direction() for the proxy.
++		 */
++		if (strcmp(prop->name, "samsung,usbdp-port-gpios") == 0)
++			continue;
++
+ 		count = of_count_phandle_with_args(curr, prop->name,
+ 						   "#gpio-cells");
+ 		if (count <= 0)

@@ -1,11 +1,13 @@
 # Kernel config based on: downstream arch/arm64/configs/exynos9820-beyond1lte_defconfig
+# Base: mainline v7.4-rc3 + the exynos-9820-mainline-linux fork commits
+# (0000-fork-*.patch, cherry-picked from chiffathefox/exynos-9820-mainline-linux
+# 62fdd500d8ca) + the beyond2lte patches (NNNN-*.patch).
 maintainer="chiffa <chiffathefoxx@gmail.com>"
 pkgname=linux-postmarketos-exynos9820
-pkgver=7.2.0
-pkgrel=1
-_commit="62fdd500d8ca0031f0259d811c6c8faa088164b6"
+pkgver=7.4_rc3
+pkgrel=17
 pkgdesc="Close-to-mainline kernel for Samsung Exynos 9820 devices"
-url="https://github.com/chiffathefox/exynos-9820-mainline-linux"
+url="https://kernel.org"
 arch="aarch64"
 _carch="arm64"
 _flavor="${pkgname#linux-}"
@@ -29,8 +31,95 @@ makedepends="
 "
 _config="config-$_flavor.$arch"
 source="
-	$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz
+	https://git.kernel.org/torvalds/t/linux-${pkgver/_/-}.tar.gz
 	$_config
+	0000-fork-001-clk-samsung-exynos-add-pll_1018x-and-pll_0817x.patch
+	0000-fork-002-clk-add-exynos9820-clock-driver.patch
+	0000-fork-003-ufs-exynos-exynos9820-phy-and-ufs-driver.patch
+	0000-fork-004-dirty-usb-phy-mess-around-with-tunes.patch
+	0000-fork-005-pinctrl-exynos9820-support.patch
+	0000-fork-006-dirty-acpm-wip.patch
+	0000-fork-007-mfd-sec-acpm-make-regmap_cfg_meter-optional.patch
+	0000-fork-008-mfd-sec-s2mps19-PMIC-support.patch
+	0000-fork-009-clk-samsung-exynos9820-add-PERIS-block.patch
+	0000-fork-010-clk-samsung-exynos9820-early-init-PERIS-and-TOP-bloc.patch
+	0000-fork-011-dirty-touchscreen-fix-event-count-mask-and-log-info-.patch
+	0000-fork-012-clk-samsung-add-exynos9820-ACPM-clock-driver.patch
+	0000-fork-013-soc-samsung-exynos-pmu-use-target-cpu-ID-in-hotplug-.patch
+	0000-fork-014-dt-bindings-soc-move-rename-google-gs101-pmu-intr-ge.patch
+	0000-fork-015-dt-bindings-soc-samsung-exynos-pmu-Require-pmu-intr-.patch
+	0000-fork-016-soc-samsung-exynos-pmu-generalise-gs101-specific-cpu.patch
+	0000-fork-017-soc-samsung-exynos-pmu-add-Exynos850-CPU-hotplug-sup.patch
+	0000-fork-018-MAINTAINERS-add-Exynos850-PMU-entry.patch
+	0000-fork-019-arm64-dts-exynos850-add-PMU-interrupt-generation-nod.patch
+	0000-fork-020-dirty-pmu-exynos9820-support.patch
+	0000-fork-021-clk-samsung-acpm-add-clk_ops-to-driver-data.patch
+	0000-fork-022-clk-samsung-acpm-exynos9820-support.patch
+	0000-fork-023-arm64-dts-exynos-gs101-Add-thermal-management-unit.patch
+	0000-fork-024-thermal-samsung-tmu-support-for-exynos9820.patch
+	0000-fork-025-clk-exynos9820-cleanup-PERIS-block.patch
+	0000-fork-026-thermal-samsung-support-multiple-clocks.patch
+	0000-fork-027-clk-exynos9820-cleanup-PERIS-block.patch
+	0000-fork-028-clk-exynos9820-refine-TOP-block.patch
+	0000-fork-029-clk-exynos9820-refine-FSYS1-block.patch
+	0000-fork-030-clk-exynos9820-refine-FSYS0A-block.patch
+	0000-fork-031-clk-exynos9820-refine-PERIC0-block.patch
+	0000-fork-032-clk-exynos9820-mark-chipid-clocks-as-CLK_IGNORE_UNUS.patch
+	0000-fork-033-clk-esynos9820-use-automatic-clock-gating.patch
+	0000-fork-034-clk-exynos9820-add-comments-to-the-PERIS-block.patch
+	0000-fork-035-clk-exynos9820-refine-APM-block.patch
+	0000-fork-036-clk-exynos9820-add-BUSC-block.patch
+	0000-fork-037-clk-exynos9820-add-an-empty-CORE-block.patch
+	0000-fork-038-clk-exynos9820-add-an-empty-MIF-block.patch
+	0000-fork-039-clk-exynos9820-add-an-empty-CPUCL0-block.patch
+	0000-fork-040-clk-exynos9820-add-an-empty-CPUCL2-block.patch
+	0000-fork-041-clk-exynos9820-add-an-empty-PERIC1-block.patch
+	0000-fork-042-clk-exynos9820-add-an-empty-FSYS0-block.patch
+	0000-fork-043-clk-exynos9820-add-an-empty-G3D-block.patch
+	0000-fork-044-clk-exynos9820-implement-DPU-block.patch
+	0000-fork-045-clk-exynos9820-implement-CMGP-block.patch
+	0000-fork-046-soc-samsung-add-support-for-Exynos-9820-power-domain.patch
+	0001-soc-samsung-exynos-pmu-undo-the-C2-programming-on-CP.patch
+	0002-pinctrl-samsung-exynos9820-do-not-save-restore-the-V.patch
+	0003-drm-exynos-Exynos-9820-DSIM-DECON0-takeover-and-S6E3.patch
+	0004-drm-panfrost-Exynos-9820-Mali-G76-support-with-CMU_G.patch
+	0005-clk-samsung-exynos9820-add-CMU_PERIC1-CMU_AUD-pll_08.patch
+	0006-Bluetooth-hci_bcm-BCM4375-support-bdaddr-parameter-a.patch
+	0007-PCI-dwc-add-Samsung-Exynos-9820-GEN2-PCIe-host-drive.patch
+	0008-usb-typec-add-Maxim-MAX77705-USB-Type-C-PD-and-MUIC-.patch
+	0009-power-supply-max77705-OTG-VBUS-regulator-charge-limi.patch
+	0010-power-supply-max17042-max77705-disable-the-stale-ale.patch
+	0011-rtc-s3c-add-Exynos9820-support.patch
+	0012-leds-max77705-fix-the-multicolor-LED-drop-hw-blink-s.patch
+	0013-clocksource-exynos_mct-re-arm-the-global-comparator-.patch
+	0014-phy-exynos5-usbdrd-add-Exynos9820-host-mode-USB3-and.patch
+	0015-usb-dwc3-Exynos9820-quirks-Gen1-host-clocking-SuperS.patch
+	0016-Input-s6sy761-robust-boot-handshake-panel-follower-b.patch
+	0017-watchdog-s3c2410_wdt-add-Exynos9820-support.patch
+	0018-iommu-exynos-panic_on_fault-parameter-block-a-suspen.patch
+	0019-ASoC-cs35l41-mfd-madera-Galaxy-S10-TDM-calibration-a.patch
+	0020-ASoC-samsung-add-Exynos9820-ABOX-and-Galaxy-S10-mach.patch
+	0021-firmware-samsung-acpm-dvfs_cmd-MIF-INT-hold-timeout-.patch
+	0022-soc-samsung-exynos-pmu-Exynos9820-CPU-hotplug-and-sy.patch
+	0023-PM-add-a-sleep-state-hook-and-a-syscore-resume-hook.patch
+	0024-pinctrl-samsung-export-the-EINT-wakeup-mask-noirq-ba.patch
+	0025-pmdomain-samsung-exynos9820-system-sleep-AUD-and-ISP.patch
+	0026-clk-samsung-Exynos9820-syscore-suspend-resume-handli.patch
+	0027-i2c-exynos5-drop-stale-FIFO-data-clean-reset-length-.patch
+	0028-scsi-ufs-exynos-full-host-re-init-after-a-sleep-that.patch
+	0029-soc-samsung-add-Exynos9820-suspend-to-RAM-driver.patch
+	0030-wifi-brcmfmac-BCM4375-PCIe-support-IPC-rev-7-fixes-l.patch
+	0031-mmc-queue-clear-MQRQ_XFER_SINGLE_BLOCK-for-new-reque.patch
+	0032-misc-add-Broadcom-BCM4775x-GNSS-sensor-hub-driver.patch
+	0033-nfc-s3fwrn5-S3NRN82-no-firmware-update-vdd-supply-cl.patch
+	0034-soc-samsung-exynos-usi-allow-I2C-only-blocks-without.patch
+	0035-leds-regulator-add-Samsung-S2MPB02-flash-LED-and-S2M.patch
+	0036-media-i2c-add-Samsung-S5K3P9-3J1-3M3-4HA-2L4-sensor-.patch
+	0037-media-samsung-add-an-Exynos-9820-CSIS-RAW-capture-dr.patch
+	0038-misc-add-a-Samsung-S5000AP-Exynos-9820-CP-modem-driv.patch
+	0039-drm-exynos-add-Exynos-9820-DisplayPort-controller-an.patch
+	0040-gpiolib-shared-don-t-proxy-the-Exynos9820-USB-DP-lan.patch
+	0041-arm64-dts-exynos-add-Samsung-Galaxy-S10-S10-beyond1l.patch
 "
 options="
 	!check
@@ -38,8 +127,7 @@ options="
 	!tracedeps
 	pmb:cross-native
 "
-builddir="$srcdir/$pkgname-$_commit"
-builddir="$srcdir/exynos-9820-mainline-linux-$_commit"
+builddir="$srcdir/linux-${pkgver/_/-}"
 
 prepare() {
 	default_prepare
@@ -70,6 +158,93 @@ package() {
 }
 
 sha512sums="
-5b9356947a4f1852b2108c073b8ed791e74983fd8c2e8c6244fd2e26174857fdf7e8e9061af77fe6177d94c8288cc917f004776e8113c724e22f3554928ce798  linux-postmarketos-exynos9820-62fdd500d8ca0031f0259d811c6c8faa088164b6.tar.gz
-a482ed029232afb545e896a74bb2ae6c9a942be52c34a43045d141bd7a5a03209b97117b2307ee00a5543c16cbe7ae9b5729ed323619479263109b2e03bc9f99  config-postmarketos-exynos9820.aarch64
+12551f560ed8dbc530126399717238f070175e5dbab356e8b68cf9379493a284c843192b3fc9d96decbc7bf411ee027aae2b30851605507655517c04bb97403f  linux-7.4-rc3.tar.gz
+52cca839dbf5d60a194f8ebf45e0188d418d9cf6d8c970db4432b790f379a915a00b56af2aef04d5eecacf51cc358b93b6042179d99900bdc160d21708f42364  config-postmarketos-exynos9820.aarch64
+348c6e3f311096299cfbc36074fd278b3a54cff350c873c4887e8d6dd6d468ae24feb58429c7e789b730738065efe91c61256d1f1a8a9591bac512f06076aff2  0000-fork-001-clk-samsung-exynos-add-pll_1018x-and-pll_0817x.patch
+a12db57da94d6b32ba4d8681f6af74ee807f16a63bd95f442e6189ec4e4fc4097f35083a885dd2911e65bc61317958840d4bfe174ea437e246359cbec872316f  0000-fork-002-clk-add-exynos9820-clock-driver.patch
+3d0e765fe65b1e63a45cd107b56df2ea0bdc6903061d89f275d180c7d3d57380c7a2e72ae94d207bfbc952a656f201b3a41add43e056cc57120434f413201ef5  0000-fork-003-ufs-exynos-exynos9820-phy-and-ufs-driver.patch
+02b2edacfa97ad4e0aedb4fe737f7a5ba476b3f6ae62bb4055cc81fe8a305a813a3b928ef82c763b81f54fc936f66e76c080a6fafe85b4d9ed771e6f0e9a34f9  0000-fork-004-dirty-usb-phy-mess-around-with-tunes.patch
+7cd2a377e3ff0c24c101d70ebaa1b55cad60c1de2f8d84cb06bd13d2287df6145d40cfe1eedc4f1965181986c624c74c94aab9edf1e6a56330824fd19bfbad22  0000-fork-005-pinctrl-exynos9820-support.patch
+32acf9f8938f6a66da5c03a88b228b57544d6b23a1fe8081f5fed4d495cb67a009088040fd6a1bfeb3bcfec8ede05c966ae48874cae18f2a28246bd0a15bf69b  0000-fork-006-dirty-acpm-wip.patch
+7a05967b702a1bea475ad3c8ae43ea46fff22fa749b4741fddb087445a54115350f567aaa2951ec9f1152e7e7975ae5a2d06b1226d2895f6bd49ef4af2229a84  0000-fork-007-mfd-sec-acpm-make-regmap_cfg_meter-optional.patch
+e3aa860d6c7c14558d85ecfc930e9317678a7039b17f89f9328c3d5d84cc74fd23bc0ff5ee1ff21fe7f927017179d702b4e1de3e1b14b43b7b689cfb51b676e3  0000-fork-008-mfd-sec-s2mps19-PMIC-support.patch
+ceacf667040df21a32ca93b423552fed345d6077622e5c3a8cb9669c31431eeea283b9a739adaace258f9815ca3322ba70061a6f5664f2d66f5991a94544d6f4  0000-fork-009-clk-samsung-exynos9820-add-PERIS-block.patch
+2b13c1d2b63bfa8e03f493237007b0c70c7f399be2d7706019f0b4691d01646c3169a7473d170c8d1973af673931fdbf89bdb370ae59f80d7c41e4c9a756704c  0000-fork-010-clk-samsung-exynos9820-early-init-PERIS-and-TOP-bloc.patch
+fd76052621f79f36245705a6e74e2afe2d93fd3b59191b13a194d2c00915c5c245eef4e0c966249fcbc5eed1b8d4ad19c54d2ec767d7fbbf27b7e0dfbf14d98c  0000-fork-011-dirty-touchscreen-fix-event-count-mask-and-log-info-.patch
+0ee3afcaf41221729bb796cc7dcf3c349b98320e2ab815f8f91810ad7938975b273150240e5b6c14185bb33ed902454914ec5f0d743ef8e48adaa110f8283fcc  0000-fork-012-clk-samsung-add-exynos9820-ACPM-clock-driver.patch
+33aea6b76f0c6fb775823961e63c3769249f2a051a38714430e508c869a3073452010f6f33c827e3fc08ea9479d7cb32d3b2b871d5d5e38ca1c2ce8fec5d578e  0000-fork-013-soc-samsung-exynos-pmu-use-target-cpu-ID-in-hotplug-.patch
+14db9edf417a09b2f53a61c5eb0bedf3bda1248bfc4dafd6e8ddbf789bd2810d8c8cc140286713eace2b4a4cefd9fa5731fae0c826ff05925e40bbe3750f5a04  0000-fork-014-dt-bindings-soc-move-rename-google-gs101-pmu-intr-ge.patch
+7b66f95d73fbc0e3097033fcea13d951c5bb3b1a5dc88e35a72e343fb782346baf41edbdf9d3f8e7f95cbc4a5a1ba73a390cedc15c0e519510dc781c773cc4d3  0000-fork-015-dt-bindings-soc-samsung-exynos-pmu-Require-pmu-intr-.patch
+aff16219003dc5b16cab0fcc9b0afd7eaccf61bde83a0f49a4db0a9cb2c198ee005f6f674065e5b9972636fcc348658d6e9bc80f2ccb44a311ac06d217b76419  0000-fork-016-soc-samsung-exynos-pmu-generalise-gs101-specific-cpu.patch
+849bab02e77da2d80c17be874b61b5dd7eeee4af5f9240dd01145bef2c59f6ca49b98281b7570a78b1feaccc163780efae925c7048c3653e6dcef7fdd63ba59a  0000-fork-017-soc-samsung-exynos-pmu-add-Exynos850-CPU-hotplug-sup.patch
+ea0e67bd30c598e55895d11483e83aa63cc06cd84e7a9d3b6ab2e34021e1df2a8273b8e792416025541b318829f16e64f5922d0a3e409d88be779390bfeff32b  0000-fork-018-MAINTAINERS-add-Exynos850-PMU-entry.patch
+d0d07c1f698e7aa75140f05f46790073d4651b00472482c44105f6ac690565e6b43d24f5e993b0d3e618611036321ea799f785661789152dfd373bfa22d9d605  0000-fork-019-arm64-dts-exynos850-add-PMU-interrupt-generation-nod.patch
+e8d01e05cb923a0cbf3afd98c20b1f6c428334c8ce8c5e2409fc2104d4e15a5307fc937524f598c5fa222328d7f69c90745ee48831ed11bc55a5dd1c661bd644  0000-fork-020-dirty-pmu-exynos9820-support.patch
+79c817083540d7fc3cdffad8421dafd4de3c37cf6507e8ad111124a4dcc2d1f7f89af20c9d38b328772c3600b5cb05aacca46561d4db75a0c62c73f4b7c47d32  0000-fork-021-clk-samsung-acpm-add-clk_ops-to-driver-data.patch
+be8e9b769ccf2cc8b08674203f413d4f9c8a33269509a07fd80e69f81de8aa1d2c9b3bd6696c538d0cb9d7271edea2e2403d1933bb21b3bcb3e49114076b70cb  0000-fork-022-clk-samsung-acpm-exynos9820-support.patch
+e0a48374fd7bf4478b3d93233cf812a45e30a0b506f991c487316f5eaa5cdb628b0b326a0a554124b8aa1ecddf17c128fb61940dfb16517daba100cac4811420  0000-fork-023-arm64-dts-exynos-gs101-Add-thermal-management-unit.patch
+f15dfeca070eb1e50a452e0d8d3b42fc60ff9eca8fa8c30c27e0d4b53f853985d779fb9660d72d392dcd159bd20e2027db896344a0715641602106a1cab8d55b  0000-fork-024-thermal-samsung-tmu-support-for-exynos9820.patch
+2aca59413ab6bb5f5f9a1f0e410535251d54c92ec3843593941a541517dc875f496c43cb2cb94837ce8286519bb8d07cd9e5484eb978be5d59479989dea4ee6a  0000-fork-025-clk-exynos9820-cleanup-PERIS-block.patch
+949e578e2d499a341598e01d3f026dce0edc0dc0be633e14d58813c2dcc0019894a4a12bd0b9c30badcafee56ca77a2c00f8950402ff79b798c543dfc274908f  0000-fork-026-thermal-samsung-support-multiple-clocks.patch
+0478a4d729c45f31ad03f39b9f7d22e17382d72c2e5ba920bc0f47c5f47f213c6a7040094c0a2eb198a23125685e449b4f72d100914080a73669d56e1de5a6fa  0000-fork-027-clk-exynos9820-cleanup-PERIS-block.patch
+75db663b40f2496c9d1bbe3812fbf5bd322632657a6e65122007141d110f441462097b79355e803f2d336b893b47c7a1a2a48a4daff63139a095ef7eba6cfc93  0000-fork-028-clk-exynos9820-refine-TOP-block.patch
+a050dc9983c08fe1fa2b225373198ea44cf8759785c8e3ae21fef0e3c5065b19909252558121b8c0c9872c8aab71511c40ddbdb965c305cc6c971fa73e325c6c  0000-fork-029-clk-exynos9820-refine-FSYS1-block.patch
+8711b62524e9db03b462e6970a208fef15cab2bff28d5e7fb8daa383b15f9eecd24e2e5862f7c84409b4b18a22eb683fc69f5535eb222ec26c3e605ece6b0e2a  0000-fork-030-clk-exynos9820-refine-FSYS0A-block.patch
+95e9a25998cf6e82c82c295da5bea72ae0c9bd6105a88f4592631f231711b4e2931110cb3a8c5f5ed126277077831bbb4ccd87ffd93ae8f0cca24224f9f7d50c  0000-fork-031-clk-exynos9820-refine-PERIC0-block.patch
+a46e93596bc22e681e3d931223c193d0101e314cad4e96b72dcf2668e29d72df1aa7d2f02ede34dea59e5e0ac71e0d88078ac804f96a2e3bf41274481f266896  0000-fork-032-clk-exynos9820-mark-chipid-clocks-as-CLK_IGNORE_UNUS.patch
+7826b2ba3f9fe32fc3c7628fefae0b381da214dc43c777c7f549f7ffd27d628ccf56b55568f349066af757e232c049a8ed367abf4f82d9ecc5ee7ac26f2a5b1c  0000-fork-033-clk-esynos9820-use-automatic-clock-gating.patch
+5d54e8222c596b9e259d63c865689f3f0eaa54f025f6891d387efe0112b213e649db321bef9d1f1dee89a191e19458fd03f8ce44c7d82c4ca926b0099d62b7b5  0000-fork-034-clk-exynos9820-add-comments-to-the-PERIS-block.patch
+6580dcaf5a4ade035ccc475534efa479609ce87419db41286cf8c8132db61e86ab5a7a3917d9b96af0b72dfabfcad1c1c72b4bb4f4fd588fa403aeb37f5705ab  0000-fork-035-clk-exynos9820-refine-APM-block.patch
+6453bdc4e03e7278cbacab9e1df724ec05b320e4ca8043aac97eb347809fb5cd29d8e042cae44a340ec02bda2f0d7dbda34166fca3b48ea0d14a1704f6c8aa76  0000-fork-036-clk-exynos9820-add-BUSC-block.patch
+20c7a30ce079d06323f5fa4b91c008ddffb86d88247c63914631d7117e25aae8d8b721ae8e1e812f726428dbff31f96cb7a4697c2f5df8e6d8b93f9f785631ac  0000-fork-037-clk-exynos9820-add-an-empty-CORE-block.patch
+5cfd92a779ca61d440e0291a0cf7ffb2d92a4ddbac19faba80b81777d3021aa42c1727f572e106af01f6faf8a44d3a6e96977fc27174c52e798ea58d4c167786  0000-fork-038-clk-exynos9820-add-an-empty-MIF-block.patch
+846a146281c30aa805162a8966ea6f891a6a21a3d18d5f48f32b80e6f84824e85b63a894487df8ed57c809f1e98ec611cba073b57a74a39fb0b3d30ebef9d64f  0000-fork-039-clk-exynos9820-add-an-empty-CPUCL0-block.patch
+6c706dcf4d8b4e0f69cb366b1ecefda8684ef928f3213b9a7968d71b64cc866246350795f2f66d201136957cab1ac37c19eb01d1c64f0216754b5765f772a033  0000-fork-040-clk-exynos9820-add-an-empty-CPUCL2-block.patch
+aa73d97898114aa19b4464ef0acbb4dac687b61735e4653188271df68b4ed40d447bad6919cc57671c86df69130b31d48b3ba6275bb814c0a05db6202d96f7a2  0000-fork-041-clk-exynos9820-add-an-empty-PERIC1-block.patch
+c96e5fc8b2a65406d2d8f22109353b2e60a922a7a6c4cc751bb75aa83e4e0a407af72251668fe4ce5eda5fd89187db1e95b7c3dee0a1a5d9503eb33d3053ccaa  0000-fork-042-clk-exynos9820-add-an-empty-FSYS0-block.patch
+c43902f81a09ac9f4938f46e8147d9bc67e24b29599922bf46862c7918d102d78bb2e6e931d202dee27c5f7d0eefbdc193176260f4f0d4acc6b39a6081a815b9  0000-fork-043-clk-exynos9820-add-an-empty-G3D-block.patch
+14bd903bd73f21732a0367ed3da012385d2504d1bc01c87c3b8043f3bdf6528822911b8684d25cd5303a1013b062b2a990acfdc4dbb54c77b30ebfe5a94bd266  0000-fork-044-clk-exynos9820-implement-DPU-block.patch
+e90b104eba20d571cb4eea67776dcdea3a039bc31d51c168d5272cf4862d190c4c543d22e2d4f87c316aab101603433fe374683e149bf2f10778bd43d17c6785  0000-fork-045-clk-exynos9820-implement-CMGP-block.patch
+282f5e2a30faf9b426c030a916a5084243cf322c47436d5249da64284645bc0652a33f36776d838e0d50c64a3fc48df3be2c5be7d9938f84b8b4a39e8374e4af  0000-fork-046-soc-samsung-add-support-for-Exynos-9820-power-domain.patch
+141c2ff10dd7369a887036abc397942d4e60771a881eb82a83e2e9baa1dec4da9766a03f4e630e61e5cb41f319b3876c54f4a88b9da58ad2629dd8473c28d968  0001-soc-samsung-exynos-pmu-undo-the-C2-programming-on-CP.patch
+6faf91056befadb704e57f609767a36ad209404f61b935711a56581a67c7003540ff3c9ad850f1637ac73d26cad674334ec850972c8fb0fac154f47c47a1917a  0002-pinctrl-samsung-exynos9820-do-not-save-restore-the-V.patch
+5378ea63b4ba44c2e1c9cec0ddb901b59556d5c7966aeeb7493d8a272772703daef546fe91c4eddd30eff06ce260164af2663b9bf019bc27277936252dcad79f  0003-drm-exynos-Exynos-9820-DSIM-DECON0-takeover-and-S6E3.patch
+82eeccbcd1c416e0c3af120be57493b8ab0095faf7a6388c2f470e589216bb188d0741121ba49e514543a54bf70e9af335105e9291833554e29885b6991534e9  0004-drm-panfrost-Exynos-9820-Mali-G76-support-with-CMU_G.patch
+99368f37dba5920982359eb5446187ad5ba59ba0ffb13236ce789cf9fc34d5e7a4d7b7944e84abcd5f0c72e85786ebe69969c135507940c3381fb0557318d2b5  0005-clk-samsung-exynos9820-add-CMU_PERIC1-CMU_AUD-pll_08.patch
+9265cd2952945053dd12fc3e64dbbb263b2deac1642c4cc36d2d8c994e70f3c2297dd64b5ad466088f49fb054b465eb7f3221a0bc78a7dac3f09c8c06ccd75ac  0006-Bluetooth-hci_bcm-BCM4375-support-bdaddr-parameter-a.patch
+b3796f4093b03162d3927c79687e21cd110b8f53277bb7b6742a76a371573b1a769786ba5fb0ac77b4cdd0c1b8adf79a9a78d319542568352ab620094f1a8f44  0007-PCI-dwc-add-Samsung-Exynos-9820-GEN2-PCIe-host-drive.patch
+f0dc790f636bc9778ce9efded7115c918b4e4315561d1dc11ce950863360ddefa40011b26a180c4616ce309e30991f0c144d8da3effe706fe516ad0c18d915d9  0008-usb-typec-add-Maxim-MAX77705-USB-Type-C-PD-and-MUIC-.patch
+f8bdc3eb575679bd02b4659735349e04ef3847c67ac1b7ffc745392f96f5770e351cff4467c0b812f2fc3186b191cb6f525f78771de97ac1931d4aacd29bade9  0009-power-supply-max77705-OTG-VBUS-regulator-charge-limi.patch
+85b59cdd3f0e2b1c24e2098771f0045efc74f8ab04878d87ca8f4e8737932cd0920313aac6f096802f55a35a1fc1d3b17f7752af7828b0ce8b8404f831aea973  0010-power-supply-max17042-max77705-disable-the-stale-ale.patch
+ac367262364dcfddc67c0c0ac2a6303288980320f61923af0c527a175d7a9c0d4da7f419b387061792b30ae66c9b60ffdf09e1b9af8a0e19776dea36b4afa9a4  0011-rtc-s3c-add-Exynos9820-support.patch
+e1b665a3ad5702764b74f0f23a7cd089a0b1c1e5b38f57b64a66f19e1158de1b38a0d5047ebf787f5221862f62b1c983243d93ae010489d7382301aa0562dab2  0012-leds-max77705-fix-the-multicolor-LED-drop-hw-blink-s.patch
+693e8ed01038166379a6cd8b1c89757f2e8aab8a800251865c389cfb38cd7527a4db2c95d77bfe2a481bb468936a5ba889565e1a98efb566273edeebec251c20  0013-clocksource-exynos_mct-re-arm-the-global-comparator-.patch
+b772b4a56fda0d63437b02aa277e4dbe38a0a1ed70ccf59c73e29d0a007d87c0694df8e4a32b4e055f7a4e3ac7a7a921a6328c4ce0e5df6ad96b81559c868a4a  0014-phy-exynos5-usbdrd-add-Exynos9820-host-mode-USB3-and.patch
+011ea8281139d833c56a491ec69293eece6a476f0e12ac78e7c68955423875cdcfbbe06a20d768617a70f2018cbb7cbae8d2eaf06043ca168fd3d6a54cd5be0d  0015-usb-dwc3-Exynos9820-quirks-Gen1-host-clocking-SuperS.patch
+72aa34e0cdf1c6b179f373a2df0236566c0e6058ad14a2baff612ad9867ca4d1965eb66e2e82c3b932698df4e3d9991e306e87caacd9bf6bacd824c9526f4ad3  0016-Input-s6sy761-robust-boot-handshake-panel-follower-b.patch
+9cfb2adad1316954eb773428a68803a547818bef3894de1a6046600c7458481b80d8b465a9e8bc357f6cc19ace9b6518c9b179a7a25cc30025400408c1eb7977  0017-watchdog-s3c2410_wdt-add-Exynos9820-support.patch
+aada214e7e8c9197c2fc8cfed51ba43fcc401fa330c0b3eea809744f9f32f24144cef902b999992b7cf7f55fe261e1c398a85f6bd112882d9990e5beaefee462  0018-iommu-exynos-panic_on_fault-parameter-block-a-suspen.patch
+39410ce02ed37a22d822aa85f5066695fe857d9de1755f1ae2bd34c0911e48ce84b7410df7257a1b38043f02ce3a9c06b00bea89de063c2f08abc176a674e2e1  0019-ASoC-cs35l41-mfd-madera-Galaxy-S10-TDM-calibration-a.patch
+90249d7ba27fd15b997a520394d1f92c04f18ed0db03f4b63b78f3147d109cebbe1aa23a32698d8d4f0cba91ade12c4ee3085128484c279990d4a652e10d070d  0020-ASoC-samsung-add-Exynos9820-ABOX-and-Galaxy-S10-mach.patch
+5f460c8242e2ec2b3114e93e8b3115f29f75d10c0c9ea7592281de0dad8f8c84f48e1ee010998ba31adfc29f50ec9bef9f60c490d7ef5ed85ac08455350a8f89  0021-firmware-samsung-acpm-dvfs_cmd-MIF-INT-hold-timeout-.patch
+fe521e7d03cfd2929e918d8b936e5770281d9fbc82ea6ae11957be14ac9c19639e1ab9d9f8a1148997175e874c4524c337b23ef0c3a6153cc6f6471347f373b8  0022-soc-samsung-exynos-pmu-Exynos9820-CPU-hotplug-and-sy.patch
+4810ebe753b5b2aca3517743fcc65f4af6beb830b4a7c0bedc7c2264167cc62e3fac31dde4f35cc4501050f39cf5b5a475d398cb311f546b8b1e0495ad682564  0023-PM-add-a-sleep-state-hook-and-a-syscore-resume-hook.patch
+a7374a835386eb3349d5c2429405029c63ee2d050f2f3f5d0c0341a8ad4013077a9fd17feece6c20cce85132a87e2aa943ca0db7c6a11759295a2dab1000bbba  0024-pinctrl-samsung-export-the-EINT-wakeup-mask-noirq-ba.patch
+75736b243c86ba74d2fcf7d79c1843295f9de880b34c027a71964d0042239f0481b966863abfdccc92ddf3e5d9416a42d9a4619353bfa5d2f4d62b25629821cf  0025-pmdomain-samsung-exynos9820-system-sleep-AUD-and-ISP.patch
+a3815f0fe3c7b1553153fdc1d43e36ace29a62ae1640179fbc3ade7c796287e299c3ebdf87dabc3a612844346a39aef8bdee781d180eff75ce8045399b49d6b2  0026-clk-samsung-Exynos9820-syscore-suspend-resume-handli.patch
+3c88fd74e1c44ce535bb87ffd8d3c4a55f30cdb9f8caa461c64131b5efe102141108700fd7d453944afffbd9964db80cab1242392cb3b9c0bd48000e928e0499  0027-i2c-exynos5-drop-stale-FIFO-data-clean-reset-length-.patch
+65ad3ea29d8dbfcc2d39272a615a9f838f5b35f4f3f496f9041d648ba6847300ee51e32d6745a7e507378497cf3d4d437cef135b6018870d052e4bcb5d61e7b2  0028-scsi-ufs-exynos-full-host-re-init-after-a-sleep-that.patch
+657af512fc7a47749ea9c9716a56f8ab16a57576537e868236292a2fbd8c38b7efbed49fa2226d40ef44da654b13472ce33180d7b3b4251633ebd780777b1fd3  0029-soc-samsung-add-Exynos9820-suspend-to-RAM-driver.patch
+317d00b70fb55037927ece015111cd5100330c8247560bdc737c1d09b6936f32f7e42710ad2156315e4af44c4f32503aac4cc73adde72bbd94a9f9939d0d5b55  0030-wifi-brcmfmac-BCM4375-PCIe-support-IPC-rev-7-fixes-l.patch
+b6392ebff5b410119e2927155d19faa7714ce42fc81feb7cce7f09b0fd0db89e223953c80c66f3272e1e43cb8ddf91958704d16b2024ba690be3cba71ad89381  0031-mmc-queue-clear-MQRQ_XFER_SINGLE_BLOCK-for-new-reque.patch
+3a852297cdf1c65c80ab7a3ddb918b7a4322b4fe82adddf3e78649628c251350628a01aae0e4ce6b7392a09bde3293dacb8ab4d25e5b0e96d3075dfc574e5907  0032-misc-add-Broadcom-BCM4775x-GNSS-sensor-hub-driver.patch
+aa1cdd4401e7e19cfbc8df247965904382b217481c3db6de43379b9f80290e4f12ea4873676df61f46ea3e4004de04ff446f064f89e4484312dccb2059e11ae4  0033-nfc-s3fwrn5-S3NRN82-no-firmware-update-vdd-supply-cl.patch
+cc50c75f8b4192a74cb4c99d75290cd53624a08252e2379eadc1bfa226346a62abb130dd889fb71383af85e45e560dd7c435b619dc3fbce1af71f6b042d89852  0034-soc-samsung-exynos-usi-allow-I2C-only-blocks-without.patch
+eb68dd95532339c1cebc43053b0c04f347d23da3497f2cf567863091ca3474752fc5bb41fb36cff90379248a20cb5c8e854f69d7dce957f6484d24adc1ef211f  0035-leds-regulator-add-Samsung-S2MPB02-flash-LED-and-S2M.patch
+2c42de77e9f0a54e819202df08402159b6ce251d65928717d96307265cc017058464dc147d503f431c2ad6eba933afa5fd9e7c8636607ad9fc4c016645d96be5  0036-media-i2c-add-Samsung-S5K3P9-3J1-3M3-4HA-2L4-sensor-.patch
+a92186bf2fc50ff72454bf9bf2080f9754f9160780a2b225014841720c7cd3542e610669b334833462187d6a7efcdefba9c64c11a979ca02437865a644386eee  0037-media-samsung-add-an-Exynos-9820-CSIS-RAW-capture-dr.patch
+c0016aec4c793287a26a6aec1aafe8302ef0b1318916c2e92a9a9ebb9872fc110cae10708cbcc0c3a3b90f1e389e1a7c499deee15ca3c6b291f63e3491f72375  0038-misc-add-a-Samsung-S5000AP-Exynos-9820-CP-modem-driv.patch
+8a72029b3e4ad1b85ce9443766e15abff02bbc10122ec9dea147a3add10394475b6f6ad32ffbd22440c6f8befa9b37cc247660f02f92ef041384c382b76ddb03  0039-drm-exynos-add-Exynos-9820-DisplayPort-controller-an.patch
+86fab3e275236bd9c8287928f87ae397b95cdf92270b836a5706ad3d7a2e0ff9f1dab7dafc3ac99be40066cb6ed51d3121a601d081a1d5f0b09b016c70775656  0040-gpiolib-shared-don-t-proxy-the-Exynos9820-USB-DP-lan.patch
+2154d28ef4c085fcebb5b506dc7578621efce3a4b4370250c47a753e480eec74983e5212c8b67f20fe1144c68e89f49076038293a651ddfa0c3bdd3e994d7f3a  0041-arm64-dts-exynos-add-Samsung-Galaxy-S10-S10-beyond1l.patch
 "
