@@ -1,0 +1,15 @@
+#!/usr/sbin/nft -f
+
+table inet filter {
+	chain input {
+		iifname "waydroid0" udp dport { 53, 67 } accept \
+			comment "Allow Waydroid DNS and DHCP"
+		iifname "waydroid0" tcp dport 53 accept \
+			comment "Allow Waydroid DNS over TCP"
+	}
+
+	chain forward {
+		iifname "waydroid0" accept \
+			comment "Allow Waydroid container egress"
+	}
+}
