@@ -6,7 +6,7 @@ maintainer="StachowiakDawid <dawidos234@gmail.com>"
 pkgname=device-samsung-beyond2lte
 pkgdesc="Samsung Galaxy S10+"
 pkgver=3
-pkgrel=52
+pkgrel=53
 url="https://postmarketos.org"
 arch="aarch64"
 license="MIT"
@@ -38,6 +38,7 @@ _pmb_recommends="$pkgname-autosuspend"
 triggers="$pkgname.trigger=/usr/lib/systemd/boot/efi"
 source="
 	deviceinfo
+	waydroid-container.conf
 	kernel-cmdline.conf
 	51-wifi-powersave.conf
 	modprobe.conf
@@ -122,6 +123,9 @@ package() {
 	cd "$srcdir"
 	local sys="$pkgdir"/usr/lib/systemd/system
 	install -Dm644 beyond2lte-usbc.conf "$pkgdir"/etc/modprobe.d/beyond2lte-usbc.conf
+	# LXC needs these delegated controllers to create Waydroid's cgroup v2 tree.
+	install -Dm644 waydroid-container.conf \
+		"$pkgdir"/usr/lib/systemd/system/waydroid-container.service.d/50-beyond2lte-cgroups.conf
 
 	# USB gadget reconnect (+ MUIC CTRL1 fix via i2crw unless max77705-usbc is bound)
 	install -Dm755 usb-gadget-reconnect.sh "$pkgdir"/usr/libexec/usb-gadget-reconnect.sh
@@ -280,6 +284,7 @@ phosh() {
 }
 sha512sums="
 abecc280bdb244e9ef1dcfef26e6f63adc97222bec4ff98b7eaf8fed99f238037e944adfb96a3fc12142eab6ba022c36ab824d476143e5ba4cab34a1dc70bbee  deviceinfo
+efd14d0f82f991f793f1ac4459520e6efb515d8ed59cb5862dcb974e077aff0bb5aa7a18c9247230c4a4bca5c1b86f4f0685b48d67a69265f37911ccf44338a3  waydroid-container.conf
 e533b0c7c583a611e88ff7f6a8df01e832f1803d9e02dc856980d73d6b3e7fa2dcd06fec75eeec94e084ebbfddfeae094db0fc42c6e4b6a49102ed8deace3255  kernel-cmdline.conf
 7670a41341807fa65c096661ac7324642a164b57fb14d16d15344f8a7e13f6df224d9229806c5e04ee4e301d02a5814ff2a9145d4b4c22123ef9ff42c59f75f8  51-wifi-powersave.conf
 814a72e9c7654e3fe628b4dda94538fcc69f619b6aa04f9bf943ab11ada187670d3cfc7368c033d8aecedbc175b55e6986f144ff9769b032f1f60e023593d366  modprobe.conf
