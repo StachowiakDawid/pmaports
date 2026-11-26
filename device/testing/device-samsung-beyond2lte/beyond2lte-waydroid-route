@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+attempt=0
+while [ "$attempt" -lt 300 ]; do
+	if [ "$(/usr/bin/waydroid shell getprop sys.boot_completed 2>/dev/null || true)" = "1" ]; then
+		/usr/bin/waydroid shell ip route replace 192.168.240.0/24 dev eth0 table eth0
+		/usr/bin/waydroid shell ip route replace default via 192.168.240.1 dev eth0 table eth0
+		exit 0
+	fi
+	attempt=$((attempt + 1))
+	sleep 1
+done
+
+exit 1

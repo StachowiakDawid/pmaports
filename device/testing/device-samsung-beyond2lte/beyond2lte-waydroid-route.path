@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply Android routes when Waydroid networking starts
+
+[Path]
+PathExists=/run/waydroid-lxc/network_up
+Unit=beyond2lte-waydroid-route.service
+
+[Install]
+WantedBy=paths.target

@@ -6,7 +6,7 @@ maintainer="StachowiakDawid <dawidos234@gmail.com>"
 pkgname=device-samsung-beyond2lte
 pkgdesc="Samsung Galaxy S10+"
 pkgver=3
-pkgrel=53
+pkgrel=54
 url="https://postmarketos.org"
 arch="aarch64"
 license="MIT"
@@ -39,6 +39,9 @@ triggers="$pkgname.trigger=/usr/lib/systemd/boot/efi"
 source="
 	deviceinfo
 	waydroid-container.conf
+	beyond2lte-waydroid-route
+	beyond2lte-waydroid-route.path
+	beyond2lte-waydroid-route.service
 	kernel-cmdline.conf
 	51-wifi-powersave.conf
 	modprobe.conf
@@ -126,6 +129,9 @@ package() {
 	# LXC needs these delegated controllers to create Waydroid's cgroup v2 tree.
 	install -Dm644 waydroid-container.conf \
 		"$pkgdir"/usr/lib/systemd/system/waydroid-container.service.d/50-beyond2lte-cgroups.conf
+	install -Dm755 beyond2lte-waydroid-route \
+		"$pkgdir"/usr/libexec/beyond2lte-waydroid-route
+	install -Dm644 beyond2lte-waydroid-route.path beyond2lte-waydroid-route.service -t "$sys"
 
 	# USB gadget reconnect (+ MUIC CTRL1 fix via i2crw unless max77705-usbc is bound)
 	install -Dm755 usb-gadget-reconnect.sh "$pkgdir"/usr/libexec/usb-gadget-reconnect.sh
@@ -285,6 +291,9 @@ phosh() {
 sha512sums="
 abecc280bdb244e9ef1dcfef26e6f63adc97222bec4ff98b7eaf8fed99f238037e944adfb96a3fc12142eab6ba022c36ab824d476143e5ba4cab34a1dc70bbee  deviceinfo
 efd14d0f82f991f793f1ac4459520e6efb515d8ed59cb5862dcb974e077aff0bb5aa7a18c9247230c4a4bca5c1b86f4f0685b48d67a69265f37911ccf44338a3  waydroid-container.conf
+00f79325a00930f269cca7fbbf692b17c19ec167a57704f7ef7783d9f307f7126f8edc223099ceecc7be5698f029b9206cefd6e239ee2abe6992c115a9c023ab  beyond2lte-waydroid-route
+2d70f2858c4d8ff54510e51655fb48235771e2406a0fbd011d5b7ece5c16afd76f0f9a68a9c3cd217d58e93dff13f545513aac4cabe9da370023ff121d8978cf  beyond2lte-waydroid-route.path
+795eccbac82314329bc998d1380fee2b803dffe73465d70a251a8121330aecb99c3c55cc529229a16a3ae645c585af61802d1bc9479325fed97eb929fc78e200  beyond2lte-waydroid-route.service
 e533b0c7c583a611e88ff7f6a8df01e832f1803d9e02dc856980d73d6b3e7fa2dcd06fec75eeec94e084ebbfddfeae094db0fc42c6e4b6a49102ed8deace3255  kernel-cmdline.conf
 7670a41341807fa65c096661ac7324642a164b57fb14d16d15344f8a7e13f6df224d9229806c5e04ee4e301d02a5814ff2a9145d4b4c22123ef9ff42c59f75f8  51-wifi-powersave.conf
 814a72e9c7654e3fe628b4dda94538fcc69f619b6aa04f9bf943ab11ada187670d3cfc7368c033d8aecedbc175b55e6986f144ff9769b032f1f60e023593d366  modprobe.conf
@@ -319,7 +328,7 @@ a076fe7055c09176c5ee8a8ea8270f894dd5225e502d5d7545140a2b1fddb2929b617e0d3647ddd0
 eaedd413982b0cf66f2a58f4a6b7b8a05bff1b105be92023eef2b10076cb826ef5187b0362660cc5b4790c9134780ca3dffd3d007d15575819a1e07c37256369  timesyncd.conf
 4a1fae681b8992eba3d878f61d21d892bafef7dd180f9cf045af750d61ea568a2ed0db01cf383eb7b0d0a40e3e3d83f13ede791c7686a50ef893cb35b3d662f9  watchdog.conf
 66484a3f8438cf31a9186cb5b6044b8ac4ff1a9da32f274e42005e5ead43102fd54247493099281a448625bc4463ecc148e2902d321c404393c3ea812e0e9b82  beyond2lte-boot-report
-6d492a9053bd3e3aa24dcf04109a514e4b1f1d300de747034ddd820473558500194230e87f5d2f0dae0a383c9e1fbec5736c6a3b5a7724eb11406b1e27d61b55  80-device-samsung-beyond2lte.preset
+7bedf69834ba69dfa221bede741d40fedcee30da1e223ad74c6958442ddf9c9f57746cb280d6d1a19a3b79825ff7092b55c75a07593a9fbc7978a1ca377a8af0  80-device-samsung-beyond2lte.preset
 7602a28bd650b1557eb00bff36597b9adb16ac122086c965e621a2a40e621941a11f80050b95adc4dd7700a45fe126b35f3b30b93f22d90bfff2d0b151a2de50  50_beyond2lte-autosuspend.gschema.override
 095e3391f69834591fd228774e2ab8aa07940ebf53d8a9dfaeaac84088e2816936d9005b21471c9a68dd7b7f0436a3795e0092c3286ecc2d3c1c9c821ce2a3a4  beyond2lte-feedbackd.conf
 b6ea327d6d10a427d60791dcd1927366436112b79c37ddd8435c920bc039154b1e2f063fa2899a3f9e75eda60ec5cdafaffa84337203f3c32f3408aa758f4e68  62-beyond2lte-sdr-inhibit.rules

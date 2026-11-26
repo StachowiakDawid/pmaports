@@ -1,0 +1,7 @@
+[Unit]
+Description=Restore Waydroid Android policy routes
+After=waydroid-container.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/beyond2lte-waydroid-route

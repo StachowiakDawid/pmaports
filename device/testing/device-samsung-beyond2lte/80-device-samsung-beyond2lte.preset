@@ -17,3 +17,4 @@ enable beyond2lte-display-takeover.service
 enable beyond2lte-dvfs.service
 # Screen on for a ringing voice call (shannon-modem call flag)
 enable beyond2lte-call-wake.path
+enable beyond2lte-waydroid-route.path
